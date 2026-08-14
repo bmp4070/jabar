@@ -225,6 +225,8 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "paths",
+ "rustc-hash",
+ "serde",
  "serde_json",
  "telemetry",
  "tracing",

@@ -18,6 +18,8 @@ paths.workspace = true
 vfs.workspace = true
 build-model.workspace = true
 telemetry.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
 
 anyhow.workspace = true
 crossbeam-channel.workspace = true

@@ -5,6 +5,14 @@
 //! structure rather than an async runtime — salsa cancellation wants one
 //! synchronous writer and many snapshot readers.
 
+pub mod capabilities;
+pub mod documents;
+pub mod line_index;
+pub mod server;
+pub mod uri;
+
+pub use crate::server::{Server, run_server};
+
 use tracing_subscriber::EnvFilter;
 
 /// Sends diagnostics to stderr, since stdout carries the LSP wire protocol and
