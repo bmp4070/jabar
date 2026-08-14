@@ -86,3 +86,11 @@ cargo fmt --all
 ```
 
 Toolchain is pinned in `rust-toolchain.toml`.
+
+## License
+
+MIT or Apache-2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.
+
+`crates/build-model/aspects/scip_java.bzl` is derived from
+[scip-java](https://github.com/sourcegraph/scip-java) (Apache-2.0, © 2022
+Sourcegraph, Inc.) and modified for Bazel 9. See `NOTICE`.

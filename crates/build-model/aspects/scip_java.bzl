@@ -1,6 +1,13 @@
 """
 Bazel aspect emitting SCIP indexes, forked for Bazel 9.
 
+Derived from scip-java, Copyright (c) 2022 Sourcegraph, Inc., licensed under
+the Apache License, Version 2.0. A copy is at LICENSE-APACHE in this
+repository, and http://www.apache.org/licenses/LICENSE-2.0.
+
+This file has been modified from the original. The changes are marked `JABAR:`
+and enumerated below, as Apache 2.0 section 4(b) requires.
+
 Upstream: sourcegraph/scip-java v0.12.3, `aspects/scip_java.bzl`, which
 `scip-java index` writes into the workspace. That version targets an older
 Bazel and fails six ways on 9.2.0. This fork carries the fixes; the JVM

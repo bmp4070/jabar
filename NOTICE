@@ -1,0 +1,19 @@
+jabar bundles and modifies third-party code. Attribution follows.
+
+--------------------------------------------------------------------------
+crates/build-model/aspects/scip_java.bzl
+
+Derived from scip-java, Copyright (c) 2022 Sourcegraph, Inc.
+Licensed under the Apache License, Version 2.0. See LICENSE-APACHE.
+
+Source: https://github.com/sourcegraph/scip-java
+        `aspects/scip_java.bzl`, as emitted by scip-java v0.12.3.
+
+Modified by the jabar authors to run on Bazel 9. Every change is marked
+`JABAR:` in the file and enumerated in its header docstring. In summary:
+JavaInfo is loaded from rules_java rather than taken as a Starlark global;
+aspect implementations return a provider list rather than a struct;
+javac_options is read as a depset; struct.to_json() is replaced with
+json.encode(); and javac options, which Bazel 9 emits as one shell-quoted
+string, are split respecting quotes.
+--------------------------------------------------------------------------
