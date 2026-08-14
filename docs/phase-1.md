@@ -910,8 +910,74 @@ note under §5.
 Half a day, and it either de-risks the largest item in the project or says to
 write our own extractor.
 
+### Measured on Ray
+
+First real-repo run: `github.com/ray-project/ray` at `c547b78dbd` — 1.1GB, 3,289
+targets, 360 Java files, Bazel **7.5.0**, `WORKSPACE` (not bzlmod). Smaller than
+the eventual target and on an older Bazel, so these are a lower bound, not the
+gate itself.
+
+| Measurement | Ray |
+| --- | --- |
+| `query //...` (3,289 targets), warm | **0.33s** |
+| `query //...`, cold incl. server start | 18.6s |
+| File → owning target | **90–264ms** |
+| `compile_info` via aquery | **352ms** |
+| SCIP index for one target (81 sources) | **35s** |
+| All 7 indexable Java targets | 38 MB, 27,297 definitions |
+| Loading 7 shards into `symbol-index` | **132ms** |
+| `search` on 27k definitions | **~1.5ms** |
+
+Six findings, in order of how much they change the plan.
+
+**1. Indexing does not need a successful build — F17 was too strong.** Ray's
+`//java:io_ray_ray_runtime` does not build here: it transitively needs C++ that
+fails against a newer Apple clang. The SCIP index built anyway, in 35 seconds,
+because `--output_groups=scip` builds only what indexing needs and never reaches
+the failing C++. With `--keep_going`, 7 of 10 Java targets indexed despite
+loading-phase errors elsewhere in the repo.
+
+That is a much weaker prerequisite than "a first build must succeed", and a much
+better one: a repo that cannot be fully built on a developer's machine — the
+normal case at scale — can still be fully *indexed*. What remains true is the
+narrow symlink prerequisite: `sourceroot/bazel-out` must exist, which any
+prior bazel invocation creates.
+
+**2. The classpath is mostly third-party, not header jars.** For that same
+target: 46 of 47 classpath entries are external Maven jars and exactly **one** is
+a same-repo header jar. F10's "Bazel already builds the item tree" holds only for
+the same-repo slice; at real scale the classpath is dominated by third-party jars
+that have neither header jar nor source. SCIP covers them — `scip-java` resolves
+through them because it runs inside javac — which is another argument for it over
+reading header jars directly.
+
+**3. Reference fan-out is far lower than F15 feared.** The worst symbol across 7
+targets and 27,297 definitions is `get`, at **331 references**. F15 assumed a
+`checkNotNull`-class symbol would have an rdeps closure approximating the whole
+repo. Not at this scale. 331 fits in a response with room to rank, and the
+truncation budget looks generous rather than tight. Ray's Java is only 360 files
+though, so this does not settle the question for a real Java megarepo — it does
+move the burden of proof.
+
+**4. Params files did not appear.** The real target's javac argv is 189 arguments
+with 47 classpath entries, entirely inline. The guard in `build-model` is still
+right, but the case is rarer than the review implied.
+
+**5. Environment fragility is a first-class failure mode.** Two unrelated things
+blocked indexing before any jabar code ran: `rules_jvm_external` shells out to
+`python`, which macOS does not provide (only `python3`); and Ray's pinned Abseil
+uses a builtin that newer clang deprecates, which `-Werror` turns fatal. Neither
+is jabar's fault and both stop it working. The server must report these as
+`Failure::BuildServer` with the underlying message intact, never as an empty
+result — a user whose index is empty because `python` is missing needs to be told
+that, not shown zero symbols.
+
+**6. The forked aspect is portable backwards.** It ran unmodified on Bazel 7.5.0
+with a `WORKSPACE` repo, including the `@rules_java//java/common:java_info.bzl`
+load added for Bazel 9. One fork covers both.
+
 **Schedule risk.** M3 and M4 are where this slips, and they share a root cause:
-nothing here has been measured against a repo of your size. If M3 threatens M4,
+nothing here has been measured against a repo of the eventual size. If M3 threatens M4,
 stub the workspace model from a checked-in JSON dump and build M4 against it —
 the index design is worth proving even on fake graph data, and M4 is the
 milestone this consumer actually needs.
@@ -960,8 +1026,8 @@ Phase 1 is done when all of these hold.
       a fixture session shows zero misleading empties.
 - [ ] The classpath decision is written down with the spike that justifies it
       committed.
-- [ ] All five M3 gate measurements are taken on the real repo and their numbers
-      recorded in this document.
+- [ ] All five M3 gate measurements are taken on the target repo and their
+      numbers recorded here. (Taken on Ray as a first pass; see §6.)
 - [ ] The `scip-java` spike has run against the fixture, and call hierarchy is
       either answerable from SCIP or has a written alternative (F15).
 - [ ] The index scope is configurable, and `//...` is nowhere assumed (F17).
