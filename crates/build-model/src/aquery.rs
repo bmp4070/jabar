@@ -116,12 +116,26 @@ pub fn parse_javac_actions(json: &str) -> Result<Vec<CompileInfo>, ParseError> {
         let label = TargetLabel::parse(raw_label)
             .map_err(|e| ParseError::BadLabel { label: (*raw_label).to_owned(), source: e })?;
 
-        out.push(CompileInfo {
-            label,
-            sources: collect_flag(&action.arguments, "--sources"),
-            classpath: collect_flag(&action.arguments, "--classpath"),
-            output_jar: collect_flag(&action.arguments, "--output").into_iter().next(),
-        });
+        let sources = collect_flag(&action.arguments, "--sources");
+        let classpath = collect_flag(&action.arguments, "--classpath");
+        let output_jar = collect_flag(&action.arguments, "--output").into_iter().next();
+
+        // If none of the flags are present but the command line points at a
+        // params file, the flags are in that file and this parse found nothing
+        // — which would otherwise be indistinguishable from a target that
+        // genuinely has no sources. Refuse instead.
+        if sources.is_empty()
+            && classpath.is_empty()
+            && output_jar.is_none()
+            && let Some(params) = params_file(&action.arguments)
+        {
+            return Err(ParseError::ParamsFile {
+                label: label.to_string(),
+                params_file: params.to_owned(),
+            });
+        }
+
+        out.push(CompileInfo { label, sources, classpath, output_jar });
     }
 
     if out.is_empty() && !doc.actions.is_empty() {
@@ -130,15 +144,34 @@ pub fn parse_javac_actions(json: &str) -> Result<Vec<CompileInfo>, ParseError> {
     Ok(out)
 }
 
-/// Collects the run of values following `flag`, stopping at the next `--flag`.
+/// Collects the run of values following `flag`, stopping at the next `--flag`
+/// or at a params-file reference.
 ///
 /// Only the first occurrence is read: JavaBuilder passes each of these once, and
 /// silently concatenating repeats would hide a command line we do not understand.
+///
+/// The `@` stop matters as much as the `--` one: a params file is never a value
+/// of `--sources`, and treating one as a source path would put a `.params` file
+/// into the compile inputs.
 fn collect_flag(args: &[String], flag: &str) -> Vec<Utf8PathBuf> {
     let Some(start) = args.iter().position(|a| a == flag) else {
         return Vec::new();
     };
-    args[start + 1..].iter().take_while(|a| !a.starts_with("--")).map(Utf8PathBuf::from).collect()
+    args[start + 1..]
+        .iter()
+        .take_while(|a| !a.starts_with("--") && !a.starts_with('@'))
+        .map(Utf8PathBuf::from)
+        .collect()
+}
+
+/// The `@file` argument in a command line, if there is one.
+///
+/// Bazel moves a javac command line into a params file once it grows past a
+/// size threshold — a large classpath does it easily — and persistent workers
+/// use one unconditionally. The flags then live in the file rather than the
+/// argv.
+fn params_file(args: &[String]) -> Option<&str> {
+    args.iter().find_map(|a| a.strip_prefix('@')).filter(|it| !it.is_empty())
 }
 
 #[derive(Debug)]
@@ -156,6 +189,17 @@ pub enum ParseError {
     /// the query matched something unexpected rather than that the target has
     /// no sources.
     NoJavacAction,
+    /// The command line is a params-file reference, so the flags this parser
+    /// reads are not in the argv.
+    ///
+    /// Reported rather than tolerated: an empty [`CompileInfo`] here would say
+    /// "this target has no sources and no classpath", which is a confident
+    /// wrong answer of exactly the kind this project exists to avoid. Reading
+    /// the file is the real fix; see the note in `docs/phase-1.md` §5.
+    ParamsFile {
+        label: String,
+        params_file: String,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -171,6 +215,11 @@ impl fmt::Display for ParseError {
             ParseError::NoJavacAction => {
                 f.write_str("aquery returned actions but no Javac action among them")
             }
+            ParseError::ParamsFile { label, params_file } => write!(
+                f,
+                "javac for `{label}` reads its flags from the params file `{params_file}`, \
+                 which this parser does not yet read; refusing to report empty sources"
+            ),
         }
     }
 }
@@ -328,6 +377,58 @@ mod tests {
           "targets": [{"id": 1, "label": "not-a-label"}]
         }"#;
         assert!(matches!(parse_javac_actions(json), Err(ParseError::BadLabel { .. })));
+    }
+
+    #[test]
+    fn a_params_file_command_line_is_refused_not_read_as_empty() {
+        // The scale break: past a size threshold, or under a persistent worker,
+        // Bazel moves the flags into an @file. Returning an empty CompileInfo
+        // would claim the target has no sources -- a confident wrong answer.
+        let json = r#"{
+          "actions": [{"mnemonic": "Javac", "targetId": 1,
+                       "arguments": ["external/…/JavaBuilder", "@bazel-out/x/libfoo.jar-2.params"]}],
+          "targets": [{"id": 1, "label": "//x:x"}]
+        }"#;
+        let err = parse_javac_actions(json).expect_err("should refuse");
+        let ParseError::ParamsFile { label, params_file } = &err else {
+            panic!("expected ParamsFile, got {err:?}");
+        };
+        assert_eq!(label, "//x:x");
+        assert_eq!(params_file, "bazel-out/x/libfoo.jar-2.params");
+        // The message has to name the file, or the failure is unactionable.
+        assert!(err.to_string().contains("libfoo.jar-2.params"), "{err}");
+    }
+
+    #[test]
+    fn an_inline_command_line_is_unaffected_by_the_guard() {
+        // A target with a genuinely empty classpath and no @file is still fine.
+        let json = r#"{
+          "actions": [{"mnemonic": "Javac", "targetId": 1,
+                       "arguments": ["--sources", "A.java"]}],
+          "targets": [{"id": 1, "label": "//x:x"}]
+        }"#;
+        assert_eq!(parse_one(json).sources.len(), 1);
+    }
+
+    #[test]
+    fn a_params_file_is_never_taken_as_a_flag_value() {
+        // A `.params` path landing in `sources` would put it on the compile
+        // inputs. The value run stops at `@` as well as at the next `--flag`.
+        let json = r#"{
+          "actions": [{"mnemonic": "Javac", "targetId": 1,
+                       "arguments": ["--sources", "A.java", "@bazel-out/extra.params"]}],
+          "targets": [{"id": 1, "label": "//x:x"}]
+        }"#;
+        let info = parse_one(json);
+        assert_eq!(info.sources.len(), 1);
+    }
+
+    #[test]
+    fn params_file_detection() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(params_file(&args(&["javac", "@a.params"])), Some("a.params"));
+        assert_eq!(params_file(&args(&["javac", "--sources", "A.java"])), None);
+        assert_eq!(params_file(&args(&["@"])), None, "a bare @ is not a file");
     }
 
     #[test]

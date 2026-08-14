@@ -61,11 +61,27 @@ them and assert on the target/file sets, which are stable.
 | `goToImplementation` | `Backoff` | `ExponentialBackoff`, `FixedBackoff`, `JitteredBackoff` — all in 1 target |
 | `goToImplementation` | `HttpClient` | `SimpleHttpClient`, `RetryingHttpClient` |
 | `findReferences` | `Preconditions.checkNotNull` | 30 call sites across 15 files in 8 targets, plus 1 declaration and 1 `{@link}` in javadoc. **The truncation case.** |
-| `findReferences` | `Clock.nowMillis` | 3 sites, 2 targets — small enough to return whole |
+| `findReferences` | `Clock.nowMillis` | 2 call sites, both in `policy`. `SystemClock.nowMillis` is an *override* — a definition of its own symbol, related to this one, not a reference to it. Small enough to return whole. |
 | `documentSymbol` | `policy/PolicyRegistry.java` | 1 class, 1 field, 3 methods. No graph access needed. |
 | `outgoingCalls` | `OrderService.placeOrder` | Crosses into `transport`, then `policy`, then `backoff` — 3 target boundaries |
 | `incomingCalls` | `Backoff.nextDelay` | `RetryingHttpClient.send` in `transport`, reached only via reverse-dependency edges |
 | `hover` | `RetryingHttpClient` | Javadoc plus resolved supertypes; local to one slice |
+
+### Overrides are definitions, not references
+
+`Clock.nowMillis` is declared once, overridden once in `SystemClock`, and called
+twice. A naive count of the four mentions says "3 references excluding the
+declaration", which is what an earlier version of this document claimed — and it
+is wrong. The override *defines* `SystemClock#nowMillis` and stands in an
+implementation relationship to `Clock#nowMillis`; it does not refer to it.
+
+The distinction matters to the client. "Who calls this method" wants the two call
+sites. "Where is this method implemented" wants the override. "Rename this
+method" wants all four. A server that collapses them answers at most one of those
+questions correctly.
+
+The correction came from running a real indexer against this file and trusting
+the disagreement over the prose.
 
 ### Why `checkNotNull` is the important one
 
