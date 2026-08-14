@@ -11,7 +11,7 @@ language server exists yet. `jabar` currently exits non-zero and says so.
 | Crate | State |
 | --- | --- |
 | `paths` | Absolute UTF-8 paths. Done, 7 tests. |
-| `vfs` | Not started. File ids, path interning, change batching. |
+| `vfs` | File ids, path interning, change batching. Done, 24 tests. No loader yet. |
 | `bsp` | Not started. Build Server Protocol client. |
 | `jabar-server` | Not started beyond a stub binary. |
 
