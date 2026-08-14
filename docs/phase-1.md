@@ -108,8 +108,8 @@ reach the warm state the whole design is built around.
 ## 3. Findings
 
 Ordered by how expensive the mistake is to undo, not by sequence. F1–F3 follow
-from the consumer profile, F8–F9 from adding debugging, and F10–F11 from
-measuring Bazel rather than assuming; the rest hold regardless of who calls the
+from the consumer profile, F8–F9 from adding debugging, and F10–F12 from
+measuring Bazel and tree-sitter rather than assuming; the rest hold regardless of who calls the
 server.
 
 ### F1 — Focus Target answers the question the agent asks last (blocking)
@@ -338,6 +338,48 @@ means positions.
 
 *Recommendation:* query family now, aspect only if the M3 gate says so.
 
+### F12 — A parser is needed later and smaller than the plan assumes, and should be bought (rework)
+
+Header jars answer the global tier without parsing anything, so the parser
+arrives at M4 rather than M2 — and its first job is narrow: **positions**. Every
+LSP response is a `Location { uri, range }`, and a header jar cannot say where in
+the file a declaration sits. Bodies, references and call hierarchy are Phase 2
+and want a full tree; position resolution wants only "find this declaration and
+give me its range".
+
+rust-analyzer wrote its own parser because Rust had no error-tolerant one and it
+needed rowan's specific properties. That reasoning does not transfer. Java has
+`tree-sitter-java`, and it does the two hard things off the shelf. Measured
+against `fixtures/megarepo`:
+
+| | |
+| --- | --- |
+| Full parse throughput | 19.3 MB/s |
+| Incremental reparse, one keystroke in a 750KB file | 501µs (77× faster) |
+| `Tree: Send + Sync` | yes — survives the salsa boundary |
+
+Correctness on the cases the fixture exists to be nasty about: `record` syntax
+parsed clean, the non-ASCII `grüße` identifier extracted correctly, and a file
+with `int x = ;` plus an unclosed brace reported 3 errors while still recovering
+all 3 declarations. That last property decides whether the server is useful
+*during* editing or only after it, which for an agent client is most of the time.
+
+The numbers also confirm the two-tier split rather than undermining it. A typical
+8KB file is ~0.4ms, so a 500-file focus slice is ~250ms single-threaded and
+trivially parallel — but a 10GB megarepo would be ~500 seconds, so parsing
+everything is off the table and the header-jar tier has to carry the global
+queries.
+
+Limits worth stating: it produces a CST, not a typed AST, and carries no name
+resolution or types. Neither matters much, because lowering to our own item tree
+and HIR happens regardless and name resolution is Phase 2/3 work under any
+parser. New Java syntax needs a grammar update, which is someone else's
+maintenance — the point of buying.
+
+*Staging:* nothing now; `tree-sitter-java` at M4 for position resolution only
+(roughly a day's work); the same trees feed the item tree and body lowering in
+Phase 2, so nothing is thrown away.
+
 ### One earlier finding, downgraded
 
 An earlier draft flagged tower-lsp as a rework item on cancellation grounds. With
@@ -370,6 +412,9 @@ blocker.
 `SourceRoot`, `FileSourceRoot` inputs and one trivial derived query, no parser —
 because without it the VFS-to-salsa pipeline is untestable. From Phase 3, index
 persistence, for the reasons in F5.
+
+**Not in this phase.** No parser beyond the narrow position-resolution use in
+M4 (F12). No item tree, no type inference, no remote HIR cache.
 
 **Cut from the roadmap entirely.** Completion, signature help, inlay hints,
 semantic tokens, code lens, folding ranges, document highlight, formatting,
@@ -442,10 +487,10 @@ engineers and are the softest part of this document.
 | ID | Milestone | Exit criterion | Wk |
 | --- | --- | --- | --- |
 | M0 | Skeleton and harness | Fixture repo builds; `tracing` spans emit; CI green. | 1 |
-| M1 | LSP shell | Claude Code connects and gets a well-formed answer to `documentSymbol`. Truncation layer returns a stated total, not a silently clipped list. | 1–2 |
+| M1 | LSP shell | Claude Code completes a session over stdio: lifecycle, encoding negotiation, incremental text sync into the VFS, and a `jabar/status` request. No capability is advertised that is not served. **Done.** | 1–2 |
 | M2 | VFS and salsa inputs | A test writes a file out of band, immediately queries, and sees the new content. A second test proves a `LOW`-durability edit does not invalidate `HIGH`-durability derived values. | 2–3 |
 | M3 | Build graph | Targets, sources, classpath and the JVM run environment resolved and cached to disk; **the graph-access gate below is measured and recorded**; the jar-versus-srcjar decision written down with a working spike behind it. | 3–5 |
-| M4 | Shallow global index | `workspaceSymbol` answers across the whole fixture repo from a cold process in under a second, served from the on-disk index. Built from header jars unless the M3 gate said otherwise. | 5–7 |
+| M4 | Shallow global index | `workspaceSymbol` answers across the whole fixture repo from a cold process in under a second, served from the on-disk index. Built from header jars unless the M3 gate said otherwise, with `tree-sitter-java` resolving positions lazily per result (F12). Truncation layer returns a stated total, not a silently clipped list. | 5–7 |
 | M5 | Focus slice | A local query loads exactly its target's slice and nothing more; a `BUILD` edit re-slices and invalidates the affected shard, debounced. | 7–8 |
 | M6 | Instrumentation | Cold p50 for `workspaceSymbol` and `goToDefinition` measured on a real target, not just the fixture. Reference fan-out distribution recorded to size the truncation budget. | 8 |
 
@@ -486,6 +531,7 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | Question | Recommendation |
 | --- | --- |
 | How do external dependencies enter the database — jars, srcjars, or both? | Classfile reader as the primary path, srcjars opportunistically when BSP offers them. Bytecode already carries the names, signatures and supertypes the shallow tier needs. |
+| Write a Java parser, or use an existing one? | `tree-sitter-java`. Error-tolerant and incremental off the shelf — 19.3 MB/s, 501µs to reparse a keystroke, `Send + Sync` — and it recovers declarations from half-written files, which is the state an agent's file is usually in. rust-analyzer's reasons for writing its own do not transfer. Arrives at M4 for positions only. |
 | Aspects or the query family for reaching the build graph? | Query family now. Skyframe is not externally reachable, so those are the only two doors, and F10 means the shallow tier needs no aspect. Revisit only if the M3 gate shows `cquery //...` costing minutes, or once positions must be precomputed. |
 | BSP, or the bazel CLI? | The CLI. bazel-bsp is a JVM tool needing coursier and version-matching, and `query`/`aquery` answer the same questions of the same graph in 67–170ms. Keep aquery parsing separate from the CLI runner so BSP can be added later for `buildTarget/didChange` push invalidation. |
 | Build the debug adapter, or drive an existing one? | Drive `java-debug` as a subprocess. Supply the launch config and jar-to-source mapping — the two things it cannot derive under Bazel — and let it own JDI, stepping and thread control. |
