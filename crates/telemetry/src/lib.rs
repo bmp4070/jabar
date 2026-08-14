@@ -160,6 +160,12 @@ pub enum EmptyReason {
     NoMatch,
     /// The shallow global index was still building.
     IndexNotReady,
+    /// The index is loaded, but was built from source older than what is on
+    /// disk now — so a symbol the client just wrote is genuinely absent from it.
+    ///
+    /// Distinct from [`EmptyReason::NoMatch`] precisely because an agent's
+    /// first move after writing a file is to ask about what it wrote.
+    IndexStale,
     /// The answer lives in a target that was not loaded.
     TargetNotLoaded,
     /// The file is not in any target and was never indexed.
@@ -170,9 +176,10 @@ pub enum EmptyReason {
 }
 
 impl EmptyReason {
-    pub const ALL: [EmptyReason; 5] = [
+    pub const ALL: [EmptyReason; 6] = [
         EmptyReason::NoMatch,
         EmptyReason::IndexNotReady,
+        EmptyReason::IndexStale,
         EmptyReason::TargetNotLoaded,
         EmptyReason::FileNotIndexed,
         EmptyReason::UnsupportedPath,
@@ -187,9 +194,10 @@ impl EmptyReason {
         match self {
             EmptyReason::NoMatch => 0,
             EmptyReason::IndexNotReady => 1,
-            EmptyReason::TargetNotLoaded => 2,
-            EmptyReason::FileNotIndexed => 3,
-            EmptyReason::UnsupportedPath => 4,
+            EmptyReason::IndexStale => 2,
+            EmptyReason::TargetNotLoaded => 3,
+            EmptyReason::FileNotIndexed => 4,
+            EmptyReason::UnsupportedPath => 5,
         }
     }
 }
@@ -208,6 +216,14 @@ pub enum Failure {
     Panic,
     /// The request named a position or path that does not exist.
     BadRequest,
+    /// The index needed to answer was not loaded, or was stale.
+    ///
+    /// Distinct from [`EmptyReason::IndexNotReady`]: that one records having
+    /// *answered* empty while not knowing, which is the damaging case. This one
+    /// records having refused, which is the correct behaviour and still worth
+    /// counting — a client asking before the index is ready is a startup
+    /// ordering problem, not a lie.
+    IndexUnavailable,
     /// Something else, deliberately coarse so the summary stays path-free.
     Internal,
 }
@@ -275,6 +291,7 @@ pub struct InFlight<'a> {
     op: Op,
     started: Instant,
     revision: u64,
+    stale: bool,
     outcome: Option<Outcome>,
 }
 
@@ -288,6 +305,24 @@ impl<'a> InFlight<'a> {
     pub fn at_revision(&mut self, revision: u64) {
         self.revision = revision;
     }
+
+    /// Marks the answer as computed while writes were still pending, so it
+    /// predates something the client has already done.
+    ///
+    /// The guard-based flow is how every handler reports, so without this the
+    /// stale-read signal in [`Health`] could never fire — it would exist only
+    /// for callers building a [`QueryRecord`] by hand, which nothing does.
+    pub fn mark_stale(&mut self, stale: bool) {
+        self.stale = stale;
+    }
+
+    /// Records a failure without consuming the guard.
+    ///
+    /// For the error paths that return early: `finish` takes `self`, which a
+    /// `?` or an early `return` inside a closure cannot always satisfy.
+    pub fn mark_failed(&mut self, failure: Failure) {
+        self.outcome = Some(Outcome::Failed { failure });
+    }
 }
 
 impl Drop for InFlight<'_> {
@@ -300,7 +335,7 @@ impl Drop for InFlight<'_> {
             outcome,
             duration: self.started.elapsed(),
             vfs_revision: self.revision,
-            stale: false,
+            stale: self.stale,
         };
         self.telemetry.record(record);
     }
@@ -314,7 +349,7 @@ struct OpStats {
     answered: u64,
     truncated: u64,
     withheld: u64,
-    empty: [u64; 5],
+    empty: [u64; 6],
     failed: FxHashMap<Failure, u64>,
     cancelled: u64,
     stale: u64,
@@ -378,7 +413,14 @@ impl Telemetry {
 
     /// Starts timing an operation. The returned guard records on drop.
     pub fn start(&self, op: Op) -> InFlight<'_> {
-        InFlight { telemetry: self, op, started: Instant::now(), revision: 0, outcome: None }
+        InFlight {
+            telemetry: self,
+            op,
+            started: Instant::now(),
+            revision: 0,
+            stale: false,
+            outcome: None,
+        }
     }
 
     /// Records a completed operation.
@@ -900,5 +942,45 @@ mod tests {
             t.record(QueryRecord::new(Op::IndexBuild, Outcome::answered(1), ms(1)));
         }
         assert!(t.health().is_healthy(), "{:?}", t.health().concerns);
+    }
+
+    #[test]
+    fn a_guard_can_report_a_stale_read() {
+        // The gap this closes: the guard flow is how every handler reports, so
+        // without mark_stale the stale-read signal could never fire in practice.
+        let t = Telemetry::new();
+        {
+            let mut guard = t.start(Op::WorkspaceSymbol);
+            guard.at_revision(9);
+            guard.mark_stale(true);
+            guard.finish(Outcome::answered(1));
+        }
+        let health = t.health();
+        assert_eq!(health.ops[0].stale_reads, 1);
+        assert!(health.concerns.iter().any(|c| matches!(c, Concern::StaleReads { .. })));
+    }
+
+    #[test]
+    fn a_guard_can_report_a_failure_without_being_consumed() {
+        let t = Telemetry::new();
+        {
+            let mut guard = t.start(Op::IndexBuild);
+            guard.mark_failed(Failure::Io);
+        }
+        assert_eq!(t.health().ops[0].failed, 1);
+    }
+
+    #[test]
+    fn a_stale_index_is_not_a_healthy_empty() {
+        // An agent writes a file, then asks about it. "Not in the index" is not
+        // "does not exist", and must not be counted as a truthful answer.
+        assert!(!EmptyReason::IndexStale.is_healthy());
+        let t = Telemetry::new();
+        t.record(QueryRecord::new(
+            Op::WorkspaceSymbol,
+            Outcome::Empty { reason: EmptyReason::IndexStale },
+            ms(1),
+        ));
+        assert_eq!(t.health().ops[0].misleading_empty, 1);
     }
 }

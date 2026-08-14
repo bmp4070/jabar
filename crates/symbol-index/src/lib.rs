@@ -227,7 +227,7 @@ impl SymbolIndex {
                 let roles = occ.symbol_roles;
                 if roles & SymbolRole::Definition as i32 != 0 {
                     let info = meta.get(occ.symbol.as_str());
-                    self.push_definition(Definition {
+                    self.insert(Definition {
                         symbol: occ.symbol.clone(),
                         name: short_name(&occ.symbol),
                         kind: info
@@ -260,7 +260,12 @@ impl SymbolIndex {
         }
     }
 
-    fn push_definition(&mut self, def: Definition) {
+    /// Adds a definition directly, for callers that build an index from
+    /// something other than a SCIP shard — a dirty-file overlay, or a test.
+    ///
+    /// A symbol already present is ignored, so re-indexing a target cannot
+    /// double its symbols.
+    pub fn insert(&mut self, def: Definition) {
         // A symbol can be defined once. Re-indexing the same target, or two
         // shards covering one file, must not produce duplicates.
         if self.by_symbol.contains_key(&def.symbol) {
@@ -430,7 +435,7 @@ mod tests {
         // `contains("")` is true for every string; returning the whole index
         // would be a very expensive way to answer a meaningless question.
         let mut index = SymbolIndex::default();
-        index.push_definition(def("com/acme/A#", "A"));
+        index.insert(def("com/acme/A#", "A"));
         assert!(index.search("").is_empty());
     }
 
@@ -455,7 +460,7 @@ mod tests {
             ("com/acme/RetryPolicy#", "RetryPolicy"),
             ("com/acme/RetryPolicyFactory#", "RetryPolicyFactory"),
         ] {
-            index.push_definition(def(symbol, name));
+            index.insert(def(symbol, name));
         }
         let names: Vec<_> = index.search("retrypolicy").iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["RetryPolicy", "RetryPolicyFactory", "AbstractRetryPolicyBase"]);
@@ -464,7 +469,7 @@ mod tests {
     #[test]
     fn search_is_case_insensitive() {
         let mut index = SymbolIndex::default();
-        index.push_definition(def("com/acme/RetryPolicy#", "RetryPolicy"));
+        index.insert(def("com/acme/RetryPolicy#", "RetryPolicy"));
         assert_eq!(index.search("RETRYPOLICY").len(), 1);
         assert_eq!(index.search("retrypolicy").len(), 1);
         assert_eq!(index.search("Policy").len(), 1);
@@ -474,8 +479,8 @@ mod tests {
     fn a_symbol_defined_twice_is_stored_once() {
         // Re-indexing a target must not double every symbol in it.
         let mut index = SymbolIndex::default();
-        index.push_definition(def("com/acme/A#", "A"));
-        index.push_definition(def("com/acme/A#", "A"));
+        index.insert(def("com/acme/A#", "A"));
+        index.insert(def("com/acme/A#", "A"));
         assert_eq!(index.definition_count(), 1);
         assert_eq!(index.search("A").len(), 1);
     }
@@ -485,7 +490,7 @@ mod tests {
         let mut index = SymbolIndex::default();
         let mut impl_def = def("com/acme/DefaultRetryPolicy#", "DefaultRetryPolicy");
         impl_def.implements = vec!["com/acme/RetryPolicy#".to_owned()];
-        index.push_definition(impl_def);
+        index.insert(impl_def);
 
         let found = index.implementors("com/acme/RetryPolicy#");
         assert_eq!(found.len(), 1);

@@ -326,6 +326,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "symbol-index",
  "telemetry",
  "tracing",
  "tracing-subscriber",

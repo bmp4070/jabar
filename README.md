@@ -5,11 +5,14 @@ agents first and editors second.
 
 ## Status
 
-The shell runs. `jabar` completes an LSP session over stdio: lifecycle,
-position-encoding negotiation, incremental text sync into the VFS, and a
-`jabar/status` request. It answers no language queries yet — it advertises no
-capability it cannot serve, so clients never receive an empty answer that means
-"not implemented".
+**`workspace/symbol` works end to end.** Given SCIP shards produced by the
+aspect in `crates/build-model/aspects/`, `jabar` answers symbol searches across
+a whole Bazel repo with real ranges, converted into the client's negotiated
+position encoding. Before an index is loaded it returns an LSP *error* rather
+than an empty list, because a client cannot tell those apart.
+
+The other eight operations are not implemented, and no capability is advertised
+that cannot be served.
 
 | Crate | State |
 | --- | --- |
@@ -17,8 +20,9 @@ capability it cannot serve, so clients never receive an empty answer that means
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
 | `telemetry` | Misbehaviour detection. Done, 15 tests. |
 | `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
+| `symbol-index` | Reads SCIP shards: search, definitions, references, implementors. Done, 18 tests. |
 | `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |
-| `jabar-server` | LSP shell: lifecycle, encoding, text sync, status. Done, 54 tests. No queries yet. |
+| `jabar-server` | LSP shell plus `workspace/symbol`. Done, 61 tests. |
 
 ## Why this exists rather than using an existing Java LSP
 

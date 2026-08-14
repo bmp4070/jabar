@@ -7,6 +7,7 @@
 
 pub mod capabilities;
 pub mod documents;
+pub mod handlers;
 pub mod line_index;
 pub mod server;
 pub mod uri;

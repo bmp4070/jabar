@@ -25,8 +25,10 @@ use vfs::{Vfs, VfsPath};
 
 use crate::capabilities::{negotiate_encoding, server_capabilities, workspace_root};
 use crate::documents::Documents;
+use crate::handlers;
 use crate::line_index::PositionEncoding;
 use crate::uri;
+use symbol_index::SymbolIndex;
 
 /// Custom request: what the server currently believes about itself.
 ///
@@ -34,6 +36,12 @@ use crate::uri;
 /// otherwise unanswerable from outside, and for an agent client a server that is
 /// quietly answering nothing looks exactly like a codebase with nothing in it.
 pub const STATUS_REQUEST: &str = "jabar/status";
+
+/// Custom request: load SCIP shards from a directory into the global index.
+///
+/// Temporary. jabar will run the aspect itself once M4 lands; until then this
+/// is how an index gets in.
+pub const LOAD_INDEX_REQUEST: &str = "jabar/loadIndex";
 
 /// Performs the `initialize` handshake and runs until the client disconnects.
 pub fn run_server(connection: Connection) -> anyhow::Result<()> {
@@ -74,6 +82,12 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// The global symbol index, once one has been loaded.
+    ///
+    /// `None` means no index, which is a different answer from an empty one --
+    /// see `handlers`. Loading is explicit for now: the aspect that produces
+    /// shards has to run first, and jabar does not yet run it.
+    index: Option<SymbolIndex>,
     telemetry: Telemetry,
     shutdown_requested: bool,
 }
@@ -92,6 +106,7 @@ impl Server {
             build,
             vfs: Vfs::default(),
             documents: Documents::default(),
+            index: None,
             telemetry: Telemetry::new(),
             shutdown_requested: false,
         }
@@ -180,12 +195,114 @@ impl Server {
 
         match request.method.as_str() {
             STATUS_REQUEST => Ok(serde_json::to_value(self.status())?),
+            LOAD_INDEX_REQUEST => self.load_index(request.params),
+            lsp_types::request::WorkspaceSymbolRequest::METHOD => {
+                self.workspace_symbol(request.params)
+            }
             // Refusing loudly matters: silently returning null would look to a
             // client like a successful empty answer.
             unknown => Err(RequestError::new(
                 ErrorCode::MethodNotFound,
                 format!("`{unknown}` is not implemented"),
             )),
+        }
+    }
+
+    /// Loads a directory of SCIP shards into the global index.
+    ///
+    /// Explicit rather than automatic because the index is a build output: the
+    /// aspect has to have run. Wiring jabar to run it is M4 (see F17).
+    fn load_index(&mut self, params: serde_json::Value) -> Result<serde_json::Value, RequestError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            path: String,
+        }
+        let params: Params = serde_json::from_value(params).map_err(|err| {
+            RequestError::new(ErrorCode::InvalidParams, format!("expected {{path}}: {err}"))
+        })?;
+
+        let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
+        let index = SymbolIndex::from_dir(std::path::Path::new(&params.path)).map_err(|err| {
+            guard_failed(&mut guard);
+            RequestError::new(
+                ErrorCode::InvalidParams,
+                format!("could not read `{}`: {err}", params.path),
+            )
+        })?;
+
+        let (shards, definitions) = (index.shard_count(), index.definition_count());
+        guard.finish(if definitions == 0 {
+            telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch }
+        } else {
+            telemetry::Outcome::answered(definitions)
+        });
+
+        tracing::info!(shards, definitions, path = %params.path, "index loaded");
+        self.index = Some(index);
+        // The capability was not advertised at initialize, because there was
+        // nothing behind it. Tell the client it exists now.
+        self.register_workspace_symbol();
+
+        Ok(serde_json::json!({ "shards": shards, "definitions": definitions }))
+    }
+
+    fn workspace_symbol(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::WorkspaceSymbolParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+
+        let mut guard = self.telemetry.start(telemetry::Op::WorkspaceSymbol);
+        guard.at_revision(self.vfs.revision().as_u64());
+
+        // No index is not the same answer as no matches. Returning `[]` here
+        // would tell the client the symbol does not exist, which it cannot
+        // distinguish and would act on.
+        let (Some(index), Some(root)) = (&self.index, &self.workspace_root) else {
+            guard.finish(handlers::index_unavailable_outcome());
+            return Err(RequestError::new(
+                ErrorCode::ServerNotInitialized,
+                "no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
+                    .to_owned(),
+            ));
+        };
+
+        let documents = &self.documents;
+        let results =
+            handlers::workspace_symbol(index, &params.query, root, self.encoding, |relative| {
+                // Prefer the client's copy, which is authoritative for an open
+                // file and may differ from what the index was built against.
+                let abs = root.join(relative);
+                let path = VfsPath::Real(abs.clone());
+                documents
+                    .get(&path)
+                    .map(|doc| doc.text.clone())
+                    .or_else(|| std::fs::read_to_string(abs.as_str()).ok())
+            });
+
+        guard.finish(results.outcome());
+        Ok(serde_json::to_value(results.symbols)?)
+    }
+
+    /// Registers `workspace/symbol` dynamically, now that it can be served.
+    fn register_workspace_symbol(&mut self) {
+        let registration = lsp_types::Registration {
+            id: "jabar-workspace-symbol".to_owned(),
+            method: lsp_types::request::WorkspaceSymbolRequest::METHOD.to_owned(),
+            register_options: None,
+        };
+        let params = lsp_types::RegistrationParams { registrations: vec![registration] };
+        match serde_json::to_value(params) {
+            Ok(params) => self.send(
+                lsp_server::Request::new(
+                    lsp_server::RequestId::from("jabar-register-workspace-symbol".to_owned()),
+                    lsp_types::request::RegisterCapability::METHOD.to_owned(),
+                    params,
+                )
+                .into(),
+            ),
+            Err(err) => tracing::warn!(%err, "could not build the capability registration"),
         }
     }
 
@@ -299,6 +416,8 @@ impl Server {
                 PositionEncoding::Utf8 => "utf-8",
                 PositionEncoding::Utf16 => "utf-16",
             },
+            index_loaded: self.index.is_some(),
+            indexed_definitions: self.index.as_ref().map(|i| i.definition_count()).unwrap_or(0),
             open_documents: self.documents.len(),
             vfs_files: self.vfs.len(),
             vfs_revision: self.vfs.revision().as_u64(),
@@ -322,6 +441,8 @@ pub struct Status {
     pub workspace_root: Option<String>,
     pub build_graph_available: bool,
     pub position_encoding: &'static str,
+    pub index_loaded: bool,
+    pub indexed_definitions: usize,
     pub open_documents: usize,
     pub vfs_files: usize,
     pub vfs_revision: u64,
@@ -329,6 +450,11 @@ pub struct Status {
     /// read-after-write signal from `docs/phase-1.md` (F3).
     pub pending_changes: bool,
     pub health: telemetry::Health,
+}
+
+/// Records a failure on an in-flight guard that is about to be dropped.
+fn guard_failed(guard: &mut telemetry::InFlight<'_>) {
+    guard.mark_failed(telemetry::Failure::Io);
 }
 
 #[derive(Debug)]
