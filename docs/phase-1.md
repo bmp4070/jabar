@@ -514,14 +514,28 @@ The SCIP schema covers more of the nine operations than the header-jar plan did:
 | `goToImplementation` | `Relationship.is_implementation` |
 | Positions | `single_line_range` / `multi_line_range`, per occurrence |
 
-Two details that matter to work already done. `Document.position_encoding` is an
-explicit field, and JVM indexers emit `UTF16CodeUnitOffsetFromLineStart` — so
-`LineIndex` is exactly the bridge needed when a client negotiates UTF-8, and M1's
-encoding work is load-bearing rather than incidental. And `SymbolRole` is a
-bitset distinguishing `Definition`, `Import`, `ReadAccess`, `WriteAccess`,
-`Generated` and `Test`, which is the reference-kind distinction
-`EXPECTATIONS.md` asks for — a rename touches all kinds, a call graph wants only
-some.
+Two details that matter to work already done. `SymbolRole` is a bitset
+distinguishing `Definition`, `Import`, `ReadAccess`, `WriteAccess`, `Generated`
+and `Test`, which is the reference-kind distinction `EXPECTATIONS.md` asks for —
+a rename touches all kinds, a call graph wants only some.
+
+And the encoding, which needs stating carefully because an earlier draft of this
+document got it wrong. `Document.position_encoding` exists as a field, but
+**scip-java leaves it `UnspecifiedPositionEncoding`** while emitting UTF-16
+columns. Verified against `Messages.java`, on the line declaring `grüße`:
+
+| Occurrence at cols 29..35 | Text |
+| --- | --- |
+| read as UTF-16 code units | `"String"` ✅ |
+| read as UTF-8 bytes | `"e(Stri"` ❌ |
+
+Reading the wrong way does not fail — it returns plausible garbage, silently,
+only on lines containing non-ASCII. Exactly the failure class this project is
+organised around. So the reader must **assume UTF-16 when the field is
+unspecified**, and M1's `LineIndex` is the bridge to a UTF-8-negotiated client.
+That makes the encoding work load-bearing rather than incidental. A conformance
+test should pin this, because a future scip-java that starts populating the field
+honestly would otherwise change behaviour silently.
 
 **The spike has run.** Results below; the format is confirmed, the tool is not.
 
