@@ -298,6 +298,29 @@ fn requests_after_shutdown_are_refused() {
 }
 
 #[test]
+fn the_custom_references_method_reports_what_the_standard_one_hides() {
+    // LSP's `references` returns a bare array, so truncation is invisible. On
+    // Gerrit, references to `Project` withhold 1,483 of 1,683 silently, and an
+    // agent reads 200 as the whole answer. The custom method carries the count.
+    let mut harness = Harness::start(Some("file:///repo"), utf8_client());
+    let params = json!({
+        "textDocument": { "uri": "file:///repo/A.java" },
+        "position": { "line": 0, "character": 0 },
+        "context": { "includeDeclaration": false }
+    });
+    // Without an index both refuse, which is the point: neither invents an
+    // empty answer. The shapes are still distinguishable.
+    let id = harness.send_request("jabar/references", params.clone());
+    let error = harness.expect_err(id);
+    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
+
+    let id = harness.send_request(lsp_types::request::References::METHOD, params);
+    let error = harness.expect_err(id);
+    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
+    harness.shutdown();
+}
+
+#[test]
 fn the_workspace_root_is_picked_up() {
     let mut harness = Harness::start(Some("file:///repo/workspace"), utf8_client());
     let status = harness.status();

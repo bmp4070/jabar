@@ -38,6 +38,17 @@ use watcher::{Change, FileWatcher};
 /// quietly answering nothing looks exactly like a codebase with nothing in it.
 pub const STATUS_REQUEST: &str = "jabar/status";
 
+/// Custom request: like `textDocument/references`, but reports the true total.
+///
+/// LSP's own `references` returns a bare array, so a client receiving 200 of
+/// 1,683 cannot tell it was truncated — on Gerrit, asking for references to
+/// `Project` withholds 1,483 silently. An agent reads that as "this class has
+/// 200 references" and acts on it.
+///
+/// The standard method stays conformant for clients that only speak LSP; this
+/// one carries the count so a client that knows to ask gets the truth.
+pub const REFERENCES_REQUEST: &str = "jabar/references";
+
 /// Custom request: load SCIP shards from a directory into the global index.
 ///
 /// Temporary. jabar will run the aspect itself once M4 lands; until then this
@@ -288,7 +299,10 @@ impl Server {
                 self.workspace_symbol(request.params)
             }
             lsp_types::request::GotoDefinition::METHOD => self.goto_definition(request.params),
-            lsp_types::request::References::METHOD => self.find_references(request.params),
+            lsp_types::request::References::METHOD => {
+                self.find_references(request.params).map(|r| r.locations)
+            }
+            REFERENCES_REQUEST => self.find_references(request.params).map(|r| r.full),
             // Refusing loudly matters: silently returning null would look to a
             // client like a successful empty answer.
             unknown => Err(RequestError::new(
@@ -406,7 +420,7 @@ impl Server {
     fn find_references(
         &mut self,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, RequestError> {
+    ) -> Result<ReferenceReply, RequestError> {
         let params: lsp_types::ReferenceParams = serde_json::from_value(params)
             .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
         let doc = params.text_document_position;
@@ -424,7 +438,7 @@ impl Server {
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
 
-        match handlers::find_references(
+        let reply = match handlers::find_references(
             index,
             &relative,
             position,
@@ -443,13 +457,14 @@ impl Server {
                     );
                 }
                 guard.finish(results.outcome());
-                Ok(serde_json::to_value(results.locations)?)
+                ReferenceReply::new(&results.symbol, results.locations, results.total)?
             }
             None => {
                 guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
-                Ok(serde_json::to_value(Vec::<lsp_types::Location>::new())?)
+                ReferenceReply::new("", Vec::new(), 0)?
             }
-        }
+        };
+        Ok(reply)
     }
 
     /// The index, workspace root, and workspace-relative path for a query.
@@ -675,6 +690,32 @@ pub struct Status {
     /// read-after-write signal from `docs/phase-1.md` (F3).
     pub pending_changes: bool,
     pub health: telemetry::Health,
+}
+
+/// Both shapes of a references answer: the LSP-conformant array, and the
+/// fuller reply that names what was withheld.
+struct ReferenceReply {
+    locations: serde_json::Value,
+    full: serde_json::Value,
+}
+
+impl ReferenceReply {
+    fn new(
+        symbol: &str,
+        locations: Vec<lsp_types::Location>,
+        total: usize,
+    ) -> Result<ReferenceReply, RequestError> {
+        let returned = locations.len();
+        let locations = serde_json::to_value(locations)?;
+        let full = serde_json::json!({
+            "symbol": symbol,
+            "returned": returned,
+            "total": total,
+            "truncated": returned < total,
+            "locations": locations,
+        });
+        Ok(ReferenceReply { locations, full })
+    }
 }
 
 /// Reads a workspace-relative file, preferring the client's open copy.

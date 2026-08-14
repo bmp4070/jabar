@@ -910,6 +910,52 @@ note under §5.
 Half a day, and it either de-risks the largest item in the project or says to
 write our own extractor.
 
+### Measured on Gerrit
+
+The better test, and the one that matches the target: **Bazel 9.1.0, bzlmod,
+4,132 Java files, 8,760 targets.** Gerrit is Java-first where Ray is Python and
+C++ with Java attached.
+
+| Measurement | Gerrit |
+| --- | --- |
+| `query //...` (8,760 targets), warm | **0.15s** |
+| `query //...`, cold | 11.6s |
+| Indexing every `//java/...` library, 97 targets | **2m 04s, zero errors** |
+| Index size | 74.5 MB |
+| Definitions / occurrences | **50,646 / 637,714** |
+| Loading 97 shards | **343ms** |
+| `workspaceSymbol` | 1.5–3.1ms in-process, 22ms p50 through LSP |
+| `goToDefinition` | 230µs |
+| `findReferences` (200 of 1,683) | 47ms |
+
+**The fork works on Bazel 9 + bzlmod.** This is the configuration it was written
+for and the first time it has been exercised there — every one of the six fixes
+was needed, and the first target indexed in 1.5s.
+
+**F15's fan-out question, answered on a real Java codebase.** The worst symbol is
+`Account` at **2,372 references**, then `Project` at 1,683 and `Change` at 1,613.
+Four of 203 probed symbols exceed the 200 truncation cap.
+
+That is 7× Ray's worst and still nowhere near F15's fear that a common symbol's
+closure approximates the whole repo. Ranking and truncation handle it; a
+code-search index is not needed for this. The measurement stands as evidence
+rather than proof — Gerrit is 4,132 Java files, and a megarepo is more — but the
+shape of the answer is now known rather than guessed.
+
+**It also caught a live defect.** Asking for references to `Project` returned 200
+locations and said nothing about the other 1,483. The plan required a truncated
+answer to state its total; the implementation logged it and told the client
+nothing. An agent reads 200 as the whole answer. Fixed by adding
+`jabar/references`, which carries `returned`, `total` and `truncated` beside the
+locations, while the standard method stays conformant for clients that only speak
+LSP.
+
+**Submodules are a real prerequisite.** Gerrit vendors jgit and twelve plugins as
+git submodules, and without `git submodule update --init` every Bazel query fails
+at repository resolution rather than at anything jabar does. Another instance of
+the environment-fragility finding: the failure has nothing to do with indexing
+and stops it completely.
+
 ### Measured on Ray
 
 First real-repo run: `github.com/ray-project/ray` at `c547b78dbd` — 1.1GB, 3,289
