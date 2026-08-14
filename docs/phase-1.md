@@ -523,12 +523,87 @@ bitset distinguishing `Definition`, `Import`, `ReadAccess`, `WriteAccess`,
 `EXPECTATIONS.md` asks for — a rename touches all kinds, a call graph wants only
 some.
 
-**Open, and the first thing the spike must check:** whether SCIP carries enough
-enclosing-scope information to answer call hierarchy. Three of the nine
-operations are `prepareCallHierarchy`, `incomingCalls` and `outgoingCalls`, and
-SCIP was designed for Sourcegraph's definition/reference/hover surface. If the
-containing symbol of an occurrence is not derivable, call hierarchy needs
-something else and that changes M4 again.
+**The spike has run.** Results below; the format is confirmed, the tool is not.
+
+#### What SCIP delivers (better than expected)
+
+Indexing `fixtures/megarepo` produced 11 shards, one per Java target, 119KB total
+for 844 lines of Java. Against the golden answers in `EXPECTATIONS.md`:
+
+| Check | Expected | SCIP | |
+| --- | --- | --- | --- |
+| `Preconditions.checkNotNull` references | 30 | 30 | ✅ |
+| …in files | 15 | 15 | ✅ |
+| …across targets | 8 | 8 | ✅ |
+| `RetryPolicy` implementations | 3 | 3 | ✅ |
+
+Four things resolved that were open questions:
+
+- **Call hierarchy is answerable.** SCIP emits `enclosing_range_start` per symbol,
+  including locals and type parameters, so an occurrence's containing method is
+  derivable. That was the question gating M4, and the answer is yes.
+- **JDK symbols resolve, with versions.** `java/util/List#` comes back tagged
+  `semanticdb maven jdk 26`. This dissolves the jimage problem — no separate
+  reader for `$JAVA_HOME/lib/modules` is needed, because the indexer runs inside
+  javac and javac already knows.
+- **Symbols are global, not per-target.** A shard for `//java/com/acme/policy`
+  references `com/acme/core/RetryPolicy#` by the same symbol string the `core`
+  shard defines. Shards compose by construction.
+- **`hover` is covered too.** Occurrences carry `documentation` (the javadoc),
+  `signature_documentation`, `kind` and `display_name`.
+
+So SCIP answers eight of the nine operations directly, and the ninth
+(`documentSymbol`) falls out of a single shard.
+
+One detail worth keeping: a javadoc `{@link #checkNotNull}` is *not* emitted as a
+reference. `EXPECTATIONS.md` treats that as a distinct reference kind, so a
+rename would miss it. Minor, but it means SCIP is not a complete answer for
+rename.
+
+#### What does not work: scip-java on Bazel 9
+
+`scip-java` v0.12.3's Bazel aspect targets an older Bazel. Six distinct failures,
+hit in sequence on Bazel 9.2.0:
+
+| # | Failure | Fix |
+| --- | --- | --- |
+| 1 | Bazel not detected — requires a `WORKSPACE` file, so bzlmod-only repos are invisible even with `--build-tool bazel` | add `WORKSPACE` |
+| 2 | `name 'JavaInfo' is not defined` — moved into `rules_java` in Bazel 7+ | add a `load()` |
+| 3 | "Returning a struct from an aspect implementation function is deprecated" | `return []` |
+| 4 | `type 'depset' is not iterable` — `javac_options` changed shape | `.to_list()` |
+| 5 | `'struct' value has no field or method 'to_json'` | `json.encode()` |
+| 6 | javac options arrive as one concatenated string; javac rejects `invalid flag: -source 21 -target 21 '-XD…'` | **unfixed** — bypassed for the spike by dropping the options |
+
+Patches 1–5 are one-liners. #6 needs care, because splitting the string naively
+breaks on quoted values. The results above were obtained with javac options
+dropped entirely, which is fine for a spike and not fine for production — some
+options change what compiles.
+
+Telling detail: the aspect already carries a shim commented *"In different
+versions of bazel javac options are either a nested set or a depset or a list…"*.
+Bazel 9 is simply a case nobody has reached.
+
+#### The decision this forces
+
+Format and tool were separable choices, and this splits them. **SCIP as the
+format stands** — nothing in the spike argues against it and much argues for it.
+The tool is now a choice between:
+
+- **Fork the aspect.** `--bazel-aspect` points at a custom file, so this is
+  supported usage rather than a hack. The aspect is ~180 lines of Starlark; we
+  own five fixes already. The cost is tracking Bazel API churn, and the fixes are
+  worth upstreaming either way.
+- **Own the extractor.** Full control, but writing a javac plugin that does name
+  resolution is months, and it is precisely the work `scip-java` exists to save.
+
+The split that matters: the **fragile** part is the Bazel aspect (Starlark,
+tracks Bazel's API), and the **valuable** part is the javac plugin (resolution,
+SemanticDB, JDK handling). Forking the first while keeping the second is the
+cheap trade — a few hundred lines we control, against thousands we do not have to
+write.
+
+*Recommendation:* fork the aspect, keep the JVM indexer, upstream the fixes.
+Resolve #6 before M4 depends on it.
 
 ### F17 — A first build is a prerequisite, and the index should come from CI (rework)
 
@@ -844,7 +919,7 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | How does the client learn that a result was truncated? | A custom method returning an explicit total and a ranking rationale, with standard `textDocument/references` kept as a conformant fallback for Copilot. Silent truncation makes an agent confidently wrong. |
 | Own a Bazel daemon connection, or shell out per query? | Shell out to the CLI, which talks to the resident Bazel server — there is no per-query JVM warmup to avoid. The real cost is contention with the agent's own builds (F13), answered by a dedicated `--output_base` rather than by a different protocol. |
 | How does the index behave when a target's header jar is missing or stale? | Three-way source model per target: present → read it; absent → `TargetNotLoaded`, never `NoMatch`; source newer than jar → overlay from parsed source (F14). |
-| Where does call-site data for `findReferences` come from? | **Decided: build-time reference tables from an aspect, in SCIP format via `scip-java`.** A reference table needs name resolution, so the extractor was always a javac plugin; that already exists. Spike it against the fixture before committing (F15). |
+| Where does call-site data for `findReferences` come from? | **Decided: build-time reference tables, SCIP format, `scip-java`'s JVM indexer, our own fork of its Bazel aspect.** The spike confirmed SCIP answers 8 of 9 operations including call hierarchy, and matched the fixture's golden answers exactly — but scip-java's aspect does not run on Bazel 9 (F15). |
 | Is a first build a prerequisite? | **Yes, scoped — not `//...`.** An index is a build output, so require the build rather than engineer around its absence. Produced in CI and fetched where possible; locally as a fallback (F17). |
 | How does jabar learn a file changed outside the client? | **Undecided.** `didChangeWatchedFiles`, watchman, or an explicit `jabar/refresh` the agent calls after its own builds. The last is attractive because the client is the thing running the builds (F18). |
 | What is the unit of focus? | A set, not a target, with promote-on-write membership (F16). |
