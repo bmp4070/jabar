@@ -13,7 +13,7 @@ language server exists yet. `jabar` currently exits non-zero and says so.
 | `paths` | Absolute UTF-8 paths. Done, 7 tests. |
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
 | `telemetry` | Misbehaviour detection. Done, 15 tests. |
-| `bsp` | Not started. Build Server Protocol client. |
+| `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |
 | `jabar-server` | Not started beyond a stub binary. |
 
 ## Why this exists rather than using an existing Java LSP

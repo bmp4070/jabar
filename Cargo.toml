@@ -12,7 +12,7 @@ publish = false
 [workspace.dependencies]
 paths = { path = "crates/paths" }
 vfs = { path = "crates/vfs" }
-bsp = { path = "crates/bsp" }
+build-model = { path = "crates/build-model" }
 telemetry = { path = "crates/telemetry" }
 
 anyhow = "1.0.102"

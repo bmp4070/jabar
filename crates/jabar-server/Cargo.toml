@@ -16,7 +16,7 @@ path = "src/bin/main.rs"
 [dependencies]
 paths.workspace = true
 vfs.workspace = true
-bsp.workspace = true
+build-model.workspace = true
 telemetry.workspace = true
 
 anyhow.workspace = true

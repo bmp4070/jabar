@@ -1,5 +1,5 @@
 [package]
-name = "bsp"
+name = "build-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,13 @@ publish.workspace = true
 
 [dependencies]
 paths.workspace = true
+telemetry.workspace = true
+
+anyhow.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
