@@ -109,8 +109,8 @@ reach the warm state the whole design is built around.
 
 Ordered by how expensive the mistake is to undo, not by sequence. F1–F3 follow
 from the consumer profile, F8–F9 from adding debugging, F10–F12 from measuring
-Bazel and tree-sitter rather than assuming, and F13–F16 from an external review
-of this document; the rest hold regardless of who calls the server.
+Bazel and tree-sitter rather than assuming, and F13–F18 from an external review
+of this document and the decisions that followed it; the rest hold regardless of who calls the server.
 
 ### F1 — Focus Target answers the question the agent asks last (blocking)
 
@@ -481,6 +481,110 @@ aspect means re-running it over the repo — this must be decided before M4 sets
 the index schema. The reference fan-out measurement in the M3 gate exists to size
 it.
 
+### F15 resolved — consume SCIP from a scip-java aspect
+
+Decided: **build-time reference tables, produced by an aspect, in SCIP format via
+`scip-java`.** Not a bespoke extractor.
+
+The reasoning that settles it: a reference table has to know *which*
+`checkNotNull`, which is name resolution, which needs javac's resolved AST.
+tree-sitter cannot do it. So the build-time indexer was always going to be a
+javac plugin — and that is a thing that already exists, maintained by someone
+else against new Java versions.
+
+`scip-java` gained automatic Bazel support in v0.8.24. It is invoked as
+
+```
+scip-java index "--bazel-scip-java-binary=$(which scip-java)"
+```
+
+and the flag is mandatory because *it runs an aspect that needs the absolute path
+to the binary* — i.e. the mechanism this plan chose independently. Indexing
+happens inside the Bazel action graph, so it inherits parallel compilation and
+the build cache. Java on Bazel is supported; Kotlin on Bazel is not, which is
+worth knowing if the repo has any.
+
+The SCIP schema covers more of the nine operations than the header-jar plan did:
+
+| Operation | SCIP mechanism |
+| --- | --- |
+| `workspaceSymbol` | `Occurrence` with `SymbolRole::Definition` |
+| `goToDefinition` | same, plus `Document.relative_path` |
+| `findReferences` | non-definition occurrences; `Relationship.is_reference` |
+| `goToImplementation` | `Relationship.is_implementation` |
+| Positions | `single_line_range` / `multi_line_range`, per occurrence |
+
+Two details that matter to work already done. `Document.position_encoding` is an
+explicit field, and JVM indexers emit `UTF16CodeUnitOffsetFromLineStart` — so
+`LineIndex` is exactly the bridge needed when a client negotiates UTF-8, and M1's
+encoding work is load-bearing rather than incidental. And `SymbolRole` is a
+bitset distinguishing `Definition`, `Import`, `ReadAccess`, `WriteAccess`,
+`Generated` and `Test`, which is the reference-kind distinction
+`EXPECTATIONS.md` asks for — a rename touches all kinds, a call graph wants only
+some.
+
+**Open, and the first thing the spike must check:** whether SCIP carries enough
+enclosing-scope information to answer call hierarchy. Three of the nine
+operations are `prepareCallHierarchy`, `incomingCalls` and `outgoingCalls`, and
+SCIP was designed for Sourcegraph's definition/reference/hover surface. If the
+containing symbol of an occurrence is not derivable, call hierarchy needs
+something else and that changes M4 again.
+
+### F17 — A first build is a prerequisite, and the index should come from CI (rework)
+
+Follows from F14 and closes it. If the index is a build output, then having one
+means a build has happened; so require it rather than engineering around its
+absence. That collapses M4's three-way source model to two: indexed, or dirty.
+
+Three consequences.
+
+**Scope it, do not build the world.** On a real megarepo `bazel build //...` is
+not merely slow — it includes targets that are broken at HEAD, need credentials,
+or want toolchains the machine does not have. Nobody runs it. The index scope has
+to be configurable (`//myteam/...` and its deps), and designing for that from the
+start avoids the assumption that will not survive contact.
+
+**A dedicated `--output_base` becomes required, not a candidate.** F13 was about
+queries blocking the agent's builds. Running *builds* in the background holds the
+exclusive workspace lock for minutes, directly stalling `bazel test`. The cost of
+a separate output base is that jabar's builds miss the agent's local action
+cache, so the remote cache has to carry it.
+
+**The index should be produced in CI, not locally.** This is how the comparable
+systems work — Kythe at Google, Glean at Meta, SCIP at Sourcegraph: the build
+already runs for every commit, the aspect rides along, and the index is uploaded
+to a shared store that clients fetch from. That is the PDF's "Remote Cache
+Hydration", which this plan filed as an optional Phase 3 optimization. Between
+F14 and this, that was wrong: it is what makes the aspect approach viable at
+scale, not a later optimization. Local indexing remains the fallback and the
+small-repo path. The aspect is the same either way, which is what makes it safe
+to build now and decide distribution later.
+
+**What none of this fixes:** the window between an agent writing a file and a
+build running. Nothing build-based can close it. That is what the dirty-file
+overlay is for, and it gives tree-sitter a clearer job than "positions":
+
+```
+committed and built  →  SCIP index          complete, resolved, remotely cached
+dirty or new files   →  tree-sitter overlay immediate, shallow, local
+```
+
+An unindexed symbol must report `IndexStale`, never `NoMatch`.
+
+### F18 — File watching is missing from the plan entirely (gap)
+
+Raised by the same review. F3's read-after-write barrier covers writes arriving
+through `didOpen`/`didChange` or a re-stat. It does not cover branch switches,
+codegen, or another tool mutating files — and under F17 those are exactly what
+must trigger a background reindex.
+
+Recursive watching of a megarepo is its own hard problem; `notify` does not scale
+to it, which is why watchman and fsmonitor exist. This needs a decision, not a
+default: client `didChangeWatchedFiles` only, a watchman integration, or an
+explicit `jabar/refresh` the agent calls after its own builds. The last is worth
+serious consideration precisely because the client here *is* the thing running
+the builds.
+
 ### F16 — Agents have no stable focus target (rework)
 
 `RootKind::FocusTarget` and `is_editable` in `base-db` assume a human who keeps
@@ -657,7 +761,7 @@ engineers and are the softest part of this document.
 | M1 | LSP shell | Claude Code completes a session over stdio: lifecycle, encoding negotiation, incremental text sync into the VFS, and a `jabar/status` request. No capability is advertised that is not served. **Done.** | 1–2 |
 | M2 | VFS and salsa inputs | A test writes a file out of band, immediately queries, and sees the new content. A second test proves a `LOW`-durability edit does not invalidate `HIGH`-durability derived values. | 2–3 |
 | M3 | Build graph | Targets, sources, classpath and the JVM run environment resolved and cached to disk; **the graph-access gate below is measured and recorded**; the jar-versus-srcjar decision written down with a working spike behind it. | 3–5 |
-| M4 | Shallow global index | `workspaceSymbol` answers across the whole fixture repo from a cold process in under a second, served from the on-disk index. Built from header jars unless the M3 gate said otherwise, with `tree-sitter-java` resolving positions lazily per result (F12). Truncation layer returns a stated total, not a silently clipped list. | 5–7 |
+| M4 | Global index | `workspaceSymbol` and `findReferences` answer across the whole fixture repo from a cold process in under a second, served from an on-disk SCIP index produced by the `scip-java` aspect (F15), with a `tree-sitter-java` overlay for dirty files (F17). Results match `EXPECTATIONS.md`. Truncation returns a stated total, not a silently clipped list. | 5–7 |
 | M5 | Focus slice | A local query loads exactly its target's slice and nothing more; a `BUILD` edit re-slices and invalidates the affected shard, debounced. | 7–8 |
 | M6 | Instrumentation | Cold p50 for `workspaceSymbol` and `goToDefinition` measured on a real target, not just the fixture. Reference fan-out distribution recorded to size the truncation budget. | 8 |
 
@@ -700,6 +804,23 @@ A sixth is a five-minute check rather than a measurement: run
 large target and confirm whether the argv is a params-file reference. See the
 note under §5.
 
+**The scip-java spike, which now gates M4's design.** Run `scip-java index` over
+`fixtures/megarepo` and check, in this order:
+
+1. Does it run against Bazel 9.2.0 at all? Its Bazel support may target an older
+   Bazel, and that is a hard blocker rather than a detail.
+2. Does SCIP carry enough enclosing-scope information to answer call hierarchy?
+   Three of nine operations depend on it (F15).
+3. Do the emitted definitions and references match `EXPECTATIONS.md`? The fixture
+   already states the golden answers — 30 `checkNotNull` call sites across 15
+   files in 8 targets, three `RetryPolicy` implementations in two targets — so
+   this is a conformance check rather than an inspection.
+4. What does the index weigh per target? That sizes the distribution problem in
+   F17.
+
+Half a day, and it either de-risks the largest item in the project or says to
+write our own extractor.
+
 **Schedule risk.** M3 and M4 are where this slips, and they share a root cause:
 nothing here has been measured against a repo of your size. If M3 threatens M4,
 stub the workspace model from a checked-in JSON dump and build M4 against it —
@@ -723,7 +844,9 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | How does the client learn that a result was truncated? | A custom method returning an explicit total and a ranking rationale, with standard `textDocument/references` kept as a conformant fallback for Copilot. Silent truncation makes an agent confidently wrong. |
 | Own a Bazel daemon connection, or shell out per query? | Shell out to the CLI, which talks to the resident Bazel server — there is no per-query JVM warmup to avoid. The real cost is contention with the agent's own builds (F13), answered by a dedicated `--output_base` rather than by a different protocol. |
 | How does the index behave when a target's header jar is missing or stale? | Three-way source model per target: present → read it; absent → `TargetNotLoaded`, never `NoMatch`; source newer than jar → overlay from parsed source (F14). |
-| Where does call-site data for `findReferences` come from? | **Undecided, and blocking M4.** Either a persistent identifier-occurrence index or build-time reference tables from an aspect. Measurement 4 at the M3 gate sizes it (F15). |
+| Where does call-site data for `findReferences` come from? | **Decided: build-time reference tables from an aspect, in SCIP format via `scip-java`.** A reference table needs name resolution, so the extractor was always a javac plugin; that already exists. Spike it against the fixture before committing (F15). |
+| Is a first build a prerequisite? | **Yes, scoped — not `//...`.** An index is a build output, so require the build rather than engineer around its absence. Produced in CI and fetched where possible; locally as a fallback (F17). |
+| How does jabar learn a file changed outside the client? | **Undecided.** `didChangeWatchedFiles`, watchman, or an explicit `jabar/refresh` the agent calls after its own builds. The last is attractive because the client is the thing running the builds (F18). |
 | What is the unit of focus? | A set, not a target, with promote-on-write membership (F16). |
 | What happens when a file belongs to no target, or to several? | Several: pick deterministically and log. None: index standalone with an empty classpath rather than failing. Agents hit generated and scratch files constantly. |
 
@@ -750,8 +873,12 @@ Phase 1 is done when all of these hold.
       committed.
 - [ ] All five M3 gate measurements are taken on the real repo and their numbers
       recorded in this document.
-- [ ] The reference-index decision (F15) is written down, since it sets the M4
-      index schema.
+- [ ] The `scip-java` spike has run against the fixture, and call hierarchy is
+      either answerable from SCIP or has a written alternative (F15).
+- [ ] The index scope is configurable, and `//...` is nowhere assumed (F17).
+- [ ] jabar builds in its own `--output_base`, verified not to block a concurrent
+      `bazel test` (F13, F17).
+- [ ] The file-change trigger is decided and implemented (F18).
 - [ ] An `@params-file` javac action is either handled or refused loudly — never
       parsed into an empty `CompileInfo`.
 - [ ] No standard-method query returns an empty success when the true answer is
