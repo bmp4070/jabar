@@ -16,6 +16,7 @@ capability it cannot serve, so clients never receive an empty answer that means
 | `paths` | Absolute UTF-8 paths. Done, 7 tests. |
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
 | `telemetry` | Misbehaviour detection. Done, 15 tests. |
+| `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
 | `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |
 | `jabar-server` | LSP shell: lifecycle, encoding, text sync, status. Done, 54 tests. No queries yet. |
 

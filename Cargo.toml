@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 paths = { path = "crates/paths" }
 vfs = { path = "crates/vfs" }
+base-db = { path = "crates/base-db" }
 build-model = { path = "crates/build-model" }
 telemetry = { path = "crates/telemetry" }
 
@@ -22,6 +23,7 @@ indexmap = "2.14.0"
 lsp-server = "0.7.9"
 lsp-types = "=0.95.0"
 rustc-hash = "2.1.1"
+salsa = "0.28.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tracing = "0.1.44"
