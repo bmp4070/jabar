@@ -107,9 +107,10 @@ reach the warm state the whole design is built around.
 
 ## 3. Findings
 
-Ordered by how expensive the mistake is to undo, not by sequence. The first three
-follow from the consumer profile and the last two from adding debugging; the rest
-hold regardless of who calls the server.
+Ordered by how expensive the mistake is to undo, not by sequence. F1–F3 follow
+from the consumer profile, F8–F9 from adding debugging, and F10–F11 from
+measuring Bazel rather than assuming; the rest hold regardless of who calls the
+server.
 
 ### F1 — Focus Target answers the question the agent asks last (blocking)
 
@@ -279,6 +280,64 @@ The cost is a coupling to the custom commands `java-debug` expects from its
 language server — a real dependency, but a documented and small one, and far
 cheaper than owning a JDI implementation.
 
+### F10 — Bazel already builds the item tree (blocking)
+
+Measured against `fixtures/megarepo`, not assumed. Every entry on a target's
+javac classpath is a *header jar*: `libpolicy-hjar.jar`, never `libpolicy.jar`.
+Confirmed with `javap` — class names, supertypes, interfaces and full method
+signatures, with the `Code` attribute stripped:
+
+```
+FULL jar                          HEADER jar
+public boolean shouldRetry(...)   public boolean shouldRetry(...)
+  Code:                           public int maxAttempts();
+     0: iload_1  …                  ← no body at all
+```
+
+That is an item tree, in the sense F2 and Phase 2 both mean. Bazel builds one
+per target as part of every compile, caches it remotely, and invalidates it
+correctly. It is the artifact M4 was going to write an aspect to produce.
+
+The limit is as sharp as the opportunity. Header jars carry **no `SourceFile`
+and no `LineNumberTable`** — verified. They answer "does this symbol exist and
+what shape is it" and never "where is it". Positions need a second, lazy step
+against the source file `aquery` already names.
+
+*Phase 1 action:* build the shallow tier by reading header jars rather than by
+authoring a Bazel aspect. Resolve positions lazily, per result. See the M3 gate
+below for the measurement that decides whether an aspect becomes necessary
+after all.
+
+### F11 — Skyframe is not externally reachable, and aspects are the only alternative to query (gap)
+
+The PDF proposes querying "Bazel's Skyframe" directly. There is no such door:
+Skyframe is internal to the Bazel server's JVM, and an outside process reaches
+it only through `query`, `cquery`, `aquery`, or an aspect. Those *are* the
+Skyframe API. Nothing lower is available to a Rust process, so the real choice
+is aspects versus the query family.
+
+| | Aspects | Query family |
+| --- | --- | --- |
+| Runs as | build actions | loading / analysis phase |
+| Remote-cacheable | **yes** | no |
+| Needs a repo change | yes, a `.bzl` file | no |
+| Push invalidation | via the build | no, polling only |
+| Measured on the fixture | not authored | 67–170ms per query |
+| Version coupling | rules_java internals | JavaBuilder flag names |
+
+Both are fragile, differently. The aspect flavour is already visible: the
+`JavaInfo` provider key is `@@rules_java+//java/private:java_info.bzl%JavaInfo`
+under bzlmod, not `"JavaInfo"` — it moved into Starlark and the key is
+version-qualified.
+
+The aspect's real advantage is the remote cache, which is the only mechanism
+that answers F5. But given F10, the shallow tier needs no aspect: the artifact
+already exists and is already cached. An aspect earns its place only when
+something is needed that the build does not already produce — which, concretely,
+means positions.
+
+*Recommendation:* query family now, aspect only if the M3 gate says so.
+
 ### One earlier finding, downgraded
 
 An earlier draft flagged tower-lsp as a rework item on cancellation grounds. With
@@ -298,9 +357,9 @@ blocker.
   shaping and truncation.
 - VFS: path interning, `FileId` allocation, change batching, content hashing,
   virtual paths for jar entries, read-after-write barrier.
-- BSP client: transport, the methods that matter (including the JVM run
-  environment, for DAP in Phase 2), on-disk graph cache, `buildTarget/didChange`
-  invalidation.
+- Build-graph access: targets, sources, classpath and the JVM run environment
+  (the last for DAP in Phase 2), on-disk graph cache, and an invalidation story.
+  Via the bazel CLI rather than BSP; see F11 and the M3 gate.
 - Shallow global index: names, kinds, owning target, ranges, supertype edges —
   built from a Bazel aspect and persisted.
 - Focus slice plumbing: `inverseSources` → transitive slice → durability-tagged
@@ -362,8 +421,7 @@ jabar/
 ├── crates/
 │   ├── paths          absolute, UTF-8 paths — thin wrapper over camino
 │   ├── vfs            FileId interner, change log, VfsPath (incl. jar:// virtual)
-│   ├── bsp            BSP wire types + client, transport = lsp-server
-│   ├── build-model    BSP → JavaWorkspace → source roots, classpath, durability
+│   ├── build-model    bazel labels, aquery parsing, CLI queries, durability
 │   ├── symbol-index   shallow global tier: names, supertypes, persistence
 │   ├── telemetry      outcome/invariant recording, health summary
 │   ├── base-db        salsa inputs only in Phase 1
@@ -386,16 +444,40 @@ engineers and are the softest part of this document.
 | M0 | Skeleton and harness | Fixture repo builds; `tracing` spans emit; CI green. | 1 |
 | M1 | LSP shell | Claude Code connects and gets a well-formed answer to `documentSymbol`. Truncation layer returns a stated total, not a silently clipped list. | 1–2 |
 | M2 | VFS and salsa inputs | A test writes a file out of band, immediately queries, and sees the new content. A second test proves a `LOW`-durability edit does not invalidate `HIGH`-durability derived values. | 2–3 |
-| M3 | BSP client | Handshake with bazel-bsp; targets, sources, javacOptions and the JVM run environment cached to disk; the jar-versus-srcjar decision written down with a working spike behind it. | 3–5 |
-| M4 | Shallow global index | `workspaceSymbol` answers across the whole fixture repo from a cold process in under a second, served from the on-disk index. | 5–7 |
+| M3 | Build graph | Targets, sources, classpath and the JVM run environment resolved and cached to disk; **the graph-access gate below is measured and recorded**; the jar-versus-srcjar decision written down with a working spike behind it. | 3–5 |
+| M4 | Shallow global index | `workspaceSymbol` answers across the whole fixture repo from a cold process in under a second, served from the on-disk index. Built from header jars unless the M3 gate said otherwise. | 5–7 |
 | M5 | Focus slice | A local query loads exactly its target's slice and nothing more; a `BUILD` edit re-slices and invalidates the affected shard, debounced. | 7–8 |
 | M6 | Instrumentation | Cold p50 for `workspaceSymbol` and `goToDefinition` measured on a real target, not just the fixture. Reference fan-out distribution recorded to size the truncation budget. | 8 |
 
+### The M3 gate: how the build graph is reached
+
+Everything above is calibrated on twelve targets. One measurement decides whether
+the query family carries M4 or an aspect has to be written, and it must be taken
+on the real repo before M4 starts:
+
+> **Time `bazel cquery //... --output=starlark` over the whole repo, cold and
+> warm.** That is the analysis phase across the full graph — the cost an aspect
+> amortizes through the remote cache and the query family pays on every server
+> start.
+
+Read it as:
+
+- **Seconds.** Skip the aspect. Enumerate targets with `cquery`, read header
+  jars, resolve positions lazily. No repo change, nothing to get signed off.
+- **Minutes.** The aspect is buying the remote cache, and F5 makes that
+  decisive. Write it — and since you are paying for an aspect anyway, have it
+  emit positions too, which is the one thing header jars cannot give you.
+
+Record the number in this document when it is taken. Two supporting numbers are
+worth the same trip: how long `bazel query same_pkg_direct_rdeps` takes on a
+cold server, and how large the header jars for one deep target's closure are in
+total, since that is what the shallow index has to read.
+
 **Schedule risk.** M3 and M4 are where this slips, and they share a root cause:
-nobody has measured bazel-bsp or a custom aspect against a repo of your size. If
-M3 threatens M4, stub `JavaWorkspace` from a checked-in JSON dump and build M4
-against it — the index design is worth proving even on fake graph data, and M4 is
-the milestone this consumer actually needs.
+nothing here has been measured against a repo of your size. If M3 threatens M4,
+stub the workspace model from a checked-in JSON dump and build M4 against it —
+the index design is worth proving even on fake graph data, and M4 is the
+milestone this consumer actually needs.
 
 ## 7. Decisions Phase 1 must close
 
@@ -404,6 +486,8 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | Question | Recommendation |
 | --- | --- |
 | How do external dependencies enter the database — jars, srcjars, or both? | Classfile reader as the primary path, srcjars opportunistically when BSP offers them. Bytecode already carries the names, signatures and supertypes the shallow tier needs. |
+| Aspects or the query family for reaching the build graph? | Query family now. Skyframe is not externally reachable, so those are the only two doors, and F10 means the shallow tier needs no aspect. Revisit only if the M3 gate shows `cquery //...` costing minutes, or once positions must be precomputed. |
+| BSP, or the bazel CLI? | The CLI. bazel-bsp is a JVM tool needing coursier and version-matching, and `query`/`aquery` answer the same questions of the same graph in 67–170ms. Keep aquery parsing separate from the CLI runner so BSP can be added later for `buildTarget/didChange` push invalidation. |
 | Build the debug adapter, or drive an existing one? | Drive `java-debug` as a subprocess. Supply the launch config and jar-to-source mapping — the two things it cannot derive under Bazel — and let it own JDI, stepping and thread control. |
 | Does the shallow index live in salsa, or beside it? | Beside it, as a plain persisted structure keyed by target. It changes only when the build graph changes, so putting it under salsa buys invalidation you do not need and costs a serialization story you do. |
 | Does `VfsPath` carry jar-internal entries, or do jars get extracted to a cache directory? | Virtual paths. Extraction adds an I/O and invalidation problem the design is explicitly trying to avoid. |
@@ -433,6 +517,8 @@ Phase 1 is done when all of these hold.
       a fixture session shows zero misleading empties.
 - [ ] The classpath decision is written down with the spike that justifies it
       committed.
+- [ ] The M3 graph-access gate is measured on the real repo and its number
+      recorded in this document.
 - [ ] No parser and no completion code exist in the tree. If either crept in,
       scope was not held.
 
