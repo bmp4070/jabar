@@ -175,11 +175,32 @@ fn advertises_only_what_is_implemented() {
 
 #[test]
 fn an_unknown_method_is_refused_rather_than_answered_empty() {
+    // `hover` is genuinely not implemented. When it is, this test should move
+    // to another unimplemented method rather than be deleted -- the property is
+    // that jabar never answers a method it does not serve.
     let mut harness = Harness::start(None, utf8_client());
-    let id = harness.send_request("textDocument/definition", json!({}));
+    let id = harness.send_request("textDocument/hover", json!({}));
     let error = harness.expect_err(id);
     assert_eq!(error.code, lsp_server::ErrorCode::MethodNotFound as i32);
-    assert!(error.message.contains("textDocument/definition"), "message: {}", error.message);
+    assert!(error.message.contains("textDocument/hover"), "message: {}", error.message);
+    harness.shutdown();
+}
+
+#[test]
+fn an_implemented_query_without_an_index_refuses_rather_than_returning_null() {
+    // `definition` is implemented, but there is no index. A null result would
+    // read as "no definition exists", which is a different and false claim.
+    let mut harness = Harness::start(Some("file:///repo"), utf8_client());
+    let id = harness.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": "file:///repo/A.java" },
+            "position": { "line": 0, "character": 0 }
+        }),
+    );
+    let error = harness.expect_err(id);
+    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
+    assert!(error.message.contains("index"), "message: {}", error.message);
     harness.shutdown();
 }
 

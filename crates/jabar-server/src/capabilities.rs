@@ -142,6 +142,8 @@ mod tests {
         let caps = server_capabilities(PositionEncoding::Utf8);
         assert!(caps.document_symbol_provider.is_none(), "no parser yet");
         assert!(caps.workspace_symbol_provider.is_none(), "no index yet");
+        // Registered dynamically once an index loads, not advertised at
+        // initialize -- before that there is nothing behind them.
         assert!(caps.definition_provider.is_none());
         assert!(caps.references_provider.is_none());
         assert!(caps.hover_provider.is_none());

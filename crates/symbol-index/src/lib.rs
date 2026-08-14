@@ -151,6 +151,17 @@ pub struct Reference {
     pub is_import: bool,
 }
 
+/// One symbol occurrence in a file, for position lookup.
+///
+/// Symbols are held as ids into [`SymbolIndex::symbol_names`] rather than as
+/// strings: a large repo has far more occurrences than distinct symbols, and a
+/// SCIP symbol string runs to sixty-odd bytes.
+#[derive(Copy, Clone, Debug)]
+struct Occurrence {
+    range: Range,
+    symbol: u32,
+}
+
 /// Symbols and references, keyed for lookup.
 #[derive(Default)]
 pub struct SymbolIndex {
@@ -163,6 +174,11 @@ pub struct SymbolIndex {
     references: FxHashMap<String, Vec<Reference>>,
     /// Supertype symbol to the symbols implementing it.
     implementors: FxHashMap<String, Vec<usize>>,
+    /// Every occurrence in a file, ordered by position, for cursor lookup.
+    occurrences: FxHashMap<String, Vec<Occurrence>>,
+    /// Interned symbol strings, indexed by the ids in [`Occurrence`].
+    symbol_names: Vec<String>,
+    symbol_ids: FxHashMap<String, u32>,
     shards: usize,
 }
 
@@ -225,6 +241,12 @@ impl SymbolIndex {
                     continue;
                 }
                 let roles = occ.symbol_roles;
+                let symbol_id = self.intern_symbol(&occ.symbol);
+                self.occurrences
+                    .entry(path.clone())
+                    .or_default()
+                    .push(Occurrence { range, symbol: symbol_id });
+
                 if roles & SymbolRole::Definition as i32 != 0 {
                     let info = meta.get(occ.symbol.as_str());
                     self.insert(Definition {
@@ -257,7 +279,23 @@ impl SymbolIndex {
                     });
                 }
             }
+
+            // Ordered once per document so lookup can stop early. SCIP emits
+            // occurrences in source order already, but nothing guarantees it.
+            if let Some(occurrences) = self.occurrences.get_mut(&path) {
+                occurrences.sort_by_key(|o| (o.range.start_line, o.range.start_col));
+            }
         }
+    }
+
+    fn intern_symbol(&mut self, symbol: &str) -> u32 {
+        if let Some(&id) = self.symbol_ids.get(symbol) {
+            return id;
+        }
+        let id = self.symbol_names.len() as u32;
+        self.symbol_names.push(symbol.to_owned());
+        self.symbol_ids.insert(symbol.to_owned(), id);
+        id
     }
 
     /// Adds a definition directly, for callers that build an index from
@@ -315,6 +353,46 @@ impl SymbolIndex {
         hits
     }
 
+    /// The symbol whose occurrence covers `(line, col)` in `path`.
+    ///
+    /// `col` is a UTF-16 code unit offset, matching what the index stores — the
+    /// caller converts from the client's encoding first.
+    ///
+    /// Ranges are half-open at the end, so a cursor resting immediately after an
+    /// identifier does not select it. That matches how editors place a caret and
+    /// avoids `foo|(bar)` resolving to `foo` when the user means the call.
+    ///
+    /// When occurrences overlap — a generic type argument inside a wider type
+    /// reference — the narrowest wins, since that is what the cursor is most
+    /// precisely on.
+    pub fn symbol_at(&self, path: &str, line: u32, col: u32) -> Option<&str> {
+        let occurrences = self.occurrences.get(path)?;
+        let mut best: Option<&Occurrence> = None;
+        for occ in occurrences {
+            // Sorted by start, so once a start is past the cursor's line we are
+            // done -- multi-line ranges starting earlier are already seen.
+            if occ.range.start_line > line {
+                break;
+            }
+            if !covers(&occ.range, line, col) {
+                continue;
+            }
+            let narrower = match best {
+                None => true,
+                Some(current) => span_len(&occ.range) < span_len(&current.range),
+            };
+            if narrower {
+                best = Some(occ);
+            }
+        }
+        best.map(|o| self.symbol_names[o.symbol as usize].as_str())
+    }
+
+    /// Total occurrences held, across every file.
+    pub fn occurrence_count(&self) -> usize {
+        self.occurrences.values().map(Vec::len).sum()
+    }
+
     pub fn definition(&self, symbol: &str) -> Option<&Definition> {
         self.by_symbol.get(symbol).map(|&i| &self.definitions[i])
     }
@@ -331,6 +409,30 @@ impl SymbolIndex {
             .map(|idxs| idxs.iter().map(|&i| &self.definitions[i]).collect())
             .unwrap_or_default()
     }
+}
+
+/// Whether `range` covers `(line, col)`, treating the end as exclusive.
+fn covers(range: &Range, line: u32, col: u32) -> bool {
+    if line < range.start_line || line > range.end_line {
+        return false;
+    }
+    if line == range.start_line && col < range.start_col {
+        return false;
+    }
+    if line == range.end_line && col >= range.end_col {
+        return false;
+    }
+    true
+}
+
+/// A comparable size for a range, for picking the narrowest of several.
+///
+/// Multi-line ranges are always wider than single-line ones, so the line span
+/// dominates and the column span breaks ties.
+fn span_len(range: &Range) -> u64 {
+    let lines = (range.end_line - range.start_line) as u64;
+    let cols = range.end_col.saturating_sub(range.start_col) as u64;
+    lines * u64::from(u32::MAX) + cols
 }
 
 /// 0 for an exact match, 1 for a prefix match, 2 otherwise.
@@ -483,6 +585,51 @@ mod tests {
         index.insert(def("com/acme/A#", "A"));
         assert_eq!(index.definition_count(), 1);
         assert_eq!(index.search("A").len(), 1);
+    }
+
+    fn r(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
+        Range { start_line: sl, start_col: sc, end_line: el, end_col: ec }
+    }
+
+    #[test]
+    fn a_range_covers_its_own_span_but_not_the_character_after() {
+        let range = r(5, 10, 5, 15);
+        assert!(covers(&range, 5, 10), "the first character is inside");
+        assert!(covers(&range, 5, 14), "the last character is inside");
+        // Half-open: a caret resting after an identifier does not select it,
+        // which is how editors place the cursor after a click at a word's end.
+        assert!(!covers(&range, 5, 15));
+        assert!(!covers(&range, 5, 9));
+        assert!(!covers(&range, 4, 12), "wrong line");
+        assert!(!covers(&range, 6, 12));
+    }
+
+    #[test]
+    fn multi_line_ranges_cover_their_interior() {
+        let range = r(2, 30, 4, 5);
+        assert!(covers(&range, 2, 30), "start of the first line");
+        assert!(!covers(&range, 2, 29), "before the start on the first line");
+        assert!(covers(&range, 3, 0), "any column on an interior line");
+        assert!(covers(&range, 3, 9999));
+        assert!(covers(&range, 4, 4), "up to the end on the last line");
+        assert!(!covers(&range, 4, 5));
+    }
+
+    #[test]
+    fn the_narrowest_overlapping_range_wins() {
+        // `Map<String, RetryPolicy>` -- the cursor on `RetryPolicy` sits inside
+        // both the whole type reference and the argument. The argument is what
+        // the user means.
+        assert!(span_len(&r(0, 10, 0, 21)) < span_len(&r(0, 0, 0, 30)));
+        // A multi-line range is always wider than a single-line one.
+        assert!(span_len(&r(0, 0, 0, 999)) < span_len(&r(0, 0, 1, 0)));
+    }
+
+    #[test]
+    fn a_position_in_an_unknown_file_resolves_to_nothing() {
+        let index = SymbolIndex::default();
+        assert_eq!(index.symbol_at("nowhere/A.java", 0, 0), None);
+        assert_eq!(index.occurrence_count(), 0);
     }
 
     #[test]

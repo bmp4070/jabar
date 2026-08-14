@@ -104,14 +104,23 @@ fn convert_range(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Range {
-    let raw = def.range;
+    convert_span(&def.path, def.range, def.encoding, client_encoding, read_file)
+}
+
+fn convert_span(
+    path: &str,
+    raw: symbol_index::Range,
+    index_encoding: symbol_index::PositionEncoding,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Range {
     let passthrough = Range {
         start: Position::new(raw.start_line, raw.start_col),
         end: Position::new(raw.end_line, raw.end_col),
     };
 
     // Identical encodings need no text and no work.
-    let index_encoding = match def.encoding {
+    let index_encoding = match index_encoding {
         PositionEncoding::Utf8 => ClientEncoding::Utf8,
         // UTF-32 is not something a JVM indexer emits; treating it as UTF-16
         // is wrong only for astral characters, and passthrough would be worse.
@@ -121,8 +130,8 @@ fn convert_range(
         return passthrough;
     }
 
-    let Some(text) = read_file(&def.path) else {
-        tracing::debug!(path = %def.path, "no text for column conversion; passing columns through");
+    let Some(text) = read_file(path) else {
+        tracing::debug!(path, "no text for column conversion; passing columns through");
         return passthrough;
     };
     let line_index = LineIndex::new(&text);
@@ -154,6 +163,155 @@ fn to_lsp_kind(kind: SymbolKind) -> LspKind {
         SymbolKind::Field => LspKind::FIELD,
         SymbolKind::Other => LspKind::OBJECT,
     }
+}
+
+/// How many references a single response carries.
+///
+/// Higher than [`SEARCH_LIMIT`] because references are the query where the
+/// caller most needs breadth — "who calls this" with twenty of four hundred
+/// answers is close to useless — but still bounded, because the alternative on
+/// a common symbol is a response no client can read.
+pub const REFERENCE_LIMIT: usize = 200;
+
+/// A resolved location, plus what the index knew about it.
+pub struct Located {
+    pub location: Location,
+    /// The SCIP symbol, so a caller can chain another query without re-resolving.
+    pub symbol: String,
+}
+
+/// Resolves the symbol under a cursor to its definition.
+///
+/// `position` arrives in the client's encoding and is converted to the index's
+/// UTF-16 columns before lookup — the two disagree on any line with a non-ASCII
+/// character, which is most lines in a real internationalised codebase.
+pub fn goto_definition(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<Located> {
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let def = index.definition(&symbol)?;
+    let location = to_location(
+        def.path.as_str(),
+        def.range,
+        def.encoding,
+        workspace_root,
+        client_encoding,
+        read_file,
+    )?;
+    Some(Located { location, symbol })
+}
+
+/// References to the symbol under a cursor, ranked and capped.
+///
+/// The definition is included when `include_declaration` is set, which is what
+/// the LSP request's own parameter asks for.
+pub fn find_references(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    include_declaration: bool,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<ReferenceResults> {
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+
+    let mut hits: Vec<(&str, symbol_index::Range, symbol_index::PositionEncoding)> = Vec::new();
+    if include_declaration && let Some(def) = index.definition(&symbol) {
+        hits.push((def.path.as_str(), def.range, def.encoding));
+    }
+    for reference in index.references(&symbol) {
+        hits.push((reference.path.as_str(), reference.range, reference.encoding));
+    }
+
+    // Same file first, then same directory, then everything else. A caller
+    // reading a truncated list gets the references nearest what it was looking
+    // at, which is the ordering an agent can act on without re-querying.
+    let here_dir = parent_dir(relative_path);
+    hits.sort_by_key(|(path, range, _)| {
+        let proximity = if *path == relative_path {
+            0
+        } else if parent_dir(path) == here_dir {
+            1
+        } else {
+            2
+        };
+        (proximity, path.to_owned(), range.start_line, range.start_col)
+    });
+
+    let total = hits.len();
+    let locations = hits
+        .into_iter()
+        .take(REFERENCE_LIMIT)
+        .filter_map(|(path, range, encoding)| {
+            to_location(path, range, encoding, workspace_root, client_encoding, read_file)
+        })
+        .collect();
+
+    Some(ReferenceResults { symbol, locations, total })
+}
+
+pub struct ReferenceResults {
+    pub symbol: String,
+    pub locations: Vec<Location>,
+    /// How many exist, which may exceed `locations.len()`.
+    pub total: usize,
+}
+
+impl ReferenceResults {
+    pub fn outcome(&self) -> Outcome {
+        if self.total == 0 {
+            Outcome::Empty { reason: EmptyReason::NoMatch }
+        } else {
+            Outcome::Answered { returned: self.locations.len(), total: self.total }
+        }
+    }
+}
+
+/// The SCIP symbol under a client-supplied cursor position.
+fn symbol_under_cursor(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    // The index stores UTF-16 columns. A UTF-8 client's column is a byte
+    // offset, and converting needs the file's text.
+    let col = if client_encoding == ClientEncoding::Utf16 {
+        position.character
+    } else {
+        let text = read_file(relative_path)?;
+        let line_index = LineIndex::new(&text);
+        let offset = line_index.offset(position, client_encoding)?;
+        line_index.position(offset, ClientEncoding::Utf16).character
+    };
+    index.symbol_at(relative_path, position.line, col).map(str::to_owned)
+}
+
+fn to_location(
+    relative_path: &str,
+    range: symbol_index::Range,
+    index_encoding: symbol_index::PositionEncoding,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<Location> {
+    let abs = workspace_root.join(relative_path);
+    let uri = Url::from_file_path(abs.as_str()).ok()?;
+    Some(Location {
+        uri,
+        range: convert_span(relative_path, range, index_encoding, client_encoding, read_file),
+    })
+}
+
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
 
 /// The outcome for a query refused because no index is loaded.

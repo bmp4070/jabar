@@ -180,6 +180,77 @@ fn all_ranges_are_well_formed() {
     }
 }
 
+/// The workspace the shards were built from, for tests that need source text.
+///
+/// `JABAR_FIXTURE_DIR` is optional: the position tests skip without it, since
+/// they need to locate an identifier in the file to know where to put a cursor.
+fn fixture_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("JABAR_FIXTURE_DIR").map(std::path::PathBuf::from)
+}
+
+/// Finds `(line, utf16_col)` of `needle` on the first line containing `marker`.
+fn cursor_on(relative: &str, marker: &str, needle: &str) -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string(fixture_dir()?.join(relative)).ok()?;
+    let (line_no, line) = text.lines().enumerate().find(|(_, l)| l.contains(marker))?;
+    let byte_col = line.find(needle)?;
+    // The index stores UTF-16 columns, so count code units, not bytes.
+    let utf16_col = line[..byte_col].encode_utf16().count();
+    // Land inside the identifier rather than on its first character, so the
+    // test also proves the range is treated as a span.
+    Some((line_no as u32, (utf16_col + needle.len().min(2)) as u32))
+}
+
+/// The lookup behind `goToDefinition`: a cursor resolves to a symbol.
+#[test]
+fn a_cursor_inside_an_identifier_resolves_to_its_symbol() {
+    let Some(index) = index() else { return };
+    let Some((line, col)) = cursor_on(
+        "java/com/acme/policy/DefaultRetryPolicy.java",
+        "class DefaultRetryPolicy",
+        "DefaultRetryPolicy",
+    ) else {
+        return;
+    };
+
+    let symbol = index
+        .symbol_at("java/com/acme/policy/DefaultRetryPolicy.java", line, col)
+        .expect("the cursor is inside the class name");
+    assert!(symbol.contains("DefaultRetryPolicy#"), "resolved to {symbol}");
+
+    // And that symbol has a definition, which is what goToDefinition returns.
+    let def = index.definition(symbol).expect("the symbol should be defined");
+    assert_eq!(def.name, "DefaultRetryPolicy");
+    assert_eq!(def.range.start_line, line, "the definition is on the same line");
+}
+
+/// A cursor in whitespace resolves to nothing, rather than to whatever is near.
+#[test]
+fn a_cursor_outside_any_identifier_resolves_to_nothing() {
+    let Some(index) = index() else { return };
+    if fixture_dir().is_none() {
+        return;
+    }
+    // Column 0 of a class declaration line is indentation.
+    let path = "java/com/acme/policy/DefaultRetryPolicy.java";
+    let Some((line, _)) = cursor_on(path, "class DefaultRetryPolicy", "class") else { return };
+    assert_eq!(index.symbol_at(path, line, 0), None, "indentation is not a symbol");
+}
+
+/// The lookup behind `findReferences`, end to end from a cursor.
+#[test]
+fn a_cursor_on_a_call_site_finds_every_reference() {
+    let Some(index) = index() else { return };
+    // A `checkNotNull(` call inside ExponentialBackoff.
+    let path = "java/com/acme/backoff/ExponentialBackoff.java";
+    let Some((line, col)) = cursor_on(path, "checkNotNull(base", "checkNotNull") else { return };
+
+    let symbol = index.symbol_at(path, line, col).expect("cursor is on the call");
+    assert!(symbol.contains("checkNotNull"), "resolved to {symbol}");
+    // EXPECTATIONS.md: 30 call sites. Reached from a cursor rather than by
+    // searching for the name, which is the path a client actually takes.
+    assert_eq!(index.references(symbol).len(), 30);
+}
+
 /// A helper the JDK test wants and `Option` does not have.
 trait NotThen {
     fn not_then<T>(self, f: impl FnOnce() -> T) -> Option<T>;

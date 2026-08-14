@@ -199,6 +199,8 @@ impl Server {
             lsp_types::request::WorkspaceSymbolRequest::METHOD => {
                 self.workspace_symbol(request.params)
             }
+            lsp_types::request::GotoDefinition::METHOD => self.goto_definition(request.params),
+            lsp_types::request::References::METHOD => self.find_references(request.params),
             // Refusing loudly matters: silently returning null would look to a
             // client like a successful empty answer.
             unknown => Err(RequestError::new(
@@ -268,31 +270,145 @@ impl Server {
             ));
         };
 
-        let documents = &self.documents;
-        let results =
-            handlers::workspace_symbol(index, &params.query, root, self.encoding, |relative| {
-                // Prefer the client's copy, which is authoritative for an open
-                // file and may differ from what the index was built against.
-                let abs = root.join(relative);
-                let path = VfsPath::Real(abs.clone());
-                documents
-                    .get(&path)
-                    .map(|doc| doc.text.clone())
-                    .or_else(|| std::fs::read_to_string(abs.as_str()).ok())
-            });
+        let read = file_reader(&self.documents, root);
+        let results = handlers::workspace_symbol(index, &params.query, root, self.encoding, read);
 
         guard.finish(results.outcome());
         Ok(serde_json::to_value(results.symbols)?)
     }
 
+    fn goto_definition(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::GotoDefinitionParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+        let doc = params.text_document_position_params;
+
+        let mut guard = self.telemetry.start(telemetry::Op::GoToDefinition);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
+            let err = self.refuse(&mut guard, &doc.text_document.uri);
+            return Err(err);
+        };
+        let position =
+            crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
+        let read = file_reader(&self.documents, root);
+
+        match handlers::goto_definition(index, &relative, position, root, self.encoding, &read) {
+            Some(found) => {
+                tracing::debug!(symbol = %found.symbol, "resolved definition");
+                guard.finish(telemetry::Outcome::answered(1));
+                Ok(serde_json::to_value(lsp_types::GotoDefinitionResponse::Scalar(found.location))?)
+            }
+            None => {
+                // Nothing at that position, or a symbol this index does not
+                // define -- a JDK or third-party type, whose definition lives in
+                // a jar no shard covers. Both are an honest "no match".
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    fn find_references(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::ReferenceParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+        let doc = params.text_document_position;
+        let include_declaration = params.context.include_declaration;
+
+        let mut guard = self.telemetry.start(telemetry::Op::FindReferences);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
+            let err = self.refuse(&mut guard, &doc.text_document.uri);
+            return Err(err);
+        };
+        let position =
+            crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
+        let read = file_reader(&self.documents, root);
+
+        match handlers::find_references(
+            index,
+            &relative,
+            position,
+            include_declaration,
+            root,
+            self.encoding,
+            &read,
+        ) {
+            Some(results) => {
+                if results.outcome().is_truncated() {
+                    tracing::info!(
+                        symbol = %results.symbol,
+                        returned = results.locations.len(),
+                        total = results.total,
+                        "truncated references"
+                    );
+                }
+                guard.finish(results.outcome());
+                Ok(serde_json::to_value(results.locations)?)
+            }
+            None => {
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                Ok(serde_json::to_value(Vec::<lsp_types::Location>::new())?)
+            }
+        }
+    }
+
+    /// The index, workspace root, and workspace-relative path for a query.
+    ///
+    /// `None` when there is no index, or the URI is not a real path under the
+    /// workspace. The caller turns that into a refusal rather than an empty
+    /// answer.
+    fn resolve_query(&self, uri: &lsp_types::Url) -> Option<(&SymbolIndex, &AbsPathBuf, String)> {
+        let index = self.index.as_ref()?;
+        let root = self.workspace_root.as_ref()?;
+        let path = uri::vfs_path(uri).ok()?;
+        let abs = path.as_real()?.clone();
+        let relative = abs.strip_prefix(root)?.as_str().to_owned();
+        Some((index, root, relative))
+    }
+
+    /// Records the refusal and builds the error the client sees.
+    fn refuse(&self, guard: &mut telemetry::InFlight<'_>, uri: &lsp_types::Url) -> RequestError {
+        if self.index.is_none() {
+            guard.mark_failed(telemetry::Failure::IndexUnavailable);
+            RequestError::new(
+                ErrorCode::ServerNotInitialized,
+                "no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
+                    .to_owned(),
+            )
+        } else {
+            guard.mark_failed(telemetry::Failure::BadRequest);
+            RequestError::new(
+                ErrorCode::InvalidParams,
+                format!("`{uri}` is not a file inside the workspace"),
+            )
+        }
+    }
+
     /// Registers `workspace/symbol` dynamically, now that it can be served.
     fn register_workspace_symbol(&mut self) {
-        let registration = lsp_types::Registration {
-            id: "jabar-workspace-symbol".to_owned(),
-            method: lsp_types::request::WorkspaceSymbolRequest::METHOD.to_owned(),
+        let registrations = [
+            lsp_types::request::WorkspaceSymbolRequest::METHOD,
+            lsp_types::request::GotoDefinition::METHOD,
+            lsp_types::request::References::METHOD,
+        ]
+        .into_iter()
+        .map(|method| lsp_types::Registration {
+            id: format!("jabar-{method}"),
+            method: method.to_owned(),
             register_options: None,
-        };
-        let params = lsp_types::RegistrationParams { registrations: vec![registration] };
+        })
+        .collect();
+        let params = lsp_types::RegistrationParams { registrations };
         match serde_json::to_value(params) {
             Ok(params) => self.send(
                 lsp_server::Request::new(
@@ -450,6 +566,24 @@ pub struct Status {
     /// read-after-write signal from `docs/phase-1.md` (F3).
     pub pending_changes: bool,
     pub health: telemetry::Health,
+}
+
+/// Reads a workspace-relative file, preferring the client's open copy.
+///
+/// The client's buffer is authoritative for an open file and differs from disk
+/// from the first keystroke until a save. A free function rather than a method
+/// so it borrows only the documents, leaving the rest of the server mutable.
+fn file_reader<'a>(
+    documents: &'a Documents,
+    root: &'a AbsPathBuf,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |relative: &str| {
+        let abs = root.join(relative);
+        documents
+            .get(&VfsPath::Real(abs.clone()))
+            .map(|doc| doc.text.clone())
+            .or_else(|| std::fs::read_to_string(abs.as_str()).ok())
+    }
 }
 
 /// Records a failure on an in-flight guard that is about to be dropped.

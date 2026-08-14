@@ -5,7 +5,8 @@ agents first and editors second.
 
 ## Status
 
-**`workspace/symbol` works end to end.** Given SCIP shards produced by the
+**Three operations work end to end** — `workspace/symbol`,
+`textDocument/definition` and `textDocument/references`. Given SCIP shards produced by the
 aspect in `crates/build-model/aspects/`, `jabar` answers symbol searches across
 a whole Bazel repo with real ranges, converted into the client's negotiated
 position encoding. Before an index is loaded it returns an LSP *error* rather
@@ -20,9 +21,9 @@ that cannot be served.
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
 | `telemetry` | Misbehaviour detection. Done, 15 tests. |
 | `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
-| `symbol-index` | Reads SCIP shards: search, definitions, references, implementors. Done, 18 tests. |
+| `symbol-index` | Reads SCIP shards: search, cursor resolution, definitions, references, implementors. Done, 25 tests. |
 | `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |
-| `jabar-server` | LSP shell plus `workspace/symbol`. Done, 61 tests. |
+| `jabar-server` | LSP shell plus the three query handlers. Done, 61 tests. |
 
 ## Why this exists rather than using an existing Java LSP
 
