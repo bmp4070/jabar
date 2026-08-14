@@ -19,7 +19,8 @@ that cannot be served.
 | --- | --- |
 | `paths` | Absolute UTF-8 paths. Done, 7 tests. |
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
-| `telemetry` | Misbehaviour detection. Done, 15 tests. |
+| `telemetry` | Misbehaviour detection. Done, 21 tests. |
+| `watcher` | Reloads the index when shards or git state change. Done, 10 tests. |
 | `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
 | `symbol-index` | Reads SCIP shards: search, cursor resolution, definitions, references, implementors. Done, 25 tests. |
 | `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |

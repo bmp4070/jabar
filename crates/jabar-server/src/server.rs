@@ -29,6 +29,7 @@ use crate::handlers;
 use crate::line_index::PositionEncoding;
 use crate::uri;
 use symbol_index::SymbolIndex;
+use watcher::{Change, FileWatcher};
 
 /// Custom request: what the server currently believes about itself.
 ///
@@ -82,6 +83,11 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// Watches the shards and git state; `None` until an index is loaded, since
+    /// there is nothing to watch before that.
+    watcher: Option<FileWatcher>,
+    /// Where the shards were loaded from, so a change can reload them.
+    index_dir: Option<paths::Utf8PathBuf>,
     /// The global symbol index, once one has been loaded.
     ///
     /// `None` means no index, which is a different answer from an empty one --
@@ -107,6 +113,8 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            watcher: None,
+            index_dir: None,
             telemetry: Telemetry::new(),
             shutdown_requested: false,
         }
@@ -121,7 +129,31 @@ impl Server {
     /// `InvalidRequest` until `exit` arrives. A client that has a request in
     /// flight when the user quits should get an error, not a dead socket.
     fn run(mut self, connection: &Connection) -> anyhow::Result<()> {
-        for message in &connection.receiver {
+        loop {
+            // The watcher channel is swapped in as the index is loaded, so it is
+            // re-read each turn rather than captured once. `never()` parks the
+            // arm until there is something to watch.
+            let watch_rx = match &self.watcher {
+                Some(watcher) => watcher.receiver().clone(),
+                None => crossbeam_channel::never(),
+            };
+            let message = crossbeam_channel::select! {
+                recv(connection.receiver) -> message => match message {
+                    Ok(message) => message,
+                    // The client hung up. Common when an editor is killed, and
+                    // not worth failing over.
+                    Err(_) => {
+                        tracing::info!("client disconnected");
+                        return Ok(());
+                    }
+                },
+                recv(watch_rx) -> change => {
+                    if let Ok(change) = change {
+                        self.on_file_change(change);
+                    }
+                    continue;
+                }
+            };
             match message {
                 Message::Request(request) => {
                     if request.method == lsp_types::request::Shutdown::METHOD {
@@ -153,10 +185,66 @@ impl Server {
                 }
             }
         }
-        // The channel closed without `exit`. Common enough when an editor is
-        // killed, and not worth failing over.
-        tracing::info!("client disconnected");
-        Ok(())
+    }
+
+    /// Reacts to something changing on disk.
+    ///
+    /// Reloading is synchronous, which is fine while it is a directory read —
+    /// Ray's seven shards load in 132ms. When the index grows, or when jabar
+    /// runs the aspect itself, this moves to the task pool.
+    fn on_file_change(&mut self, change: Change) {
+        match change {
+            Change::Index => {
+                tracing::info!("shards changed on disk; reloading the index");
+                self.reload_index();
+            }
+            Change::Workspace => {
+                // A branch switch invalidates the index without necessarily
+                // rewriting any shard: the shards on disk now describe the old
+                // tree. Nothing can be reloaded that would be right, so the
+                // honest move is to drop the index and say so.
+                tracing::info!("the workspace moved; dropping the index as stale");
+                self.index = None;
+                self.notify_index_stale();
+            }
+        }
+    }
+
+    fn reload_index(&mut self) {
+        let Some(dir) = self.index_dir.clone() else { return };
+        let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
+        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
+            Ok(index) => {
+                let definitions = index.definition_count();
+                guard.finish(telemetry::Outcome::answered(definitions));
+                tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
+                self.index = Some(index);
+            }
+            Err(err) => {
+                guard.mark_failed(telemetry::Failure::Io);
+                tracing::warn!(%err, dir = %dir, "could not reload the index; keeping the old one");
+            }
+        }
+    }
+
+    /// Tells the client the index is gone, so it can stop trusting past answers.
+    fn notify_index_stale(&self) {
+        let params = lsp_types::ShowMessageParams {
+            typ: lsp_types::MessageType::WARNING,
+            message: "jabar: the workspace moved and the symbol index is now stale. \
+                      Re-run the SCIP aspect and call `jabar/loadIndex`."
+                .to_owned(),
+        };
+        match serde_json::to_value(params) {
+            Ok(params) => self.send(
+                lsp_server::Notification::new(
+                    lsp_types::notification::ShowMessage::METHOD.to_owned(),
+                    params,
+                )
+                .into(),
+            ),
+            Err(err) => tracing::warn!(%err, "could not build the staleness notification"),
+        }
     }
 
     fn on_request(&mut self, request: Request) {
@@ -241,6 +329,8 @@ impl Server {
 
         tracing::info!(shards, definitions, path = %params.path, "index loaded");
         self.index = Some(index);
+        self.index_dir = Some(paths::Utf8PathBuf::from(params.path.clone()));
+        self.start_watching(&params.path);
         // The capability was not advertised at initialize, because there was
         // nothing behind it. Tell the client it exists now.
         self.register_workspace_symbol();
@@ -394,6 +484,23 @@ impl Server {
         }
     }
 
+    /// Begins watching the shards and the workspace's git state.
+    ///
+    /// Failing to watch is not failing to serve: the index is loaded and every
+    /// query still works, it just will not notice a rebuild. Worth a warning,
+    /// not an error.
+    fn start_watching(&mut self, index_dir: &str) {
+        let dir = paths::Utf8Path::new(index_dir);
+        let index_dir = paths::AbsPath::try_new(dir);
+        match FileWatcher::spawn(index_dir, self.workspace_root.as_deref()) {
+            Ok(watcher) => {
+                tracing::debug!(dir = %dir, "watching for index changes");
+                self.watcher = Some(watcher);
+            }
+            Err(err) => tracing::warn!(%err, "not watching for changes; reloads must be manual"),
+        }
+    }
+
     /// Registers `workspace/symbol` dynamically, now that it can be served.
     fn register_workspace_symbol(&mut self) {
         let registrations = [
@@ -533,6 +640,7 @@ impl Server {
                 PositionEncoding::Utf16 => "utf-16",
             },
             index_loaded: self.index.is_some(),
+            watching: self.watcher.is_some(),
             indexed_definitions: self.index.as_ref().map(|i| i.definition_count()).unwrap_or(0),
             open_documents: self.documents.len(),
             vfs_files: self.vfs.len(),
@@ -558,6 +666,7 @@ pub struct Status {
     pub build_graph_available: bool,
     pub position_encoding: &'static str,
     pub index_loaded: bool,
+    pub watching: bool,
     pub indexed_definitions: usize,
     pub open_documents: usize,
     pub vfs_files: usize,
