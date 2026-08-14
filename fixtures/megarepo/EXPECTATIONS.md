@@ -137,6 +137,23 @@ Note that debugging is DAP, not LSP — a separate protocol with a separate
 server. jabar's role there is supplying source-to-class mapping and breakpoint
 resolution, not answering debug requests itself.
 
+## Known gaps
+
+An external review identified three cases this fixture cannot exercise, each of
+which hides a failure that only appears at real scale. Adding them is worthwhile
+before M4:
+
+- **No target large enough to trigger a params file.** Bazel moves a javac
+  command line into an `@file` once it crosses a size threshold, at which point
+  `build-model`'s argv scan finds no flags and silently produces an empty
+  `CompileInfo`. Forcing this with `--min_param_file_size=1` did not reproduce it
+  here, so a target with a genuinely large classpath is needed. See "A known
+  break waiting at scale" in `docs/phase-1.md`.
+- **No `java_proto_library`.** Generated protobuf code dominates real megarepo
+  classpaths and carries its own jar-naming conventions.
+- **No annotation processors.** They generate sources at build time, which is a
+  different shape of generated code from the single `genrule` here.
+
 ## Extending the fixture
 
 Keep the invariants that make it useful:

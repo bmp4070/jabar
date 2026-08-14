@@ -108,9 +108,9 @@ reach the warm state the whole design is built around.
 ## 3. Findings
 
 Ordered by how expensive the mistake is to undo, not by sequence. F1–F3 follow
-from the consumer profile, F8–F9 from adding debugging, and F10–F12 from
-measuring Bazel and tree-sitter rather than assuming; the rest hold regardless of who calls the
-server.
+from the consumer profile, F8–F9 from adding debugging, F10–F12 from measuring
+Bazel and tree-sitter rather than assuming, and F13–F16 from an external review
+of this document; the rest hold regardless of who calls the server.
 
 ### F1 — Focus Target answers the question the agent asks last (blocking)
 
@@ -380,6 +380,127 @@ maintenance — the point of buying.
 (roughly a day's work); the same trees feed the item tree and body lowering in
 Phase 2, so nothing is thrown away.
 
+### F13 — jabar and the agent share one Bazel server, and Bazel serializes (blocking)
+
+Raised by an external review of this plan; nothing in F1–F12 covers it.
+
+The primary client *runs Bazel itself*. An agent's loop is edit →
+`bazel build`/`test` → query the server. Two properties of Bazel then dominate
+everything the earlier measurements captured:
+
+- **The workspace lock is exclusive.** One command per output base. Every
+  `same_pkg_direct_rdeps` and every `aquery` queues behind the agent's own
+  multi-minute builds — and, worse, jabar's queries block the agent's builds. A
+  language server that intermittently stalls the client's build tool is a server
+  that gets switched off.
+- **The analysis cache is discarded when flags change.** The warm 67–170ms
+  figures assume the resident server's analysis cache is warm *for jabar's
+  flags*. Agents invoke Bazel with their own `--config`, and each flip pays full
+  re-analysis. This was demonstrated accidentally while verifying the review:
+  changing one flag printed `Build option --min_param_file_size has changed,
+  discarding analysis cache (this can be expensive)`.
+
+The 12-target fixture cannot surface either, because nothing else is using its
+Bazel server.
+
+This also exposed a contradiction in §7 that survived an earlier rewrite: one row
+decided "the CLI, not BSP" while another still said "a long-lived bazel-bsp
+subprocess", justified by JVM warmup that does not exist — the Bazel client is a
+thin binary talking to a resident server, which is precisely why warm queries are
+fast. The second row is now corrected.
+
+*Phase 1 action:* measure contention at the M3 gate. The likely mitigation is a
+dedicated `--output_base` for jabar, which decouples both the lock and the
+analysis cache at the cost of a second analysis universe. Also consider pinning
+jabar's flags to the repo's `.bazelrc` defaults so cache flips are rare, and
+`--noblock_for_lock` with retry so a lock wait surfaces as a visible
+`Failure::BuildServer` rather than a silent stall.
+
+### F14 — Header jars are build outputs, and this plan treated them as a source of truth (blocking)
+
+F10 stands as far as it goes: the artifact format already exists and no aspect
+need author one. But header jars are *outputs*, and three consequences were
+missed.
+
+- **Never-built targets.** A developer's `bazel-out` holds outputs for the
+  slices they have built — a small fraction of a megarepo. An index promising
+  coverage "across every target" would be reading artifacts that mostly do not
+  exist locally.
+- **Built without the bytes.** With remote execution and
+  `--remote_download_toplevel` or `minimal` — standard on repos this size —
+  header jars are *intermediate* outputs, exactly what is not downloaded. A fully
+  built repo can still have an empty header-jar shelf.
+- **Staleness, the sharpest.** A header jar reflects the last build, not current
+  source. The agent writes `NewRetryPolicy.java` and immediately asks
+  `workspaceSymbol("NewRetryPolicy")`. The index searched and found nothing, so
+  it reports `EmptyReason::NoMatch` — the one reason classified as *healthy*. The
+  precise failure the telemetry crate exists to catch passes through it
+  undetected, because staleness of the index's source material is not in the
+  vocabulary. The exit gate's "read-after-write is a test, not a hope" and
+  "`workspaceSymbol` served from the on-disk index" are in direct tension for any
+  symbol created since the last build.
+
+Not fatal, but it changes M4. The index needs an explicit three-way source model
+per target: header jar present, read it; absent, materialize or degrade honestly
+as `TargetNotLoaded`, never `NoMatch`; source newer than the jar, overlay from
+parsed source. The overlay widens F12 slightly — tree-sitter covers declarations
+of dirty files, not only positions — which is cheap since the parser is already
+in the tree at M4.
+
+Materializing header jars for never-built targets probably does require a small
+aspect after all, one whose only job is to request `JavaInfo.compile_jars` as an
+output group so `bazel build --aspects=… --output_groups=…` fetches them. Turbine
+header jars depend only on direct deps' header jars, so cache hit rates are
+excellent. F11's conclusion narrows rather than reverses: **do not author an
+aspect to produce an item tree; you may need one to fetch it.**
+
+Two mechanical consequences: add `EmptyReason::IndexStale`, and track index
+generation against `vfs::Revision`, which already exists.
+
+### F15 — `findReferences` and `incomingCalls` have no mechanism (blocking)
+
+Three of the nine client operations need call-site data, and neither tier holds
+it. The shallow tier has names, kinds and supertypes; the deep slice has one
+target's bodies. §2 of this document claims "reverse-dependency edges +
+per-target item trees" — but item trees do not contain call sites, and the
+rdeps-scoping trick collapses exactly where it matters. The fixture's own
+high-fan-out case makes the point: `Preconditions.checkNotNull`'s reverse
+dependency closure in a real repo is approximately the whole repo.
+
+rust-analyzer survives this with a text-search candidate pass over a workspace it
+can afford to scan. That is not available here.
+
+So one of two things has to be budgeted, and neither is currently in the plan:
+
+- a persistent identifier-occurrence or trigram index — a code-search component,
+  and the largest unbudgeted item in the project; or
+- per-target reference tables emitted at build time, which is the aspect again.
+
+By F1's own logic — the tier boundary determines the aspect, and rewriting an
+aspect means re-running it over the repo — this must be decided before M4 sets
+the index schema. The reference fan-out measurement in the M3 gate exists to size
+it.
+
+### F16 — Agents have no stable focus target (rework)
+
+`RootKind::FocusTarget` and `is_editable` in `base-db` assume a human who keeps
+one module warm for an hour. An agent's session hops: global search, edit in
+target A, definition into B, edit B, edit C. Every one of those writes lands on
+files currently classified `MEDIUM`.
+
+Correctness survives — a `MEDIUM` write invalidates properly — but if `MEDIUM`
+writes are as frequent as `LOW` ones, the middle tier degenerates into two tiers
+plus bookkeeping, and the bookkeeping is not free: re-rooting churns membership
+inputs whose durability is deliberately higher.
+
+This is the same error §1 accuses the original plan of: designing for a user who
+does not show up.
+
+*Phase 1 action:* write the policy down and test it. **The focus is a set, not a
+target, and membership is promote-on-write** — the first client write to a file
+in a `MEDIUM` root promotes that root to `LOW` for the session, and demotion
+happens only on a graph refresh.
+
 ### One earlier finding, downgraded
 
 An earlier draft flagged tower-lsp as a rework item on cancellation grounds. With
@@ -417,9 +538,17 @@ persistence, for the reasons in F5.
 M4 (F12). No item tree, no type inference, no remote HIR cache.
 
 **Cut from the roadmap entirely.** Completion, signature help, inlay hints,
-semantic tokens, code lens, folding ranges, document highlight, formatting,
-rename, code actions. None are reachable from the client surface. If any appear in
-a later phase document, that document has drifted.
+semantic tokens, code lens, folding ranges, document highlight, formatting, code
+actions. None are reachable from the client surface. If any appear in a later
+phase document, that document has drifted.
+
+**Rename is the one cut now restored, to Phase 3.** The original justification —
+not reachable from the client surface — mistook today's schema for the client's
+needs. Agents rename constantly; they simply do it badly, by string-replacing
+across files. A correct cross-repo rename is plausibly the highest-value single
+operation available to hand an agent, it shares most of its machinery with
+`findReferences`, and if the client surface grows one operation a
+workspace-edit-shaped one is the likely candidate.
 
 ### Telemetry: detecting misbehaviour
 
@@ -454,6 +583,44 @@ operation kinds only — no paths, symbol names or file contents — so it is sa
 to share. The per-query `tracing` stream is the opposite, and is what makes it
 useful for debugging and unsafe to ship anywhere. Nothing leaves the process on
 its own.
+
+**Auditing is not mitigation.** The telemetry makes a misleading empty visible to
+whoever reads the health summary, but the agent on the wire still receives a bare
+`[]` and still deletes the code. So the policy, not just the counter: a query on a
+*standard* LSP method that would be `IndexNotReady`, `IndexStale` or
+`TargetNotLoaded` must **block until it can answer, or return an LSP error** —
+never an empty success. The reasons ride the custom methods, where a client that
+understands them can act on them.
+
+Two gaps in the crate as built, both to close before the first handler uses it:
+
+- `InFlight`'s `Drop` hardcodes `stale: false` and there is no `mark_stale()`, so
+  the guard-based flow — which every handler will use — can never emit the
+  stale-read signal the crate advertises.
+- `EmptyReason` has no variant for an index whose *source material* is stale,
+  which is how F14's failure escapes classification as unhealthy.
+
+### A known break waiting at scale
+
+`aquery` reports a Javac action's `arguments` as the literal command line, and
+`build-model` scans it for `--sources`, `--classpath` and `--output`. On the
+fixture that argv is inline. On a real repo it may not be: once the command line
+crosses Bazel's params-file threshold — a thousand-jar classpath does so easily —
+or Javac runs as a persistent worker, `arguments` collapses to roughly
+`["…JavaBuilder", "@bazel-out/…/libfoo.jar-2.params"]` and every flag moves into
+the file.
+
+The scan would then return empty vectors and produce a `CompileInfo` with no
+sources and no classpath: not an error, a **silently wrong answer** — the exact
+failure class the telemetry section condemns. `ParseError::NoJavacAction` does not
+catch it, because the Javac action is present and matches.
+
+Attempting to reproduce this on the fixture with `--min_param_file_size=1` left
+the argv inline, so it is unconfirmed here; `--include_param_files` exists on
+`aquery` precisely because params files are a case it has to handle. The fix is
+cheap either way and should not wait for confirmation: read the params file when
+an argument begins with `@`, and in the meantime treat "no flags found but an
+`@file` argument present" as a hard error so the break is loud.
 
 ## 5. Crate layout
 
@@ -513,10 +680,25 @@ Read it as:
   decisive. Write it — and since you are paying for an aspect anyway, have it
   emit positions too, which is the one thing header jars cannot give you.
 
-Record the number in this document when it is taken. Two supporting numbers are
-worth the same trip: how long `bazel query same_pkg_direct_rdeps` takes on a
-cold server, and how large the header jars for one deep target's closure are in
-total, since that is what the shallow index has to read.
+Four more measurements belong on the same trip, each settling a finding that
+cannot be settled from a 12-target fixture. Record every number in this document
+when taken.
+
+| # | Measure | Settles |
+| --- | --- | --- |
+| 1 | `bazel cquery //... --output=starlark`, cold and warm | aspect vs query family |
+| 2 | Query latency **while a build holds the lock**, and `aquery` latency immediately after a differently-flagged build | F13 — whether jabar needs its own `--output_base` |
+| 3 | Fraction of targets with a readable header jar locally, with and without `--remote_download_toplevel` | F14 — whether an aspect is needed to *fetch* header jars |
+| 4 | Reference fan-out of one `checkNotNull`-class symbol, and the rdeps-closure size of its owning target | F15 — whether Phase 2 needs a code-search index |
+| 5 | Size of `aquery deps(//deep:target) --output=jsonproto` for one deep target | per-target vs bulk slice loading |
+
+Measurement 4 is the one to take first if time is short: it sizes the largest
+unbudgeted item in the project.
+
+A sixth is a five-minute check rather than a measurement: run
+`bazel aquery 'mnemonic("Javac", //some/big:target)' --include_param_files` on a
+large target and confirm whether the argv is a params-file reference. See the
+note under §5.
 
 **Schedule risk.** M3 and M4 are where this slips, and they share a root cause:
 nothing here has been measured against a repo of your size. If M3 threatens M4,
@@ -539,7 +721,10 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | Does `VfsPath` carry jar-internal entries, or do jars get extracted to a cache directory? | Virtual paths. Extraction adds an I/O and invalidation problem the design is explicitly trying to avoid. |
 | What is the unit of durability? | Three tiers. Focus target `LOW`, same-repo transitive deps `MEDIUM`, external jars `HIGH`. The middle tier is the one rust-analyzer lacks and a megarepo needs. |
 | How does the client learn that a result was truncated? | A custom method returning an explicit total and a ranking rationale, with standard `textDocument/references` kept as a conformant fallback for Copilot. Silent truncation makes an agent confidently wrong. |
-| Own a Bazel daemon connection, or shell out per query? | A long-lived bazel-bsp subprocess. Per-query `bazel` invocations pay JVM and analysis-cache warmup every time — the exact cost this design exists to avoid. |
+| Own a Bazel daemon connection, or shell out per query? | Shell out to the CLI, which talks to the resident Bazel server — there is no per-query JVM warmup to avoid. The real cost is contention with the agent's own builds (F13), answered by a dedicated `--output_base` rather than by a different protocol. |
+| How does the index behave when a target's header jar is missing or stale? | Three-way source model per target: present → read it; absent → `TargetNotLoaded`, never `NoMatch`; source newer than jar → overlay from parsed source (F14). |
+| Where does call-site data for `findReferences` come from? | **Undecided, and blocking M4.** Either a persistent identifier-occurrence index or build-time reference tables from an aspect. Measurement 4 at the M3 gate sizes it (F15). |
+| What is the unit of focus? | A set, not a target, with promote-on-write membership (F16). |
 | What happens when a file belongs to no target, or to several? | Several: pick deterministically and log. None: index standalone with an empty classpath rather than failing. Agents hit generated and scratch files constantly. |
 
 ## 8. Exit gate
@@ -563,8 +748,14 @@ Phase 1 is done when all of these hold.
       a fixture session shows zero misleading empties.
 - [ ] The classpath decision is written down with the spike that justifies it
       committed.
-- [ ] The M3 graph-access gate is measured on the real repo and its number
+- [ ] All five M3 gate measurements are taken on the real repo and their numbers
       recorded in this document.
+- [ ] The reference-index decision (F15) is written down, since it sets the M4
+      index schema.
+- [ ] An `@params-file` javac action is either handled or refused loudly — never
+      parsed into an empty `CompileInfo`.
+- [ ] No standard-method query returns an empty success when the true answer is
+      "not indexed yet".
 - [ ] No parser and no completion code exist in the tree. If either crept in,
       scope was not held.
 
