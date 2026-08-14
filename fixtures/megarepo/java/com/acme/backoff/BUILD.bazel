@@ -1,0 +1,14 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Three implementations of core.Backoff in a single target. Contrast with
+# RetryPolicy, whose implementations are spread across targets.
+java_library(
+    name = "backoff",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/core",
+        "//java/com/acme/util",
+    ],
+)

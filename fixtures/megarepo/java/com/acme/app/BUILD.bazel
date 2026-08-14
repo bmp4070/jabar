@@ -1,0 +1,24 @@
+load("@rules_java//java:defs.bzl", "java_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Runnable so the fixture can be stepped through under a debugger, not just
+# indexed. `bazel run //java/com/acme/app:app` exercises the full call chain.
+java_binary(
+    name = "app",
+    srcs = ["Main.java"],
+    main_class = "com.acme.app.Main",
+    # Main references Messages.grüße, so it inherits the same exemption.
+    javacopts = ["-Xep:UnicodeInCode:OFF"],
+    deps = [
+        "//java/com/acme/backoff",
+        "//java/com/acme/core",
+        "//java/com/acme/generated",
+        "//java/com/acme/i18n",
+        "//java/com/acme/policy",
+        "//java/com/acme/service/inventory",
+        "//java/com/acme/service/order",
+        "//java/com/acme/service/payment",
+        "//java/com/acme/transport",
+    ],
+)

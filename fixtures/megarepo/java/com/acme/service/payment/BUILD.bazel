@@ -1,0 +1,16 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Holds the third implementation of core.RetryPolicy, four packages away from
+# the interface it implements.
+java_library(
+    name = "payment",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/core",
+        "//java/com/acme/policy",
+        "//java/com/acme/transport",
+        "//java/com/acme/util",
+    ],
+)

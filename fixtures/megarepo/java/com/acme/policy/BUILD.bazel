@@ -1,0 +1,13 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+java_library(
+    name = "policy",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/backoff",
+        "//java/com/acme/core",
+        "//java/com/acme/util",
+    ],
+)

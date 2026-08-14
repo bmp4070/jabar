@@ -1,0 +1,3 @@
+/target
+# Bazel symlinks created inside the fixture workspace
+/fixtures/megarepo/bazel-*

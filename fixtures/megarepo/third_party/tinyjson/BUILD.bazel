@@ -1,0 +1,12 @@
+load("@rules_java//java:defs.bzl", "java_import")
+
+package(default_visibility = ["//visibility:public"])
+
+# A binary-only dependency: classfiles, no sources. Everything jabar knows
+# about com.tinyjson has to come from reading the jar.
+#
+# Regenerate with tools/build_thirdparty_jar.sh
+java_import(
+    name = "tinyjson",
+    jars = ["tinyjson.jar"],
+)

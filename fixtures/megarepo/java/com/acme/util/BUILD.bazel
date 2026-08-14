@@ -1,0 +1,10 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# High fan-in on purpose: almost every other target depends on this one, so
+# findReferences against Preconditions.checkNotNull is the truncation test case.
+java_library(
+    name = "util",
+    srcs = glob(["*.java"]),
+)

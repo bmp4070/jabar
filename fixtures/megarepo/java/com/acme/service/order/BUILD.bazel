@@ -1,0 +1,17 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Deepest target in the fixture. Its transitive closure is core, util, backoff,
+# policy, transport and tinyjson -- six of the ten targets, and notably not
+# i18n, generated, inventory or payment. That gap is what makes a focus-slice
+# measurably smaller than the repo.
+java_library(
+    name = "order",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/policy",
+        "//java/com/acme/transport",
+        "//java/com/acme/util",
+    ],
+)

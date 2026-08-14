@@ -1,0 +1,11 @@
+"""A deliberately small slice of a Java megarepo, shaped to exercise jabar.
+
+See EXPECTATIONS.md for what each target is here to prove.
+"""
+
+module(
+    name = "acme_megarepo",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "rules_java", version = "9.1.0")

@@ -1,0 +1,16 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Position-encoding test bed. Not reachable from any service target, so it also
+# doubles as a check that focus slices exclude what they should.
+#
+# Error Prone rejects non-ASCII identifiers by default. The identifier is the
+# point here -- jabar has to index and locate `grüße` correctly -- so the check
+# is off for this target only.
+java_library(
+    name = "i18n",
+    srcs = glob(["*.java"]),
+    javacopts = ["-Xep:UnicodeInCode:OFF"],
+    deps = ["//java/com/acme/util"],
+)

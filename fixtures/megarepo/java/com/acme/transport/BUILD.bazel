@@ -1,0 +1,15 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# First target in the graph with a binary-only dependency on its classpath.
+java_library(
+    name = "transport",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/core",
+        "//java/com/acme/policy",
+        "//java/com/acme/util",
+        "//third_party/tinyjson",
+    ],
+)

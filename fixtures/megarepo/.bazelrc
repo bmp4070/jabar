@@ -1,0 +1,6 @@
+# Keep the fixture hermetic and quiet enough to diff build output between runs.
+common --enable_bzlmod
+build --java_language_version=21
+build --tool_java_language_version=21
+build --nolegacy_external_runfiles
+test --test_output=errors

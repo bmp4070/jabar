@@ -1,0 +1,14 @@
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Deliberately does not depend on //java/com/acme/policy: a slice rooted here
+# is strictly smaller than one rooted at //java/com/acme/service/order.
+java_library(
+    name = "inventory",
+    srcs = glob(["*.java"]),
+    deps = [
+        "//java/com/acme/transport",
+        "//java/com/acme/util",
+    ],
+)
