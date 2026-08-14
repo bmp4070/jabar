@@ -222,6 +222,7 @@ dependencies = [
  "lsp-types",
  "paths",
  "serde_json",
+ "telemetry",
  "tracing",
  "tracing-subscriber",
  "vfs",
@@ -476,6 +477,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "telemetry"
+version = "0.0.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

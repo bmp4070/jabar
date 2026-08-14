@@ -13,6 +13,7 @@ publish = false
 paths = { path = "crates/paths" }
 vfs = { path = "crates/vfs" }
 bsp = { path = "crates/bsp" }
+telemetry = { path = "crates/telemetry" }
 
 anyhow = "1.0.102"
 camino = "1.2.2"

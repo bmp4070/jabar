@@ -17,6 +17,7 @@ path = "src/bin/main.rs"
 paths.workspace = true
 vfs.workspace = true
 bsp.workspace = true
+telemetry.workspace = true
 
 anyhow.workspace = true
 crossbeam-channel.workspace = true

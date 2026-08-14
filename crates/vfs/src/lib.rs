@@ -133,6 +133,27 @@ impl ChangedFile {
 /// A batch of changes, in the order the files were first touched.
 pub type Changes = IndexMap<FileId, ChangedFile, FxBuildHasher>;
 
+/// Counts mutations the VFS has seen. Never decreases.
+///
+/// This is how an answer gets pinned to the state it was computed from. An
+/// agent writes a file and queries microseconds later; recording the revision a
+/// result was derived from is what makes a stale answer detectable after the
+/// fact rather than merely suspected.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Revision(u64);
+
+impl Revision {
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Revision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "r{}", self.0)
+    }
+}
+
 /// Path interning plus a log of pending changes.
 #[derive(Default)]
 pub struct Vfs {
@@ -140,6 +161,7 @@ pub struct Vfs {
     /// Indexed by [`FileId::index`]; parallel to the interner.
     state: Vec<FileState>,
     changes: Changes,
+    revision: Revision,
 }
 
 impl Vfs {
@@ -212,7 +234,13 @@ impl Vfs {
 
         self.state[file_id.0 as usize] = new_state;
         self.record(file_id, change);
+        self.revision.0 += 1;
         true
+    }
+
+    /// The current revision. Bumps on every write that changed something.
+    pub fn revision(&self) -> Revision {
+        self.revision
     }
 
     /// Whether [`Vfs::take_changes`] would return anything.
@@ -294,6 +322,7 @@ impl fmt::Debug for Vfs {
         f.debug_struct("Vfs")
             .field("paths", &self.interner.len())
             .field("pending_changes", &self.changes.len())
+            .field("revision", &self.revision)
             .finish()
     }
 }
@@ -513,5 +542,46 @@ mod tests {
         vfs.set_file_contents(p, None);
         let changes = vfs.take_changes();
         assert!(changes.values().all(|c| c.is_structural() && !c.exists()));
+    }
+
+    #[test]
+    fn revision_advances_only_on_real_change() {
+        let mut vfs = Vfs::default();
+        let p = path("/repo/A.java");
+        assert_eq!(vfs.revision(), Revision::default());
+
+        vfs.set_file_contents(p.clone(), b("one"));
+        let after_create = vfs.revision();
+        assert!(after_create > Revision::default());
+
+        // A no-op write must not advance it, or every identical rewrite would
+        // look like an invalidation to anything watching the revision.
+        assert!(!vfs.set_file_contents(p.clone(), b("one")));
+        assert_eq!(vfs.revision(), after_create);
+
+        vfs.set_file_contents(p, b("two"));
+        assert!(vfs.revision() > after_create);
+    }
+
+    #[test]
+    fn revision_survives_draining() {
+        // take_changes is a read. If draining reset the revision, an answer
+        // computed before the drain would compare equal to one computed after.
+        let mut vfs = Vfs::default();
+        vfs.set_file_contents(path("/repo/A.java"), b("one"));
+        let before = vfs.revision();
+        vfs.take_changes();
+        assert_eq!(vfs.revision(), before);
+    }
+
+    #[test]
+    fn pending_changes_mean_the_database_is_behind() {
+        // This is the read-after-write signal: answering a query while the VFS
+        // still holds undrained writes means the answer predates them.
+        let mut vfs = Vfs::default();
+        vfs.set_file_contents(path("/repo/A.java"), b("one"));
+        assert!(vfs.has_pending_changes(), "a write is waiting to reach the database");
+        vfs.take_changes();
+        assert!(!vfs.has_pending_changes());
     }
 }

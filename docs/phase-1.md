@@ -305,7 +305,7 @@ blocker.
   built from a Bazel aspect and persisted.
 - Focus slice plumbing: `inverseSources` → transitive slice → durability-tagged
   salsa inputs.
-- Agent-shaped latency instrumentation.
+- Telemetry that detects wrong answers, not just slow ones (see below).
 
 **Pulled forward.** From Phase 2, a skeletal salsa database — `FileText`,
 `SourceRoot`, `FileSourceRoot` inputs and one trivial derived query, no parser —
@@ -316,6 +316,40 @@ persistence, for the reasons in F5.
 semantic tokens, code lens, folding ranges, document highlight, formatting,
 rename, code actions. None are reachable from the client surface. If any appear in
 a later phase document, that document has drifted.
+
+### Telemetry: detecting misbehaviour
+
+Latency instrumentation assumes a human who notices a slow response and re-runs
+it. An agent re-runs nothing — it takes the first answer as ground truth, so the
+failure that costs most is the fast, confident, wrong one.
+
+The sharpest case is the empty result. `workspaceSymbol` returning nothing
+because the index has not finished building is, on the wire, identical to
+returning nothing because the symbol does not exist. The client cannot tell
+those apart, and one of them makes it delete code that is actually referenced.
+So an empty outcome must carry *why* it was empty, and exactly one reason —
+"searched, found nothing" — is healthy. Everything else is the server saying
+"none" when it means "I do not know".
+
+The `telemetry` crate encodes that in its types, so every call site is asked the
+question rather than being allowed to return a bare empty list. Alongside it:
+
+- **Truncation** is recorded as returned-versus-total, so withheld results are
+  counted rather than silently dropped (F4).
+- **Stale reads** are flagged when an answer is produced while the VFS still
+  holds undrained writes — the F3 race, made observable.
+- **Runtime invariant checks** validate that returned ranges sit on character
+  boundaries and inside the file, which is the bug class the fixture's
+  `Messages.java` exists to provoke. They record and carry on rather than
+  panicking.
+- **Concerns** turn the counters into a verdict, ranked so a wrong answer sorts
+  above an outright failure — a failure is at least visible to the client.
+
+One boundary to hold: the `Health` summary contains counts, durations and
+operation kinds only — no paths, symbol names or file contents — so it is safe
+to share. The per-query `tracing` stream is the opposite, and is what makes it
+useful for debugging and unsafe to ship anywhere. Nothing leaves the process on
+its own.
 
 ## 5. Crate layout
 
@@ -331,6 +365,7 @@ jabar/
 │   ├── bsp            BSP wire types + client, transport = lsp-server
 │   ├── build-model    BSP → JavaWorkspace → source roots, classpath, durability
 │   ├── symbol-index   shallow global tier: names, supertypes, persistence
+│   ├── telemetry      outcome/invariant recording, health summary
 │   ├── base-db        salsa inputs only in Phase 1
 │   └── jabar-server   GlobalState, main_loop, dispatch, handlers, response shaping
 └── xtask/             bench + fixture tooling
@@ -394,6 +429,8 @@ Phase 1 is done when all of these hold.
 - [ ] A `BUILD` edit re-slices and invalidates the affected shard, debounced,
       without a restart.
 - [ ] Cold p50 for the top two operations is recorded for a real target.
+- [ ] Every client-facing handler reports an outcome, and a health summary over
+      a fixture session shows zero misleading empties.
 - [ ] The classpath decision is written down with the spike that justifies it
       committed.
 - [ ] No parser and no completion code exist in the tree. If either crept in,
