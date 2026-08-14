@@ -32,6 +32,9 @@ and moves the pressure onto cross-target queries instead.
 
 ## Design notes
 
+`docs/phase-1.md` is the working plan: scope, milestones, exit gate, and the
+findings behind each decision.
+
 Structure follows rust-analyzer: a synchronous event loop with one writer and
 many snapshot readers, not an async runtime. Salsa cancellation works by taking
 `&mut db`, which unwinds in-flight readers; that model wants a single writer.
@@ -44,6 +47,11 @@ Two departures from rust-analyzer, both forced by Java:
 - **A shallow global index sits alongside the deep per-target slice.** Six of the
   nine client operations are repo-wide, so a purely lazy slice has nothing to
   answer them with.
+
+Debugging is DAP, a separate protocol the agent clients do not speak. Breakpoint
+and frame mapping lands in Phase 2 off the item tree; expression evaluation waits
+for Phase 3. The adapter itself will be `java-debug` driven as a subprocess
+rather than a JDI client written here.
 
 ## Test fixture
 
