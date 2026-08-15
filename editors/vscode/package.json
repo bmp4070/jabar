@@ -56,7 +56,9 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "launch": "npm run compile && code --extensionDevelopmentPath=\"$PWD\""
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

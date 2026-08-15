@@ -12,6 +12,12 @@ cd editors/vscode && npm install && npm run compile
 code --extensionDevelopmentPath="$PWD"   # opens a window with the extension loaded
 ```
 
+VS Code runs `out/extension.js`, not the TypeScript. **Any change to `src/`
+needs `npm run compile` before it takes effect**, and a reload of the extension
+host (`Developer: Reload Window`) after that. Symptom of forgetting: behaviour,
+including error messages, that matches an older version of the source. `npm run
+watch` recompiles on save and avoids the whole problem.
+
 Then open a Bazel Java workspace.
 
 The binary is found automatically: `target/release/jabar`, then `target/debug`,
