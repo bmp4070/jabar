@@ -3,6 +3,8 @@
 // else: everything a user sees comes from the server, and logic that lives here
 // is logic no other editor gets.
 
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
 import {
   LanguageClient,
@@ -13,9 +15,43 @@ import {
 
 let client: LanguageClient | undefined;
 
+/// Where to look for the binary, in order, before falling back to PATH.
+///
+/// Running from a source checkout is the normal case for now, and requiring an
+/// absolute path in settings to get past a first launch is a poor trade for a
+/// few lines of searching. `release` precedes `debug` because a debug build is
+/// usually a leftover rather than a choice.
+function locateServer(context: vscode.ExtensionContext): string | undefined {
+  const configured = vscode.workspace.getConfiguration("jabar").get<string>("server.path")?.trim();
+  if (configured) {
+    // Taken at its word: if someone set it and it is wrong, saying so beats
+    // silently using a different binary than they asked for.
+    return configured;
+  }
+
+  const roots = [
+    // The extension lives at <repo>/editors/vscode, so the build output is two
+    // levels up. This is what makes `--extensionDevelopmentPath` just work.
+    path.resolve(context.extensionPath, "..", ".."),
+    // Or the user opened the jabar repo itself.
+    ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+  ];
+
+  for (const root of roots) {
+    for (const profile of ["release", "debug"]) {
+      const candidate = path.join(root, "target", profile, "jabar");
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("jabar");
-  const command = config.get<string>("server.path")?.trim() || "jabar";
+  const located = locateServer(context);
+  const command = located ?? "jabar";
 
   const serverOptions: ServerOptions = {
     command,
@@ -48,12 +84,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await client.start();
   } catch (error) {
-    // The overwhelmingly likely cause is that the binary is not on PATH, so
-    // say that rather than surfacing a spawn errno.
-    vscode.window.showErrorMessage(
-      `jabar failed to start (\`${command}\`). Set \`jabar.server.path\`, or ` +
-        `build it with \`cargo build --release\`. Details: ${error}`,
+    // `spawn jabar ENOENT` on its own tells a user nothing actionable, so name
+    // what was tried and what would fix it.
+    const tried = located
+      ? `Tried \`${command}\`.`
+      : `No built binary was found near the extension or the workspace, so \`jabar\` ` +
+        `was looked up on PATH and is not there.`;
+    const choice = await vscode.window.showErrorMessage(
+      `jabar could not start. ${tried} Build it with \`cargo build --release\`, ` +
+        `or set \`jabar.server.path\` to the binary.`,
+      "Open settings",
     );
+    if (choice === "Open settings") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "jabar.server.path");
+    }
+    console.error("jabar failed to start", error);
   }
 }
 
@@ -103,20 +148,22 @@ async function reloadIndex(): Promise<void> {
     return;
   }
   const suggested = vscode.Uri.joinPath(folder.uri, "bazel-bin").fsPath;
-  const path = await vscode.window.showInputBox({
+  // Not named `path`: that would shadow the module imported above, which is a
+  // trap for the next edit rather than a problem today.
+  const dir = await vscode.window.showInputBox({
     prompt: "Directory holding the SCIP shards",
     value: suggested,
   });
-  if (!path) {
+  if (!dir) {
     return;
   }
   try {
-    const result = await client.sendRequest<LoadIndexResult>("jabar/loadIndex", { path });
+    const result = await client.sendRequest<LoadIndexResult>("jabar/loadIndex", { path: dir });
     vscode.window.showInformationMessage(
       `jabar: loaded ${result.definitions} definitions from ${result.shards} shards.`,
     );
   } catch (error) {
-    vscode.window.showErrorMessage(`jabar: could not load an index from ${path}. ${error}`);
+    vscode.window.showErrorMessage(`jabar: could not load an index from ${dir}. ${error}`);
   }
 }
 

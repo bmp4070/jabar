@@ -5,9 +5,15 @@
   "version": "0.0.0",
   "license": "MIT OR Apache-2.0",
   "private": true,
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages"],
-  "activationEvents": ["onLanguage:java"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:java"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
@@ -16,11 +22,15 @@
         "jabar.server.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the jabar binary. Defaults to `jabar` on PATH."
+          "description": "Path to the jabar binary. Leave empty to look for target/release/jabar (then debug) near the extension or the open workspace, and fall back to `jabar` on PATH."
         },
         "jabar.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "description": "Log the LSP traffic between VS Code and jabar."
         },

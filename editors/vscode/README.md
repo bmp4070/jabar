@@ -12,8 +12,15 @@ cd editors/vscode && npm install && npm run compile
 code --extensionDevelopmentPath="$PWD"   # opens a window with the extension loaded
 ```
 
-Then open a Bazel Java workspace. Point `jabar.server.path` at
-`target/release/jabar` unless it is on your PATH.
+Then open a Bazel Java workspace.
+
+The binary is found automatically: `target/release/jabar`, then `target/debug`,
+looked for beside the extension and under the open workspace, falling back to
+`jabar` on PATH. Set `jabar.server.path` only to override that.
+
+If it cannot start, the error names what it tried — `spawn jabar ENOENT` on its
+own means the search found nothing and PATH had no `jabar`, which almost always
+means the release build has not run.
 
 ## The index has to exist first
 
