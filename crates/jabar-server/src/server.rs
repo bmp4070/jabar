@@ -18,7 +18,7 @@ use crossbeam_channel::Sender;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
-use paths::AbsPathBuf;
+use paths::{AbsPath, AbsPathBuf};
 use serde::Serialize;
 use telemetry::Telemetry;
 use vfs::{Vfs, VfsPath};
@@ -72,8 +72,20 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     }
     tracing::info!(?encoding, root = ?root.as_ref().map(|r| r.as_str()), "initializing");
 
+    // Find an index before advertising, because LSP has no way to say
+    // "supported, but not yet": a provider advertised with nothing behind it
+    // means clients call it and get nothing, which reads as "no such symbol".
+    let discovered = root.as_deref().and_then(discover_index);
+    if let Some((dir, shards, definitions)) = &discovered {
+        tracing::info!(%dir, shards, definitions, "found an index at startup");
+    } else {
+        tracing::info!(
+            "no index found; run the SCIP aspect, then reopen or call `jabar/loadIndex`"
+        );
+    }
+
     let result = lsp_types::InitializeResult {
-        capabilities: server_capabilities(encoding),
+        capabilities: server_capabilities(encoding, discovered.is_some()),
         server_info: Some(lsp_types::ServerInfo {
             name: "jabar".to_owned(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
@@ -83,7 +95,43 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
         .initialize_finish(id, serde_json::to_value(result)?)
         .context("initialize handshake failed")?;
 
-    Server::new(connection.sender.clone(), encoding, root).run(&connection)
+    let mut server = Server::new(connection.sender.clone(), encoding, root);
+    if let Some((dir, _, _)) = discovered {
+        server.adopt_index(&dir);
+    }
+    server.run(&connection)
+}
+
+/// Looks for SCIP shards under a workspace.
+///
+/// Returns the directory, shard count and definition count when it finds any.
+/// The conventional home is `bazel-bin`, which is the convenience symlink Bazel
+/// writes at the workspace root; shards land one per target beneath it.
+///
+/// Reads the whole index to answer, which is the only honest way to know it is
+/// usable — a directory of unparseable files is not an index. On Gerrit that is
+/// 97 shards and 343ms, paid once at startup.
+fn discover_index(root: &AbsPath) -> Option<(paths::Utf8PathBuf, usize, usize)> {
+    // `bazel-bin` is a symlink into the output base; `symlink_metadata` would
+    // see the link rather than the directory, so follow it deliberately.
+    for candidate in ["bazel-bin", ".jabar/index"] {
+        let dir = root.join(candidate);
+        if !dir.as_utf8_path().is_dir() {
+            continue;
+        }
+        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
+            Ok(index) if !index.is_empty() => {
+                return Some((
+                    dir.into_utf8_path_buf(),
+                    index.shard_count(),
+                    index.definition_count(),
+                ));
+            }
+            Ok(_) => tracing::debug!(%dir, "no shards here"),
+            Err(err) => tracing::debug!(%dir, %err, "could not read"),
+        }
+    }
+    None
 }
 
 pub struct Server {
@@ -316,6 +364,23 @@ impl Server {
                 ErrorCode::MethodNotFound,
                 format!("`{unknown}` is not implemented"),
             )),
+        }
+    }
+
+    /// Takes on an index discovered at startup.
+    ///
+    /// Re-reads rather than taking the one `discover_index` built, because that
+    /// one was read before the server existed and threading it through would
+    /// complicate the constructor for a one-off saving of a few hundred
+    /// milliseconds.
+    pub fn adopt_index(&mut self, dir: &paths::Utf8Path) {
+        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
+            Ok(index) => {
+                self.index = Some(index);
+                self.index_dir = Some(dir.to_path_buf());
+                self.start_watching(dir.as_str());
+            }
+            Err(err) => tracing::warn!(%err, %dir, "could not adopt the index found at startup"),
         }
     }
 

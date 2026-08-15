@@ -90,6 +90,12 @@ cargo fmt --all
 
 Toolchain is pinned in `rust-toolchain.toml`.
 
+## Editors
+
+`editors/vscode/` holds a VS Code extension. Any LSP client works — the server
+advertises its capabilities statically once it finds an index, so nothing is
+client-specific — but VS Code needs an extension to spawn a custom binary at all.
+
 ## License
 
 MIT or Apache-2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.

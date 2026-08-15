@@ -1,0 +1,59 @@
+{
+  "name": "jabar",
+  "displayName": "jabar",
+  "description": "Java language support for Bazel megarepos, backed by SCIP indexes",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:java"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "jabar",
+      "properties": {
+        "jabar.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the jabar binary. Defaults to `jabar` on PATH."
+        },
+        "jabar.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Log the LSP traffic between VS Code and jabar."
+        },
+        "jabar.server.log": {
+          "type": "string",
+          "default": "info",
+          "description": "Value for JABAR_LOG in the server process, e.g. `jabar_server=debug`."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "jabar.status",
+        "title": "jabar: Show server status",
+        "category": "jabar"
+      },
+      {
+        "command": "jabar.reloadIndex",
+        "title": "jabar: Reload the symbol index",
+        "category": "jabar"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
