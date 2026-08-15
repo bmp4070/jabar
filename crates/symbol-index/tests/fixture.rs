@@ -251,6 +251,50 @@ fn a_cursor_on_a_call_site_finds_every_reference() {
     assert_eq!(index.references(symbol).len(), 30);
 }
 
+/// `documentSymbol` reads one file's declarations, in source order.
+#[test]
+fn a_files_declarations_are_listed_in_source_order() {
+    let Some(index) = index() else { return };
+    let defs = index.definitions_in("java/com/acme/policy/PolicyRegistry.java");
+    assert!(!defs.is_empty(), "the file should contribute definitions");
+
+    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&"PolicyRegistry"), "the class itself: {names:?}");
+    assert!(names.contains(&"register"), "its methods: {names:?}");
+
+    // Source order, so a caller can nest by enclosing span in one pass.
+    let lines: Vec<u32> = defs.iter().map(|d| d.range.start_line).collect();
+    assert!(lines.windows(2).all(|w| w[0] <= w[1]), "not in source order: {lines:?}");
+
+    // The class encloses its members, which is what makes nesting possible.
+    let class = defs.iter().find(|d| d.name == "PolicyRegistry").expect("the class");
+    let method = defs.iter().find(|d| d.name == "register").expect("a method");
+    let span = class.enclosing.expect("a class declaration has a span");
+    assert!(
+        span.start_line <= method.range.start_line && method.range.end_line <= span.end_line,
+        "the class span {span:?} should contain the method at {:?}",
+        method.range
+    );
+}
+
+/// `hover` needs a signature and javadoc; both come from the indexer.
+#[test]
+fn definitions_carry_a_signature_and_documentation() {
+    let Some(index) = index() else { return };
+    let def = index
+        .search("RetryPolicy")
+        .into_iter()
+        .find(|d| d.name == "RetryPolicy")
+        .expect("the interface");
+
+    assert!(def.signature.contains("RetryPolicy"), "signature: {:?}", def.signature);
+    assert!(
+        def.documentation.iter().any(|d| d.contains("failed attempt")),
+        "the javadoc should survive: {:?}",
+        def.documentation
+    );
+}
+
 /// A helper the JDK test wants and `Option` does not have.
 trait NotThen {
     fn not_then<T>(self, f: impl FnOnce() -> T) -> Option<T>;

@@ -49,6 +49,8 @@ impl Range {
     /// Three elements mean a single-line range and four mean a multi-line one;
     /// anything else is a shard we do not understand.
     fn from_scip(raw: &[i32]) -> Option<Range> {
+        // An absent enclosing_range arrives as an empty vector, not as a
+        // missing field, so emptiness is the normal case rather than an error.
         match *raw {
             [line, start, end] => Some(Range {
                 start_line: line as u32,
@@ -137,6 +139,16 @@ pub struct Definition {
     pub implements: Vec<String>,
     /// Javadoc, if the indexer captured any.
     pub documentation: Vec<String>,
+    /// The signature as it should be shown in a tooltip, e.g.
+    /// `public boolean shouldRetry(int, Throwable)`. Empty when the indexer
+    /// did not record one.
+    pub signature: String,
+    /// The span of the whole declaration, not just its name — the class body,
+    /// the method including its body.
+    ///
+    /// Absent for symbols the indexer did not scope, and for anything whose
+    /// declaration is its name. Used to nest symbols in `documentSymbol`.
+    pub enclosing: Option<Range>,
 }
 
 /// One use of a symbol somewhere other than its definition.
@@ -174,6 +186,8 @@ pub struct SymbolIndex {
     references: FxHashMap<String, Vec<Reference>>,
     /// Supertype symbol to the symbols implementing it.
     implementors: FxHashMap<String, Vec<usize>>,
+    /// File path to the definitions it contains.
+    by_path: FxHashMap<String, Vec<usize>>,
     /// Every occurrence in a file, ordered by position, for cursor lookup.
     occurrences: FxHashMap<String, Vec<Occurrence>>,
     /// Interned symbol strings, indexed by the ids in [`Occurrence`].
@@ -251,7 +265,13 @@ impl SymbolIndex {
                     let info = meta.get(occ.symbol.as_str());
                     self.insert(Definition {
                         symbol: occ.symbol.clone(),
-                        name: short_name(&occ.symbol),
+                        // `display_name` is what the indexer intends a human to
+                        // see. Falling back to parsing the symbol string is for
+                        // shards that omit it.
+                        name: info
+                            .map(|i| i.display_name.clone())
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| short_name(&occ.symbol)),
                         kind: info
                             .map(|i| SymbolKind::from_scip(i.kind.enum_value_or_default()))
                             .unwrap_or(SymbolKind::Other),
@@ -268,6 +288,13 @@ impl SymbolIndex {
                             })
                             .unwrap_or_default(),
                         documentation: info.map(|i| i.documentation.clone()).unwrap_or_default(),
+                        signature: info
+                            .and_then(|i| i.signature_documentation.as_ref())
+                            .map(|sig| sig.text.clone())
+                            .unwrap_or_default(),
+                        // Carried by the occurrence, not the symbol: the same
+                        // symbol can be declared in more than one place.
+                        enclosing: Range::from_scip(&occ.enclosing_range),
                     });
                 } else {
                     self.references.entry(occ.symbol.clone()).or_default().push(Reference {
@@ -310,6 +337,7 @@ impl SymbolIndex {
             return;
         }
         let idx = self.definitions.len();
+        self.by_path.entry(def.path.clone()).or_default().push(idx);
         self.by_name.entry(def.name.to_lowercase()).or_default().push(idx);
         self.by_symbol.insert(def.symbol.clone(), idx);
         for supertype in &def.implements {
@@ -393,6 +421,20 @@ impl SymbolIndex {
         self.occurrences.values().map(Vec::len).sum()
     }
 
+    /// Every definition in one file, in source order.
+    ///
+    /// Ordered by position so a caller can nest them: a definition whose range
+    /// falls inside a preceding one's `enclosing` span is a child of it.
+    pub fn definitions_in(&self, path: &str) -> Vec<&Definition> {
+        let mut defs: Vec<&Definition> = self
+            .by_path
+            .get(path)
+            .map(|idxs| idxs.iter().map(|&i| &self.definitions[i]).collect())
+            .unwrap_or_default();
+        defs.sort_by_key(|d| (d.range.start_line, d.range.start_col));
+        defs
+    }
+
     pub fn definition(&self, symbol: &str) -> Option<&Definition> {
         self.by_symbol.get(symbol).map(|&i| &self.definitions[i])
     }
@@ -445,6 +487,15 @@ fn rank(def: &Definition, needle: &str) -> u8 {
     } else {
         2
     }
+}
+
+/// The searchable short name in a SCIP symbol string.
+///
+/// Public as [`short_name_of`] for callers rendering a symbol they only have as
+/// a string — a supertype named in a relationship, say, which may be defined in
+/// a shard this index never loaded.
+pub fn short_name_of(symbol: &str) -> String {
+    short_name(symbol)
 }
 
 /// The searchable short name in a SCIP symbol string.
@@ -551,6 +602,8 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             implements: Vec::new(),
             documentation: Vec::new(),
+            signature: String::new(),
+            enclosing: None,
         }
     }
 

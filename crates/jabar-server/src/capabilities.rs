@@ -148,6 +148,7 @@ mod tests {
         assert!(caps.references_provider.is_none());
         assert!(caps.hover_provider.is_none());
         assert!(caps.implementation_provider.is_none());
+        // Genuinely not implemented, as opposed to registered on index load.
         assert!(caps.call_hierarchy_provider.is_none());
         // Cut from the roadmap entirely, not merely pending.
         assert!(caps.completion_provider.is_none(), "completion is out of scope");

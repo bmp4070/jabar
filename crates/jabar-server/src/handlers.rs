@@ -314,6 +314,176 @@ fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
 
+/// Documentation and signature for the symbol under a cursor.
+///
+/// Markdown, because every client renders it and the alternative is plain text
+/// with the signature indistinguishable from the prose around it.
+pub fn hover(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<lsp_types::Hover> {
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let def = index.definition(&symbol)?;
+
+    let mut markdown = String::new();
+    if !def.signature.is_empty() {
+        // A fenced block so the client syntax-highlights it rather than
+        // reflowing it as prose.
+        markdown.push_str("```java\n");
+        markdown.push_str(&def.signature);
+        markdown.push_str("\n```");
+    }
+    for paragraph in &def.documentation {
+        if !markdown.is_empty() {
+            markdown.push_str("\n\n");
+        }
+        markdown.push_str(paragraph.trim());
+    }
+    // What a symbol implements is often the most useful thing about it and is
+    // nowhere else in the response.
+    if !def.implements.is_empty() {
+        if !markdown.is_empty() {
+            markdown.push_str("\n\n");
+        }
+        markdown.push_str("Implements: ");
+        let names: Vec<String> =
+            def.implements.iter().map(|s| symbol_index::short_name_of(s)).collect();
+        markdown.push_str(&names.join(", "));
+    }
+
+    // Nothing to say is not the same as no symbol here. Returning an empty
+    // hover would render as a blank tooltip; `None` lets the client fall back.
+    if markdown.is_empty() {
+        return None;
+    }
+
+    Some(lsp_types::Hover {
+        contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: None,
+    })
+}
+
+/// Implementations of the interface or method under a cursor.
+pub fn goto_implementation(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<Vec<Location>> {
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let locations = index
+        .implementors(&symbol)
+        .into_iter()
+        .filter_map(|def| {
+            to_location(
+                &def.path,
+                def.range,
+                def.encoding,
+                workspace_root,
+                client_encoding,
+                read_file,
+            )
+        })
+        .collect();
+    Some(locations)
+}
+
+/// Every symbol declared in one file, nested by enclosing scope.
+pub fn document_symbols(
+    index: &SymbolIndex,
+    relative_path: &str,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Vec<lsp_types::DocumentSymbol> {
+    let defs = index.definitions_in(relative_path);
+    let converted: Vec<(usize, lsp_types::DocumentSymbol)> = defs
+        .iter()
+        .enumerate()
+        .map(|(i, def)| (i, to_document_symbol(def, relative_path, client_encoding, read_file)))
+        .collect();
+
+    // Nest by enclosing span: a symbol whose selection range falls inside an
+    // earlier symbol's declaration is a member of it. Walking a stack works
+    // because `definitions_in` returns source order, so a parent always
+    // precedes its members.
+    let mut roots: Vec<lsp_types::DocumentSymbol> = Vec::new();
+    let mut stack: Vec<(symbol_index::Range, lsp_types::DocumentSymbol)> = Vec::new();
+
+    for (i, symbol) in converted {
+        let def = defs[i];
+        while let Some((span, _)) = stack.last() {
+            if contains(span, &def.range) {
+                break;
+            }
+            let (_, finished) = stack.pop().expect("just checked");
+            attach(&mut stack, &mut roots, finished);
+        }
+        match def.enclosing {
+            Some(span) => stack.push((span, symbol)),
+            // No declaration span, so nothing can nest inside it.
+            None => attach(&mut stack, &mut roots, symbol),
+        }
+    }
+    while let Some((_, finished)) = stack.pop() {
+        attach(&mut stack, &mut roots, finished);
+    }
+    roots
+}
+
+fn attach(
+    stack: &mut [(symbol_index::Range, lsp_types::DocumentSymbol)],
+    roots: &mut Vec<lsp_types::DocumentSymbol>,
+    symbol: lsp_types::DocumentSymbol,
+) {
+    match stack.last_mut() {
+        Some((_, parent)) => parent.children.get_or_insert_with(Vec::new).push(symbol),
+        None => roots.push(symbol),
+    }
+}
+
+/// Whether `outer` wholly contains `inner`.
+fn contains(outer: &symbol_index::Range, inner: &symbol_index::Range) -> bool {
+    let starts_after = (inner.start_line, inner.start_col) >= (outer.start_line, outer.start_col);
+    let ends_before = (inner.end_line, inner.end_col) <= (outer.end_line, outer.end_col);
+    starts_after && ends_before
+}
+
+fn to_document_symbol(
+    def: &Definition,
+    relative_path: &str,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> lsp_types::DocumentSymbol {
+    let selection =
+        convert_span(relative_path, def.range, def.encoding, client_encoding, read_file);
+    // The full declaration where the indexer gave one, otherwise the name --
+    // LSP requires `range` to contain `selection_range`, so it can never be
+    // narrower.
+    let range = match def.enclosing {
+        Some(span) => convert_span(relative_path, span, def.encoding, client_encoding, read_file),
+        None => selection,
+    };
+    #[allow(deprecated)] // `deprecated` is a required field of the struct
+    lsp_types::DocumentSymbol {
+        name: def.name.clone(),
+        detail: (!def.signature.is_empty()).then(|| def.signature.clone()),
+        kind: to_lsp_kind(def.kind),
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range: selection,
+        children: None,
+    }
+}
+
 /// The outcome for a query refused because no index is loaded.
 ///
 /// A *failure*, not an empty result, because that is what the client is sent.
@@ -382,6 +552,8 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             implements: Vec::new(),
             documentation: Vec::new(),
+            signature: String::new(),
+            enclosing: None,
         }
     }
 

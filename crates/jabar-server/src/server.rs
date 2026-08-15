@@ -303,6 +303,13 @@ impl Server {
                 self.find_references(request.params).map(|r| r.locations)
             }
             REFERENCES_REQUEST => self.find_references(request.params).map(|r| r.full),
+            lsp_types::request::HoverRequest::METHOD => self.hover(request.params),
+            lsp_types::request::GotoImplementation::METHOD => {
+                self.goto_implementation(request.params)
+            }
+            lsp_types::request::DocumentSymbolRequest::METHOD => {
+                self.document_symbols(request.params)
+            }
             // Refusing loudly matters: silently returning null would look to a
             // client like a successful empty answer.
             unknown => Err(RequestError::new(
@@ -467,6 +474,101 @@ impl Server {
         Ok(reply)
     }
 
+    fn hover(&mut self, params: serde_json::Value) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::HoverParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+        let doc = params.text_document_position_params;
+
+        let mut guard = self.telemetry.start(telemetry::Op::Hover);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
+            let err = self.refuse(&mut guard, &doc.text_document.uri);
+            return Err(err);
+        };
+        let position =
+            crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
+        let read = file_reader(&self.documents, root);
+
+        match handlers::hover(index, &relative, position, self.encoding, &read) {
+            Some(hover) => {
+                guard.finish(telemetry::Outcome::answered(1));
+                Ok(serde_json::to_value(hover)?)
+            }
+            None => {
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    fn goto_implementation(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::request::GotoImplementationParams =
+            serde_json::from_value(params)
+                .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+        let doc = params.text_document_position_params;
+
+        let mut guard = self.telemetry.start(telemetry::Op::GoToImplementation);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
+            let err = self.refuse(&mut guard, &doc.text_document.uri);
+            return Err(err);
+        };
+        let position =
+            crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
+        let read = file_reader(&self.documents, root);
+
+        match handlers::goto_implementation(index, &relative, position, root, self.encoding, &read)
+        {
+            Some(locations) if !locations.is_empty() => {
+                guard.finish(telemetry::Outcome::answered(locations.len()));
+                Ok(serde_json::to_value(lsp_types::GotoDefinitionResponse::Array(locations))?)
+            }
+            // A concrete class with no subtypes genuinely has no
+            // implementations, which is a truthful empty rather than a failure.
+            _ => {
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                Ok(serde_json::to_value(Vec::<lsp_types::Location>::new())?)
+            }
+        }
+    }
+
+    fn document_symbols(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::DocumentSymbolParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+
+        let mut guard = self.telemetry.start(telemetry::Op::DocumentSymbol);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&params.text_document.uri) else {
+            let err = self.refuse(&mut guard, &params.text_document.uri);
+            return Err(err);
+        };
+        let read = file_reader(&self.documents, root);
+        let symbols = handlers::document_symbols(index, &relative, self.encoding, &read);
+
+        if symbols.is_empty() {
+            // A file the index does not cover -- not yet built, or not Java.
+            // That is not "this file declares nothing", so say which it is.
+            guard.finish(telemetry::Outcome::Empty {
+                reason: telemetry::EmptyReason::FileNotIndexed,
+            });
+        } else {
+            guard.finish(telemetry::Outcome::answered(symbols.len()));
+        }
+        Ok(serde_json::to_value(lsp_types::DocumentSymbolResponse::Nested(symbols))?)
+    }
+
     /// The index, workspace root, and workspace-relative path for a query.
     ///
     /// `None` when there is no index, or the URI is not a real path under the
@@ -522,6 +624,9 @@ impl Server {
             lsp_types::request::WorkspaceSymbolRequest::METHOD,
             lsp_types::request::GotoDefinition::METHOD,
             lsp_types::request::References::METHOD,
+            lsp_types::request::HoverRequest::METHOD,
+            lsp_types::request::GotoImplementation::METHOD,
+            lsp_types::request::DocumentSymbolRequest::METHOD,
         ]
         .into_iter()
         .map(|method| lsp_types::Registration {
