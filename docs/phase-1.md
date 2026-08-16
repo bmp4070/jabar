@@ -730,10 +730,44 @@ persistence, for the reasons in F5.
 **Not in this phase.** No parser beyond the narrow position-resolution use in
 M4 (F12). No item tree, no type inference, no remote HIR cache.
 
-**Cut from the roadmap entirely.** Completion, signature help, inlay hints,
-semantic tokens, code lens, folding ranges, document highlight, formatting, code
-actions. None are reachable from the client surface. If any appear in a later
-phase document, that document has drifted.
+**Cut from the roadmap entirely.** Signature help, inlay hints, semantic tokens,
+code lens, folding ranges, document highlight, formatting, code actions. None are
+reachable from the client surface. If any appear in a later phase document, that
+document has drifted.
+
+**Completion is deferred, not cut.** An earlier version of this document cut it
+outright, reasoning that Claude Code's tool does not expose it and Copilot
+generates its own inline suggestions. That holds for agents and stops holding the
+moment a human drives an editor — which is now a stated requirement, after MVP.
+
+The distinction matters architecturally, because deferring something is a promise
+not to foreclose it:
+
+- **It needs type inference, which SCIP does not provide.** SCIP gives the symbol
+  at a declaration, so `Foo foo = …; foo.` is tractable — resolve the declared
+  type, list its members from the index. Chained calls, generics, `var` and
+  lambdas are not. So there is a cheap version covering declared types and an
+  expensive one needing real inference, which is the HIR work SCIP otherwise let
+  us skip (see F15 resolved, and the note on HIR below).
+- **It is the one latency-critical operation.** Everything else here may take
+  300ms. Completion fires on each keystroke against a ~50ms budget, and
+  rust-analyzer devotes a whole crate to it.
+
+Nothing in the current design blocks either version. The thing to avoid is
+assuming, anywhere, that a symbol's meaning is fully determined by the index —
+because completion is where that stops being true.
+
+### On HIR
+
+The original three-phase plan made item trees and method-body arenas the core of
+Phase 2. SCIP displaced both: `scip-java` builds a resolved item tree inside
+javac at compile time, remotely cached and correctly invalidated. None of the
+nine client operations need HIR — the eight above come from SCIP, and call
+hierarchy from `enclosing_range`.
+
+HIR returns to the table only for what needs *inference*: completion beyond
+declared types, diagnostics, and refactoring past rename. Deferring completion
+therefore defers HIR with it, rather than deciding against it.
 
 **Rename is the one cut now restored, to Phase 3.** The original justification —
 not reachable from the client surface — mistook today's schema for the client's
