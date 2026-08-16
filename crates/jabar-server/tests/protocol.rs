@@ -175,14 +175,14 @@ fn advertises_only_what_is_implemented() {
 
 #[test]
 fn an_unknown_method_is_refused_rather_than_answered_empty() {
-    // Call hierarchy is genuinely not implemented. When it is, move this test
-    // to another unimplemented method rather than deleting it -- the property
-    // under test is that jabar never answers a method it does not serve.
+    // All nine client operations are served now, so this uses one that is
+    // deliberately out of scope. The property under test is that jabar never
+    // answers a method it does not serve.
     let mut harness = Harness::start(None, utf8_client());
-    let id = harness.send_request("textDocument/prepareCallHierarchy", json!({}));
+    let id = harness.send_request("textDocument/completion", json!({}));
     let error = harness.expect_err(id);
     assert_eq!(error.code, lsp_server::ErrorCode::MethodNotFound as i32);
-    assert!(error.message.contains("prepareCallHierarchy"), "message: {}", error.message);
+    assert!(error.message.contains("completion"), "message: {}", error.message);
     harness.shutdown();
 }
 

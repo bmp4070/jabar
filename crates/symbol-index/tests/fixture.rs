@@ -295,6 +295,54 @@ fn definitions_carry_a_signature_and_documentation() {
     );
 }
 
+/// The lookup behind `incomingCalls`: a reference attributes to the method
+/// containing it.
+///
+/// `EXPECTATIONS.md`: `RetryingHttpClient.send` calls `Backoff.nextDelay`.
+#[test]
+fn a_reference_attributes_to_its_enclosing_method() {
+    let Some(index) = index() else { return };
+
+    let next_delay = index
+        .search("nextDelay")
+        .into_iter()
+        .find(|d| d.symbol.contains("core/Backoff#"))
+        .expect("Backoff.nextDelay should be indexed");
+
+    let callers: Vec<String> = index
+        .references(&next_delay.symbol)
+        .iter()
+        .filter_map(|r| index.enclosing_callable(&r.path, r.range))
+        .map(|d| d.name.clone())
+        .collect();
+
+    assert!(callers.contains(&"send".to_owned()), "callers: {callers:?}");
+}
+
+/// The lookup behind `outgoingCalls`: what a method's body mentions.
+#[test]
+fn a_method_body_yields_what_it_calls() {
+    let Some(index) = index() else { return };
+
+    let send = index
+        .search("send")
+        .into_iter()
+        .find(|d| d.symbol.contains("RetryingHttpClient#send"))
+        .expect("RetryingHttpClient.send should be indexed");
+    let span = send.enclosing.expect("a method has a declaration span");
+
+    let called: Vec<String> = index
+        .references_within(&send.path, span)
+        .into_iter()
+        .filter_map(|(symbol, _)| index.definition(symbol))
+        .map(|d| d.name.clone())
+        .collect();
+
+    // Per EXPECTATIONS.md this crosses three target boundaries.
+    assert!(called.contains(&"nextDelay".to_owned()), "called: {called:?}");
+    assert!(called.contains(&"shouldRetry".to_owned()), "called: {called:?}");
+}
+
 /// A helper the JDK test wants and `Option` does not have.
 trait NotThen {
     fn not_then<T>(self, f: impl FnOnce() -> T) -> Option<T>;

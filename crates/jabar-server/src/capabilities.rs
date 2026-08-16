@@ -63,6 +63,8 @@ pub fn server_capabilities(encoding: PositionEncoding, has_index: bool) -> Serve
         implementation_provider: has_index
             .then_some(lsp_types::ImplementationProviderCapability::Simple(true)),
         hover_provider: has_index.then_some(lsp_types::HoverProviderCapability::Simple(true)),
+        call_hierarchy_provider: has_index
+            .then_some(lsp_types::CallHierarchyServerCapability::Simple(true)),
         // Incremental sync, because the alternative is resending whole files on
         // every keystroke and this server is meant for large ones.
         text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
@@ -167,6 +169,7 @@ mod tests {
         assert!(with.implementation_provider.is_some());
         assert!(with.document_symbol_provider.is_some());
         assert!(with.workspace_symbol_provider.is_some());
+        assert!(with.call_hierarchy_provider.is_some());
     }
 
     #[test]
@@ -177,8 +180,10 @@ mod tests {
         // detect.
         // Nothing is advertised without an index; see the test above.
         let caps = server_capabilities(PositionEncoding::Utf8, true);
-        // Genuinely unimplemented, index or not.
-        assert!(caps.call_hierarchy_provider.is_none());
+        // Everything in the client's surface is now served, so this test has
+        // nothing left to guard. It stays as the place to add the next
+        // unimplemented capability rather than being deleted.
+        assert!(caps.completion_provider.is_none(), "completion is deferred, not built");
         // Cut from the roadmap entirely, not merely pending.
         assert!(caps.completion_provider.is_none(), "completion is out of scope");
         assert!(caps.signature_help_provider.is_none(), "signature help is out of scope");

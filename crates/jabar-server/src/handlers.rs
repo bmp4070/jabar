@@ -530,6 +530,151 @@ fn to_document_symbol(
     }
 }
 
+/// The callable under a cursor, as the item a call hierarchy starts from.
+///
+/// The SCIP symbol rides in `data`, which LSP preserves across the prepare →
+/// calls round trip. Without it the follow-up requests would have to re-resolve
+/// from a position, and the client is entitled to have moved the cursor by then.
+pub fn prepare_call_hierarchy(
+    index: &SymbolIndex,
+    relative_path: &str,
+    position: LinePosition,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<lsp_types::CallHierarchyItem> {
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let def = index.definition(&symbol)?;
+    // Only a callable can have callers. Starting a hierarchy from a class would
+    // give a tree of things that are not calls.
+    if !matches!(def.kind, SymbolKind::Method | SymbolKind::Constructor) {
+        return None;
+    }
+    to_call_item(def, workspace_root, client_encoding, read_file)
+}
+
+/// Methods that call the given one.
+///
+/// Every reference to the symbol sits inside some callable; that callable is a
+/// caller. References outside any callable — a field initialiser, an annotation
+/// — have no caller to name and are dropped rather than attributed to the
+/// enclosing class.
+pub fn incoming_calls(
+    index: &SymbolIndex,
+    symbol: &str,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Vec<lsp_types::CallHierarchyIncomingCall> {
+    // One entry per caller, carrying every site it calls from -- which is what
+    // `from_ranges` is for, and why a caller appearing twice is one result.
+    let mut callers: Vec<(&Definition, Vec<Range>)> = Vec::new();
+
+    for reference in index.references(symbol).iter().take(CALL_HIERARCHY_LIMIT) {
+        let Some(caller) = index.enclosing_callable(&reference.path, reference.range) else {
+            continue;
+        };
+        let range = convert_span(
+            &reference.path,
+            reference.range,
+            reference.encoding,
+            client_encoding,
+            read_file,
+        );
+        match callers.iter_mut().find(|(def, _)| def.symbol == caller.symbol) {
+            Some((_, ranges)) => ranges.push(range),
+            None => callers.push((caller, vec![range])),
+        }
+    }
+
+    callers
+        .into_iter()
+        .filter_map(|(def, from_ranges)| {
+            Some(lsp_types::CallHierarchyIncomingCall {
+                from: to_call_item(def, workspace_root, client_encoding, read_file)?,
+                from_ranges,
+            })
+        })
+        .collect()
+}
+
+/// Methods the given one calls.
+pub fn outgoing_calls(
+    index: &SymbolIndex,
+    symbol: &str,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Vec<lsp_types::CallHierarchyOutgoingCall> {
+    let Some(def) = index.definition(symbol) else { return Vec::new() };
+    // Without a declaration span there is no body to look inside.
+    let Some(span) = def.enclosing else { return Vec::new() };
+
+    index
+        .references_within(&def.path, span)
+        .into_iter()
+        .filter_map(|(referenced, at)| {
+            let callee = index.definition(referenced)?;
+            // A body mentions types and fields as well as calls. Only callables
+            // belong in a call hierarchy.
+            if !matches!(callee.kind, SymbolKind::Method | SymbolKind::Constructor) {
+                return None;
+            }
+            Some(lsp_types::CallHierarchyOutgoingCall {
+                to: to_call_item(callee, workspace_root, client_encoding, read_file)?,
+                // Where in *this* method the call appears.
+                from_ranges: vec![convert_span(
+                    &def.path,
+                    at,
+                    def.encoding,
+                    client_encoding,
+                    read_file,
+                )],
+            })
+        })
+        .take(CALL_HIERARCHY_LIMIT)
+        .collect()
+}
+
+/// How many callers or callees one response carries.
+///
+/// Lower than the reference cap: a call hierarchy is read as a tree and expanded
+/// a level at a time, so breadth past this is noise rather than context.
+pub const CALL_HIERARCHY_LIMIT: usize = 100;
+
+/// Recovers the SCIP symbol a `CallHierarchyItem` was built from.
+pub fn call_item_symbol(item: &lsp_types::CallHierarchyItem) -> Option<String> {
+    item.data.as_ref()?.get("symbol")?.as_str().map(str::to_owned)
+}
+
+fn to_call_item(
+    def: &Definition,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Option<lsp_types::CallHierarchyItem> {
+    let abs = workspace_root.join(&def.path);
+    let uri = lsp_types::Url::from_file_path(abs.as_str()).ok()?;
+    let selection_range =
+        convert_span(&def.path, def.range, def.encoding, client_encoding, read_file);
+    // LSP requires `range` to contain `selection_range`, so a definition without
+    // a declaration span uses its name for both.
+    let range = match def.enclosing {
+        Some(span) => convert_span(&def.path, span, def.encoding, client_encoding, read_file),
+        None => selection_range,
+    };
+    Some(lsp_types::CallHierarchyItem {
+        name: def.name.clone(),
+        kind: to_lsp_kind(def.kind),
+        tags: None,
+        detail: (!def.signature.is_empty()).then(|| def.signature.clone()),
+        uri,
+        range,
+        selection_range,
+        data: Some(serde_json::json!({ "symbol": def.symbol })),
+    })
+}
+
 /// The outcome for a query refused because no index is loaded.
 ///
 /// A *failure*, not an empty result, because that is what the client is sent.

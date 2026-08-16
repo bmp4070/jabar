@@ -416,6 +416,55 @@ impl SymbolIndex {
         best.map(|o| self.symbol_names[o.symbol as usize].as_str())
     }
 
+    /// The innermost callable whose declaration span contains `range`.
+    ///
+    /// This is what turns a reference into a caller: an occurrence of `foo`
+    /// sitting inside `bar`'s span means `bar` calls `foo`. Only methods and
+    /// constructors qualify — a reference inside a class body but outside any
+    /// method is a field initialiser, which has no caller to name.
+    ///
+    /// Innermost wins, so a call inside a nested class's method attributes to
+    /// that method rather than to the outer one containing it.
+    pub fn enclosing_callable(&self, path: &str, range: Range) -> Option<&Definition> {
+        self.by_path
+            .get(path)?
+            .iter()
+            .map(|&i| &self.definitions[i])
+            .filter(|def| matches!(def.kind, SymbolKind::Method | SymbolKind::Constructor))
+            .filter(|def| def.enclosing.is_some_and(|span| encloses(&span, &range)))
+            .min_by_key(|def| def.enclosing.map(|s| span_len(&s)).unwrap_or(u64::MAX))
+    }
+
+    /// Symbols referenced within `span` in `path`, excluding definitions.
+    ///
+    /// The reverse direction: what a method's body mentions. Returns each
+    /// distinct symbol once, with the first position it appears at, because a
+    /// call hierarchy wants "calls X" rather than "calls X four times".
+    pub fn references_within(&self, path: &str, span: Range) -> Vec<(&str, Range)> {
+        let Some(occurrences) = self.occurrences.get(path) else { return Vec::new() };
+        let mut seen: Vec<(&str, Range)> = Vec::new();
+        for occ in occurrences {
+            if occ.range.start_line > span.end_line {
+                break;
+            }
+            if !encloses(&span, &occ.range) {
+                continue;
+            }
+            let symbol = self.symbol_names[occ.symbol as usize].as_str();
+            // A definition inside the span is the method itself, or something
+            // declared in it -- neither is a call.
+            if self.by_symbol.get(symbol).is_some_and(|&i| {
+                self.definitions[i].path == path && self.definitions[i].range == occ.range
+            }) {
+                continue;
+            }
+            if !seen.iter().any(|(s, _)| *s == symbol) {
+                seen.push((symbol, occ.range));
+            }
+        }
+        seen
+    }
+
     /// Total occurrences held, across every file.
     pub fn occurrence_count(&self) -> usize {
         self.occurrences.values().map(Vec::len).sum()
@@ -451,6 +500,12 @@ impl SymbolIndex {
             .map(|idxs| idxs.iter().map(|&i| &self.definitions[i]).collect())
             .unwrap_or_default()
     }
+}
+
+/// Whether `outer` wholly contains `inner`.
+fn encloses(outer: &Range, inner: &Range) -> bool {
+    (inner.start_line, inner.start_col) >= (outer.start_line, outer.start_col)
+        && (inner.end_line, inner.end_col) <= (outer.end_line, outer.end_col)
 }
 
 /// Whether `range` covers `(line, col)`, treating the end as exclusive.
@@ -676,6 +731,21 @@ mod tests {
         assert!(span_len(&r(0, 10, 0, 21)) < span_len(&r(0, 0, 0, 30)));
         // A multi-line range is always wider than a single-line one.
         assert!(span_len(&r(0, 0, 0, 999)) < span_len(&r(0, 0, 1, 0)));
+    }
+
+    #[test]
+    fn enclosing_picks_the_innermost_callable() {
+        assert!(encloses(&r(0, 0, 10, 0), &r(5, 4, 5, 9)));
+        assert!(!encloses(&r(0, 0, 10, 0), &r(11, 0, 11, 5)));
+        // A method's span is narrower than its class's, so it wins.
+        assert!(span_len(&r(5, 2, 8, 3)) < span_len(&r(0, 0, 20, 1)));
+    }
+
+    #[test]
+    fn call_hierarchy_lookups_are_empty_on_an_unknown_file() {
+        let index = SymbolIndex::default();
+        assert!(index.enclosing_callable("nowhere.java", r(0, 0, 0, 1)).is_none());
+        assert!(index.references_within("nowhere.java", r(0, 0, 99, 0)).is_empty());
     }
 
     #[test]

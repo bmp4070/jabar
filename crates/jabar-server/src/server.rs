@@ -439,6 +439,15 @@ impl Server {
             lsp_types::request::DocumentSymbolRequest::METHOD => {
                 self.document_symbols(request.params)
             }
+            lsp_types::request::CallHierarchyPrepare::METHOD => {
+                self.prepare_call_hierarchy(request.params)
+            }
+            lsp_types::request::CallHierarchyIncomingCalls::METHOD => {
+                self.call_hierarchy(request.params, CallDirection::Incoming)
+            }
+            lsp_types::request::CallHierarchyOutgoingCalls::METHOD => {
+                self.call_hierarchy(request.params, CallDirection::Outgoing)
+            }
             // Refusing loudly matters: silently returning null would look to a
             // client like a successful empty answer.
             unknown => Err(RequestError::new(
@@ -778,6 +787,99 @@ impl Server {
         }
     }
 
+    fn prepare_call_hierarchy(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RequestError> {
+        let params: lsp_types::CallHierarchyPrepareParams = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+        let doc = params.text_document_position_params;
+
+        let mut guard = self.telemetry.start(telemetry::Op::PrepareCallHierarchy);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
+            let err = self.refuse(&mut guard, &doc.text_document.uri);
+            return Err(err);
+        };
+        let position =
+            crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
+        let read = file_reader(&self.documents, root);
+
+        match handlers::prepare_call_hierarchy(
+            index,
+            &relative,
+            position,
+            root,
+            self.encoding,
+            &read,
+        ) {
+            Some(item) => {
+                guard.finish(telemetry::Outcome::answered(1));
+                Ok(serde_json::to_value(vec![item])?)
+            }
+            None => {
+                // Not on a callable, or on one the index does not define. LSP
+                // wants null rather than an empty array to mean "no hierarchy
+                // starts here".
+                guard.finish(empty_reason(self.is_dirty(&relative, root)));
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    fn call_hierarchy(
+        &mut self,
+        params: serde_json::Value,
+        direction: CallDirection,
+    ) -> Result<serde_json::Value, RequestError> {
+        // Both directions carry the same item; only the method name differs.
+        #[derive(serde::Deserialize)]
+        struct Params {
+            item: lsp_types::CallHierarchyItem,
+        }
+        let params: Params = serde_json::from_value(params)
+            .map_err(|err| RequestError::new(ErrorCode::InvalidParams, err.to_string()))?;
+
+        let op = match direction {
+            CallDirection::Incoming => telemetry::Op::IncomingCalls,
+            CallDirection::Outgoing => telemetry::Op::OutgoingCalls,
+        };
+        let mut guard = self.telemetry.start(op);
+        guard.at_revision(self.vfs.revision().as_u64());
+        guard.mark_stale(self.vfs.has_pending_changes());
+
+        let Some((index, root, _)) = self.resolve_query(&params.item.uri) else {
+            let err = self.refuse(&mut guard, &params.item.uri);
+            return Err(err);
+        };
+        // The symbol was stashed at prepare time. A client that fabricates an
+        // item, or replays one from a previous session, will not have it.
+        let Some(symbol) = handlers::call_item_symbol(&params.item) else {
+            guard.mark_failed(telemetry::Failure::BadRequest);
+            return Err(RequestError::new(
+                ErrorCode::InvalidParams,
+                "the call hierarchy item did not come from `prepareCallHierarchy`".to_owned(),
+            ));
+        };
+
+        let read = file_reader(&self.documents, root);
+        let value = match direction {
+            CallDirection::Incoming => {
+                let calls = handlers::incoming_calls(index, &symbol, root, self.encoding, &read);
+                guard.finish(count_outcome(calls.len()));
+                serde_json::to_value(calls)?
+            }
+            CallDirection::Outgoing => {
+                let calls = handlers::outgoing_calls(index, &symbol, root, self.encoding, &read);
+                guard.finish(count_outcome(calls.len()));
+                serde_json::to_value(calls)?
+            }
+        };
+        Ok(value)
+    }
+
     /// The index, workspace root, and workspace-relative path for a query.
     ///
     /// `None` when there is no index, or the URI is not a real path under the
@@ -836,6 +938,7 @@ impl Server {
             lsp_types::request::HoverRequest::METHOD,
             lsp_types::request::GotoImplementation::METHOD,
             lsp_types::request::DocumentSymbolRequest::METHOD,
+            lsp_types::request::CallHierarchyPrepare::METHOD,
         ]
         .into_iter()
         .map(|method| lsp_types::Registration {
@@ -1037,6 +1140,23 @@ impl ReferenceReply {
             "locations": locations,
         });
         Ok(ReferenceReply { locations, full })
+    }
+}
+
+/// Which way a call hierarchy is being walked.
+#[derive(Copy, Clone)]
+enum CallDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// A method with no callers is a true answer, not a failure — an entry point,
+/// or dead code, which is often exactly what the caller wanted to learn.
+fn count_outcome(count: usize) -> telemetry::Outcome {
+    if count == 0 {
+        telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch }
+    } else {
+        telemetry::Outcome::answered(count)
     }
 }
 

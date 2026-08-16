@@ -5,16 +5,16 @@ agents first and editors second.
 
 ## Status
 
-**Six of the nine client operations work end to end** — `workspace/symbol`,
+**All nine client operations work end to end** — `workspace/symbol`,
 `textDocument/definition`, `textDocument/references`, `textDocument/hover`,
-`textDocument/implementation` and `textDocument/documentSymbol`. Given SCIP shards produced by the
+`textDocument/implementation`, `textDocument/documentSymbol`, and the call
+hierarchy trio. Given SCIP shards produced by the
 aspect in `crates/build-model/aspects/`, `jabar` answers symbol searches across
 a whole Bazel repo with real ranges, converted into the client's negotiated
 position encoding. Before an index is loaded it returns an LSP *error* rather
 than an empty list, because a client cannot tell those apart.
 
-The other eight operations are not implemented, and no capability is advertised
-that cannot be served.
+No capability is advertised that cannot be served.
 
 | Crate | State |
 | --- | --- |
