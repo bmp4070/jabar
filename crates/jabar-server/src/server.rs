@@ -28,6 +28,7 @@ use crate::documents::Documents;
 use crate::handlers;
 use crate::line_index::PositionEncoding;
 use crate::uri;
+use overlay::Overlay;
 use symbol_index::SymbolIndex;
 use watcher::{Change, FileWatcher};
 
@@ -148,6 +149,10 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// Parses open files the index cannot see yet.
+    ///
+    /// Holds a parser, so it is kept rather than made per query.
+    overlay: Overlay,
     /// Whether the client asked to be shown progress.
     pub supports_progress: bool,
     /// Watches the shards and git state; `None` until an index is loaded, since
@@ -180,6 +185,7 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            overlay: Overlay::new(),
             supports_progress: false,
             watcher: None,
             index_dir: None,
@@ -506,17 +512,43 @@ impl Server {
         // No index is not the same answer as no matches. Returning `[]` here
         // would tell the client the symbol does not exist, which it cannot
         // distinguish and would act on.
-        let (Some(index), Some(root)) = (&self.index, &self.workspace_root) else {
+        if self.index.is_none() || self.workspace_root.is_none() {
             guard.finish(handlers::index_unavailable_outcome());
             return Err(RequestError::new(
                 ErrorCode::ServerNotInitialized,
                 "no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
                     .to_owned(),
             ));
-        };
+        }
+        let root = self.workspace_root.clone().expect("just checked");
 
-        let read = file_reader(&self.documents, root);
-        let results = handlers::workspace_symbol(index, &params.query, root, self.encoding, read);
+        // Parse every open file that differs from disk, so a symbol written
+        // seconds ago is findable. Bounded by what the client has open, which
+        // is a handful of files, not the repo.
+        let dirty: Vec<(String, String)> = self
+            .documents
+            .iter()
+            .filter_map(|(path, doc)| {
+                let abs = path.as_real()?;
+                let relative = abs.strip_prefix(&root)?.as_str().to_owned();
+                Some((relative, doc.text.clone()))
+            })
+            .collect();
+        let live: Vec<symbol_index::Definition> = dirty
+            .into_iter()
+            .flat_map(|(relative, text)| self.overlay.parse(&relative, &text))
+            .collect();
+
+        let index = self.index.as_ref().expect("resolve_query established there is one");
+        let read = file_reader(&self.documents, &root);
+        let results = handlers::workspace_symbol_with(
+            index,
+            &live,
+            &params.query,
+            &root,
+            self.encoding,
+            read,
+        );
 
         guard.finish(results.outcome());
         Ok(serde_json::to_value(results.symbols)?)
@@ -550,9 +582,11 @@ impl Server {
             }
             None => {
                 // Nothing at that position, or a symbol this index does not
-                // define -- a JDK or third-party type, whose definition lives in
-                // a jar no shard covers. Both are an honest "no match".
-                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                // define -- a JDK or third-party type in a jar no shard covers.
+                // Both are an honest "no match" *unless* the file has been
+                // edited since the last build, in which case the truthful
+                // answer is that the index predates what the client wrote.
+                guard.finish(empty_reason(self.is_dirty(&relative, root)));
                 Ok(serde_json::Value::Null)
             }
         }
@@ -601,7 +635,7 @@ impl Server {
                 ReferenceReply::new(&results.symbol, results.locations, results.total)?
             }
             None => {
-                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                guard.finish(empty_reason(self.is_dirty(&relative, root)));
                 ReferenceReply::new("", Vec::new(), 0)?
             }
         };
@@ -631,7 +665,7 @@ impl Server {
                 Ok(serde_json::to_value(hover)?)
             }
             None => {
-                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
+                guard.finish(empty_reason(self.is_dirty(&relative, root)));
                 Ok(serde_json::Value::Null)
             }
         }
@@ -684,12 +718,35 @@ impl Server {
         guard.at_revision(self.vfs.revision().as_u64());
         guard.mark_stale(self.vfs.has_pending_changes());
 
-        let Some((index, root, relative)) = self.resolve_query(&params.text_document.uri) else {
-            let err = self.refuse(&mut guard, &params.text_document.uri);
-            return Err(err);
+        // Resolve to owned values first: parsing needs `&mut self`, and a
+        // borrow of the index would still be alive otherwise.
+        let (root, relative) = {
+            let Some((_, root, relative)) = self.resolve_query(&params.text_document.uri) else {
+                let err = self.refuse(&mut guard, &params.text_document.uri);
+                return Err(err);
+            };
+            (root.clone(), relative)
         };
-        let read = file_reader(&self.documents, root);
-        let symbols = handlers::document_symbols(index, &relative, self.encoding, &read);
+
+        // The client's buffer is the truth for an open file, and the index
+        // describes the tree as of the last build. Parsing what the client
+        // holds is both more current and the only way to see a file that was
+        // never built.
+        let live_text =
+            self.documents.get(&VfsPath::Real(root.join(&relative))).map(|doc| doc.text.clone());
+        let live = live_text.map(|text| self.overlay.parse(&relative, &text));
+
+        let index = self.index.as_ref().expect("resolve_query established there is one");
+        let read = file_reader(&self.documents, &root);
+        let symbols = match &live {
+            Some(defs) if !defs.is_empty() => {
+                let borrowed: Vec<&symbol_index::Definition> = defs.iter().collect();
+                handlers::document_symbols_from(&borrowed, &relative, self.encoding, &read)
+            }
+            // Not open, or open and unparseable. Fall back to the index, which
+            // may still know this file from the last build.
+            _ => handlers::document_symbols(index, &relative, self.encoding, &read),
+        };
 
         if symbols.is_empty() {
             // A file the index does not cover -- not yet built, or not Java.
@@ -701,6 +758,24 @@ impl Server {
             guard.finish(telemetry::Outcome::answered(symbols.len()));
         }
         Ok(serde_json::to_value(lsp_types::DocumentSymbolResponse::Nested(symbols))?)
+    }
+
+    /// Whether an open file has content the index cannot have seen.
+    ///
+    /// Used to distinguish "no such symbol" from "the index predates what you
+    /// just wrote", which are the same empty answer on the wire and very
+    /// different claims.
+    fn is_dirty(&self, relative: &str, root: &AbsPathBuf) -> bool {
+        let path = VfsPath::Real(root.join(relative));
+        let Some(doc) = self.documents.get(&path) else { return false };
+        // Cheap and sufficient: if the buffer differs from disk, the index --
+        // built from disk -- cannot describe it. Equal content may still be
+        // newer than the last build, which `Change::Index` handles separately.
+        match std::fs::read_to_string(root.join(relative).as_str()) {
+            Ok(on_disk) => on_disk != doc.text,
+            // Never written, so certainly not built.
+            Err(_) => true,
+        }
     }
 
     /// The index, workspace root, and workspace-relative path for a query.
@@ -963,6 +1038,18 @@ impl ReferenceReply {
         });
         Ok(ReferenceReply { locations, full })
     }
+}
+
+/// Why a query came back empty.
+///
+/// The distinction the telemetry crate exists for: `NoMatch` means the server
+/// looked and there is nothing, which is a true answer. `IndexStale` means the
+/// file has changed since the index was built, so the server cannot know — and
+/// an agent that reads the first as the second deletes live code.
+fn empty_reason(dirty: bool) -> telemetry::Outcome {
+    let reason =
+        if dirty { telemetry::EmptyReason::IndexStale } else { telemetry::EmptyReason::NoMatch };
+    telemetry::Outcome::Empty { reason }
 }
 
 /// Reads a workspace-relative file, preferring the client's open copy.

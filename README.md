@@ -22,6 +22,7 @@ that cannot be served.
 | `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
 | `telemetry` | Misbehaviour detection. Done, 21 tests. |
 | `watcher` | Reloads the index when shards or git state change. Done, 10 tests. |
+| `overlay` | tree-sitter declarations for files the index cannot see yet. Done, 11 tests. |
 | `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
 | `symbol-index` | Reads SCIP shards: search, cursor resolution, definitions, references, implementors, per-file listing. Done, 27 tests. |
 | `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |

@@ -651,7 +651,8 @@ to build now and decide distribution later.
 
 **What none of this fixes:** the window between an agent writing a file and a
 build running. Nothing build-based can close it. That is what the dirty-file
-overlay is for, and it gives tree-sitter a clearer job than "positions":
+overlay is for — **now built**, in `crates/overlay` — and it gives tree-sitter a
+clearer job than "positions":
 
 ```
 committed and built  →  SCIP index          complete, resolved, remotely cached

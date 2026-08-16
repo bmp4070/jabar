@@ -17,6 +17,7 @@ path = "src/bin/main.rs"
 paths.workspace = true
 vfs.workspace = true
 build-model.workspace = true
+overlay.workspace = true
 symbol-index.workspace = true
 telemetry.workspace = true
 watcher.workspace = true

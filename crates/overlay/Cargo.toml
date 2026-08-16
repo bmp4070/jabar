@@ -1,0 +1,17 @@
+[package]
+name = "overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+symbol-index.workspace = true
+
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-java.workspace = true
+
+[lints]
+workspace = true

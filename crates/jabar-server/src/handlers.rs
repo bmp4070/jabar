@@ -54,10 +54,41 @@ pub fn workspace_symbol(
     client_encoding: ClientEncoding,
     read_file: impl Fn(&str) -> Option<String>,
 ) -> SearchResults {
-    let matches = index.search(query);
-    let total = matches.len();
+    workspace_symbol_with(index, &[], query, workspace_root, client_encoding, read_file)
+}
 
-    let symbols = matches
+/// The same, plus definitions parsed from files the index cannot see yet.
+///
+/// `live` comes from the overlay. Its entries win over indexed ones for the same
+/// file, because a file the client is editing is described better by what the
+/// client holds than by what was built — including symbols that exist only in
+/// the buffer, which is the case the overlay exists for.
+pub fn workspace_symbol_with(
+    index: &SymbolIndex,
+    live: &[Definition],
+    query: &str,
+    workspace_root: &paths::AbsPath,
+    client_encoding: ClientEncoding,
+    read_file: impl Fn(&str) -> Option<String>,
+) -> SearchResults {
+    let needle = query.to_lowercase();
+    let live_matches: Vec<&Definition> = live
+        .iter()
+        .filter(|def| !needle.is_empty() && def.name.to_lowercase().contains(&needle))
+        .collect();
+
+    // Files the overlay covers are represented entirely by it, so an indexed
+    // symbol for such a file is a stale duplicate rather than an extra result.
+    let shadowed: Vec<&str> = live.iter().map(|d| d.path.as_str()).collect();
+    let indexed =
+        index.search(query).into_iter().filter(|def| !shadowed.contains(&def.path.as_str()));
+
+    // Live first: a symbol the client just wrote is what it is most likely
+    // asking about.
+    let all: Vec<&Definition> = live_matches.into_iter().chain(indexed).collect();
+    let total = all.len();
+
+    let symbols = all
         .into_iter()
         .take(SEARCH_LIMIT)
         .filter_map(|def| to_symbol_information(def, workspace_root, client_encoding, &read_file))
@@ -403,7 +434,22 @@ pub fn document_symbols(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::DocumentSymbol> {
-    let defs = index.definitions_in(relative_path);
+    document_symbols_from(
+        &index.definitions_in(relative_path),
+        relative_path,
+        client_encoding,
+        read_file,
+    )
+}
+
+/// The same, from definitions the caller already has — the overlay's, for a file
+/// the index has not seen.
+pub fn document_symbols_from(
+    defs: &[&Definition],
+    relative_path: &str,
+    client_encoding: ClientEncoding,
+    read_file: &impl Fn(&str) -> Option<String>,
+) -> Vec<lsp_types::DocumentSymbol> {
     let converted: Vec<(usize, lsp_types::DocumentSymbol)> = defs
         .iter()
         .enumerate()
