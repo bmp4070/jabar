@@ -62,6 +62,10 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
         serde_json::from_value(params).context("client sent malformed InitializeParams")?;
 
     let encoding = negotiate_encoding(&params.capabilities);
+    // Only send progress to a client that asked for it; an unsolicited
+    // `$/progress` is noise at best and a protocol error at worst.
+    let supports_progress =
+        params.capabilities.window.as_ref().and_then(|w| w.work_done_progress).unwrap_or(false);
     let root = workspace_root(&params)
         .as_ref()
         .and_then(|url| uri::vfs_path(url).ok())
@@ -76,8 +80,13 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     // "supported, but not yet": a provider advertised with nothing behind it
     // means clients call it and get nothing, which reads as "no such symbol".
     let discovered = root.as_deref().and_then(discover_index);
-    if let Some((dir, shards, definitions)) = &discovered {
-        tracing::info!(%dir, shards, definitions, "found an index at startup");
+    if let Some((dir, index)) = &discovered {
+        tracing::info!(
+            %dir,
+            shards = index.shard_count(),
+            definitions = index.definition_count(),
+            "found an index at startup"
+        );
     } else {
         tracing::info!(
             "no index found; run the SCIP aspect, then reopen or call `jabar/loadIndex`"
@@ -96,22 +105,23 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
         .context("initialize handshake failed")?;
 
     let mut server = Server::new(connection.sender.clone(), encoding, root);
-    if let Some((dir, _, _)) = discovered {
-        server.adopt_index(&dir);
+    server.supports_progress = supports_progress;
+    if let Some((dir, index)) = discovered {
+        server.adopt_index(dir, index);
     }
     server.run(&connection)
 }
 
-/// Looks for SCIP shards under a workspace.
+/// Looks for SCIP shards under a workspace, returning the index it built.
 ///
-/// Returns the directory, shard count and definition count when it finds any.
-/// The conventional home is `bazel-bin`, which is the convenience symlink Bazel
-/// writes at the workspace root; shards land one per target beneath it.
+/// The conventional home is `bazel-bin`, the convenience symlink Bazel writes at
+/// the workspace root; shards land one per target beneath it.
 ///
-/// Reads the whole index to answer, which is the only honest way to know it is
-/// usable — a directory of unparseable files is not an index. On Gerrit that is
-/// 97 shards and 343ms, paid once at startup.
-fn discover_index(root: &AbsPath) -> Option<(paths::Utf8PathBuf, usize, usize)> {
+/// Reading the whole index is the only honest way to know it is usable — a
+/// directory of unparseable files is not an index — and the result is handed to
+/// the server rather than rebuilt. On Gerrit that read is 97 shards and ~350ms,
+/// paid exactly once.
+fn discover_index(root: &AbsPath) -> Option<(paths::Utf8PathBuf, SymbolIndex)> {
     // `bazel-bin` is a symlink into the output base; `symlink_metadata` would
     // see the link rather than the directory, so follow it deliberately.
     for candidate in ["bazel-bin", ".jabar/index"] {
@@ -121,11 +131,7 @@ fn discover_index(root: &AbsPath) -> Option<(paths::Utf8PathBuf, usize, usize)> 
         }
         match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
             Ok(index) if !index.is_empty() => {
-                return Some((
-                    dir.into_utf8_path_buf(),
-                    index.shard_count(),
-                    index.definition_count(),
-                ));
+                return Some((dir.into_utf8_path_buf(), index));
             }
             Ok(_) => tracing::debug!(%dir, "no shards here"),
             Err(err) => tracing::debug!(%dir, %err, "could not read"),
@@ -142,6 +148,8 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// Whether the client asked to be shown progress.
+    pub supports_progress: bool,
     /// Watches the shards and git state; `None` until an index is loaded, since
     /// there is nothing to watch before that.
     watcher: Option<FileWatcher>,
@@ -172,6 +180,7 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            supports_progress: false,
             watcher: None,
             index_dir: None,
             telemetry: Telemetry::new(),
@@ -271,6 +280,10 @@ impl Server {
 
     fn reload_index(&mut self) {
         let Some(dir) = self.index_dir.clone() else { return };
+        // Reloading blocks the loop, and on a large repo that is long enough
+        // for a user to wonder whether the server has died. Say what is
+        // happening rather than going quiet.
+        let progress = self.begin_progress("jabar", "reloading the symbol index");
         let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
         match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
             Ok(index) => {
@@ -283,6 +296,68 @@ impl Server {
                 guard.mark_failed(telemetry::Failure::Io);
                 tracing::warn!(%err, dir = %dir, "could not reload the index; keeping the old one");
             }
+        }
+        self.end_progress(progress);
+    }
+
+    /// Tells the client that something slow has started, if it can show that.
+    ///
+    /// Returns the token to pass to [`Server::end_progress`], or `None` when
+    /// the client does not support progress — in which case ending is a no-op.
+    fn begin_progress(&self, title: &str, message: &str) -> Option<String> {
+        if !self.supports_progress {
+            return None;
+        }
+        let token = format!("jabar-{}", std::process::id());
+        // `create` first: a `$/progress` for a token the client has not been
+        // told about is discarded by most clients.
+        let create = lsp_types::WorkDoneProgressCreateParams {
+            token: lsp_types::NumberOrString::String(token.clone()),
+        };
+        if let Ok(params) = serde_json::to_value(create) {
+            self.send(
+                lsp_server::Request::new(
+                    lsp_server::RequestId::from(format!("{token}-create")),
+                    lsp_types::request::WorkDoneProgressCreate::METHOD.to_owned(),
+                    params,
+                )
+                .into(),
+            );
+        }
+        self.send_progress(
+            &token,
+            lsp_types::WorkDoneProgress::Begin(lsp_types::WorkDoneProgressBegin {
+                title: title.to_owned(),
+                cancellable: Some(false),
+                message: Some(message.to_owned()),
+                percentage: None,
+            }),
+        );
+        Some(token)
+    }
+
+    fn end_progress(&self, token: Option<String>) {
+        let Some(token) = token else { return };
+        self.send_progress(
+            &token,
+            lsp_types::WorkDoneProgress::End(lsp_types::WorkDoneProgressEnd { message: None }),
+        );
+    }
+
+    fn send_progress(&self, token: &str, value: lsp_types::WorkDoneProgress) {
+        let params = lsp_types::ProgressParams {
+            token: lsp_types::NumberOrString::String(token.to_owned()),
+            value: lsp_types::ProgressParamsValue::WorkDone(value),
+        };
+        match serde_json::to_value(params) {
+            Ok(params) => self.send(
+                lsp_server::Notification::new(
+                    lsp_types::notification::Progress::METHOD.to_owned(),
+                    params,
+                )
+                .into(),
+            ),
+            Err(err) => tracing::debug!(%err, "could not build a progress notification"),
         }
     }
 
@@ -369,19 +444,13 @@ impl Server {
 
     /// Takes on an index discovered at startup.
     ///
-    /// Re-reads rather than taking the one `discover_index` built, because that
-    /// one was read before the server existed and threading it through would
-    /// complicate the constructor for a one-off saving of a few hundred
-    /// milliseconds.
-    pub fn adopt_index(&mut self, dir: &paths::Utf8Path) {
-        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
-            Ok(index) => {
-                self.index = Some(index);
-                self.index_dir = Some(dir.to_path_buf());
-                self.start_watching(dir.as_str());
-            }
-            Err(err) => tracing::warn!(%err, %dir, "could not adopt the index found at startup"),
-        }
+    /// Takes the index by value rather than re-reading it: discovery already
+    /// paid for the read, and doing it twice was ~350ms of startup latency on
+    /// Gerrit for nothing.
+    pub fn adopt_index(&mut self, dir: paths::Utf8PathBuf, index: SymbolIndex) {
+        self.index = Some(index);
+        self.start_watching(dir.as_str());
+        self.index_dir = Some(dir);
     }
 
     /// Loads a directory of SCIP shards into the global index.
@@ -775,7 +844,15 @@ impl Server {
             tracing::warn!(uri = %doc.uri, "didOpen for an already-open document");
         }
         self.vfs.set_file_contents(path, Some(doc.text.into_bytes()));
-        tracing::debug!(uri = %doc.uri, open = self.documents.len(), "opened");
+        // At info, because "did the server even see my file" is the first
+        // question anyone asks, and a debug-level answer means turning the log
+        // up and reproducing.
+        tracing::info!(
+            uri = %doc.uri,
+            indexed = self.index.as_ref().is_some_and(|i| !i.is_empty()),
+            open = self.documents.len(),
+            "opened"
+        );
     }
 
     fn did_change(&mut self, params: lsp_types::DidChangeTextDocumentParams) {
