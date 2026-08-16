@@ -93,6 +93,8 @@ Toolchain is pinned in `rust-toolchain.toml`.
 
 ## Editors
 
+`editors/claude-code/` registers jabar as Claude Code's Java language server —
+a local plugin marketplace, since that is how Claude Code discovers servers.
 `editors/vscode/` holds a VS Code extension. Any LSP client works — the server
 advertises its capabilities statically once it finds an index, so nothing is
 client-specific — but VS Code needs an extension to spawn a custom binary at all.

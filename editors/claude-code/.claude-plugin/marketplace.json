@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "jabar-local",
+  "description": "Local marketplace for developing jabar's Claude Code integration.",
+  "owner": {
+    "name": "jabar"
+  },
+  "plugins": [
+    {
+      "name": "jabar-lsp",
+      "source": "./plugins/jabar-lsp",
+      "description": "Java code intelligence for Bazel repos, backed by SCIP indexes.",
+      "category": "development",
+      "lspServers": {
+        "jabar": {
+          "command": "jabar",
+          "args": [],
+          "extensionToLanguage": {
+            ".java": "java"
+          }
+        }
+      }
+    }
+  ]
+}
