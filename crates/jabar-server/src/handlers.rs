@@ -206,10 +206,14 @@ fn to_lsp_kind(kind: SymbolKind) -> LspKind {
 /// comments and javadoc, and reported 522 as the true total.
 ///
 /// So the cap was not saving tokens, it was spending more of them on a less
-/// accurate answer. It exists now only to bound the pathological case: on
-/// Gerrit, four symbols out of 203 probed exceed 1,000, the worst being
-/// `Account` at 2,372.
-pub const REFERENCE_LIMIT: usize = 1000;
+/// accurate answer.
+///
+/// It is now a guard against a runaway response rather than an economy: nothing
+/// measured on Gerrit comes close, the worst symbol there being `Account` at
+/// 2,372 references. A repo where this bites is one where the honest answer is
+/// "this symbol is used everywhere", and the truncation notice on
+/// `jabar/references` says so.
+pub const REFERENCE_LIMIT: usize = 5000;
 
 /// A resolved location, plus what the index knew about it.
 pub struct Located {

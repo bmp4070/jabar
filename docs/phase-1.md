@@ -971,10 +971,18 @@ window — still holds in the limit. What it missed is that an agent denied a
 complete answer does not accept the truncated one; it goes and gets the rest by
 whatever means it has, and the means it has are worse than ours.
 
-*Resolution:* the cap rises to 1,000, which on Gerrit leaves four of 203 probed
-symbols truncated instead of a great many. It now exists only to bound the
-pathological case rather than to economise. The lesson generalises: for an agent
-client, an incomplete answer is not a cheaper answer.
+*Resolution:* the cap rises to 5,000, above everything measured on Gerrit —
+the worst symbol there is `Account` at 2,372 — so truncation stops happening in
+practice and becomes a guard against a runaway response rather than an economy.
+Measured at that worst case: 2,372 references, `truncated=false`, 366ms, 491KB.
+
+491KB is not small, and it is fair to call it the honest cost of the question:
+asking where `Account` is used in Gerrit *is* asking for a large answer. The
+argument for paying it is that the alternative measured worse — an agent that
+greps instead spends a shell invocation, reads 647 lines, and gets the wrong
+number.
+The lesson generalises: for an agent client, an incomplete answer is not a
+cheaper answer.
 
 ### Measured on Gerrit
 
