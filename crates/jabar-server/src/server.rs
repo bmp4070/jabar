@@ -1111,6 +1111,13 @@ impl Server {
         // in-memory text in the VFS would keep serving edits the user discarded.
         let on_disk = path.as_real().and_then(|abs| std::fs::read(abs.as_str()).ok());
         self.vfs.set_file_contents(path, on_disk);
+        // Logged at the same level as `opened`, because without it the open
+        // count appears to fall between two consecutive opens.
+        tracing::info!(
+            uri = %params.text_document.uri,
+            open = self.documents.len(),
+            "closed"
+        );
     }
 
     /// Resolves a client URI, logging and skipping anything unusable.
