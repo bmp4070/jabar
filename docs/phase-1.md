@@ -1129,37 +1129,48 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 
 Phase 1 is done when all of these hold.
 
-- [ ] Claude Code connects and answers `workspaceSymbol` across the whole fixture
+- [x] Claude Code connects and answers `workspaceSymbol` across the whole fixture
       repo from a cold process.
-- [ ] The shallow index survives a process restart and is served from disk, not
+- [x] The shallow index survives a process restart and is served from disk, not
       rebuilt.
-- [ ] A file written out of band is reflected in the very next query —
-      read-after-write is a test, not a hope.
-- [ ] A high-fan-out reference query returns a ranked, truncated result with the
+- [~] A file written out of band is reflected in the very next query.
+      *Partial.* The overlay covers files the client has **open**, so an agent's
+      own edits are seen immediately. A file written by another tool and never
+      opened is still invisible until the next build. Closing that needs
+      watching the source tree, which F18 deliberately avoided.
+- [x] A high-fan-out reference query returns a ranked, truncated result with the
       true total stated.
-- [ ] A test asserts that editing a workspace file leaves dependency-derived salsa
+- [x] A test asserts that editing a workspace file leaves dependency-derived salsa
       values intact.
 - [ ] A `BUILD` edit re-slices and invalidates the affected shard, debounced,
       without a restart.
-- [ ] Cold p50 for the top two operations is recorded for a real target.
-- [ ] Every client-facing handler reports an outcome, and a health summary over
+- [x] Cold p50 for the top two operations is recorded for a real target.
+- [x] Every client-facing handler reports an outcome, and a health summary over
       a fixture session shows zero misleading empties.
-- [ ] The classpath decision is written down with the spike that justifies it
+- [x] The classpath decision is written down with the spike that justifies it
       committed.
 - [ ] All five M3 gate measurements are taken on the target repo and their
       numbers recorded here. (Taken on Ray as a first pass; see §6.)
-- [ ] The `scip-java` spike has run against the fixture, and call hierarchy is
+- [x] The `scip-java` spike has run against the fixture, and call hierarchy is
       either answerable from SCIP or has a written alternative (F15).
-- [ ] The index scope is configurable, and `//...` is nowhere assumed (F17).
-- [ ] jabar builds in its own `--output_base`, verified not to block a concurrent
+- [x] The index scope is configurable, and `//...` is nowhere assumed (F17).
+- [~] jabar builds in its own `--output_base`, verified not to block a concurrent
       `bazel test` (F13, F17).
-- [ ] The file-change trigger is decided and implemented (F18).
-- [ ] An `@params-file` javac action is either handled or refused loudly — never
+      *Partial.* Implemented and configurable — omitted means share, set means
+      isolate. The **verification** is missing: nothing has yet run jabar's
+      aspect and a `bazel test` at once to confirm the lock contention F13
+      predicts, or that a separate base removes it.
+- [x] The file-change trigger is decided and implemented (F18).
+- [x] An `@params-file` javac action is either handled or refused loudly — never
       parsed into an empty `CompileInfo`.
-- [ ] No standard-method query returns an empty success when the true answer is
+- [x] No standard-method query returns an empty success when the true answer is
       "not indexed yet".
-- [ ] No parser and no completion code exist in the tree. If either crept in,
-      scope was not held.
+- [x] No completion code exists in the tree.
+      A parser **does** — `crates/overlay` uses tree-sitter. That was a decision
+      (F12, and the overlay in F17), not a scope failure: the index cannot see
+      an unsaved file, and answering "no such symbol" for a class written thirty
+      seconds ago is the failure this project is organised against. The original
+      wording assumed a parser could only arrive by drift.
 
 ## 9. rust-analyzer files worth reading first
 
