@@ -198,11 +198,18 @@ fn to_lsp_kind(kind: SymbolKind) -> LspKind {
 
 /// How many references a single response carries.
 ///
-/// Higher than [`SEARCH_LIMIT`] because references are the query where the
-/// caller most needs breadth — "who calls this" with twenty of four hundred
-/// answers is close to useless — but still bounded, because the alternative on
-/// a common symbol is a response no client can read.
-pub const REFERENCE_LIMIT: usize = 200;
+/// Raised from 200 after watching an agent hit the cap on Gerrit's
+/// `ProjectCache` and fall back to `grep` to get "the complete picture". The
+/// fallback was worse in both directions: it cost a shell command and 647 lines
+/// of output instead of the 450 locations jabar already had, and it was wrong —
+/// grep counted 50 `ProjectCacheImpl` matches, a different symbol, plus
+/// comments and javadoc, and reported 522 as the true total.
+///
+/// So the cap was not saving tokens, it was spending more of them on a less
+/// accurate answer. It exists now only to bound the pathological case: on
+/// Gerrit, four symbols out of 203 probed exceed 1,000, the worst being
+/// `Account` at 2,372.
+pub const REFERENCE_LIMIT: usize = 1000;
 
 /// A resolved location, plus what the index knew about it.
 pub struct Located {

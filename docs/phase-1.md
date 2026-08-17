@@ -110,7 +110,8 @@ reach the warm state the whole design is built around.
 Ordered by how expensive the mistake is to undo, not by sequence. F1–F3 follow
 from the consumer profile, F8–F9 from adding debugging, F10–F12 from measuring
 Bazel and tree-sitter rather than assuming, and F13–F18 from an external review
-of this document and the decisions that followed it; the rest hold regardless of who calls the server.
+of this document and the decisions that followed it, and F19 from watching a
+real agent use the server; the rest hold regardless of who calls the server.
 
 ### F1 — Focus Target answers the question the agent asks last (blocking)
 
@@ -944,6 +945,36 @@ note under §5.
 
 Half a day, and it either de-risks the largest item in the project or says to
 write our own extractor.
+
+### F19 — Truncating pushes an agent to a worse tool (rework)
+
+Observed, not predicted. Claude Code asked jabar for references to Gerrit's
+`ProjectCache`, hit the 200 cap, said so in its own words — *"the reference list
+came back capped at 200, let me get the full picture"* — and fell back to `grep`.
+
+Both halves of the trade were wrong:
+
+| | references | files |
+| --- | --- | --- |
+| jabar, uncapped | **450** | **129** |
+| grep, as the agent used it | 522 | 157 |
+| grep, raw matches | 647 | — |
+
+grep counted 50 `ProjectCacheImpl` matches, which is a different symbol, plus
+comments and javadoc. So the fallback cost a shell invocation and 647 lines of
+output to produce a *less accurate* number, which was then reported as the
+complete count. The cap did not save tokens; it spent more of them on a worse
+answer.
+
+F4's reasoning — that results are billed in context and a huge list is a blown
+window — still holds in the limit. What it missed is that an agent denied a
+complete answer does not accept the truncated one; it goes and gets the rest by
+whatever means it has, and the means it has are worse than ours.
+
+*Resolution:* the cap rises to 1,000, which on Gerrit leaves four of 203 probed
+symbols truncated instead of a great many. It now exists only to bound the
+pathological case rather than to economise. The lesson generalises: for an agent
+client, an incomplete answer is not a cheaper answer.
 
 ### Measured on Gerrit
 
