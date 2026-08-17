@@ -13,7 +13,7 @@
 use std::panic::AssertUnwindSafe;
 
 use anyhow::Context as _;
-use build_model::BazelCli;
+use build_model::{AspectConfig, AspectRunner, BazelCli};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::Notification as _;
@@ -24,6 +24,7 @@ use telemetry::Telemetry;
 use vfs::{Vfs, VfsPath};
 
 use crate::capabilities::{negotiate_encoding, server_capabilities, workspace_root};
+use crate::config::Config;
 use crate::documents::Documents;
 use crate::handlers;
 use crate::line_index::PositionEncoding;
@@ -77,10 +78,25 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     }
     tracing::info!(?encoding, root = ?root.as_ref().map(|r| r.as_str()), "initializing");
 
+    let config = Config::from_initialization_options(params.initialization_options.as_ref());
+    tracing::debug!(?config, "configuration");
+
     // Find an index before advertising, because LSP has no way to say
     // "supported, but not yet": a provider advertised with nothing behind it
     // means clients call it and get nothing, which reads as "no such symbol".
-    let discovered = root.as_deref().and_then(discover_index);
+    let mut discovered = root.as_deref().and_then(discover_index);
+
+    // Building takes minutes and blocks the handshake, so it happens only when
+    // the client asked for it and there is nothing to serve otherwise.
+    if discovered.is_none()
+        && config.index.auto
+        && let Some(root) = root.as_deref()
+    {
+        match build_index(root, &config) {
+            Ok(()) => discovered = discover_index(root),
+            Err(err) => tracing::warn!(%err, "could not build an index"),
+        }
+    }
     if let Some((dir, index)) = &discovered {
         tracing::info!(
             %dir,
@@ -107,10 +123,35 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
 
     let mut server = Server::new(connection.sender.clone(), encoding, root);
     server.supports_progress = supports_progress;
+    server.apply_config(config);
     if let Some((dir, index)) = discovered {
         server.adopt_index(dir, index);
     }
     server.run(&connection)
+}
+
+/// Runs the SCIP aspect, so a workspace with no index gets one.
+///
+/// Everything it needs beyond the workspace is discovered or configured;
+/// missing pieces are reported rather than guessed, because a wrong `JAVA_HOME`
+/// produces a confusing compiler error rather than an obvious one.
+fn build_index(root: &AbsPath, config: &Config) -> Result<(), String> {
+    let scip_java =
+        config.resolve_scip_java().ok_or("`scip-java` is not on PATH; set `index.scipJava`")?;
+    let java_home =
+        crate::config::java_home().ok_or("JAVA_HOME is not set, and scip-java requires it")?;
+
+    let runner = AspectRunner::new(
+        root,
+        config.bazel.as_deref().unwrap_or("bazel"),
+        config.output_base.as_deref(),
+    );
+    let aspect = AspectConfig { targets: config.index.targets.clone(), scip_java, java_home };
+
+    let started = std::time::Instant::now();
+    runner.run(&aspect).map_err(|err| err.to_string())?;
+    tracing::info!(elapsed = ?started.elapsed(), "indexed");
+    Ok(())
 }
 
 /// Looks for SCIP shards under a workspace, returning the index it built.
@@ -149,6 +190,8 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// What the client asked for at startup.
+    config: Config,
     /// Parses open files the index cannot see yet.
     ///
     /// Holds a parser, so it is kept rather than made per query.
@@ -185,6 +228,7 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            config: Config::default(),
             overlay: Overlay::new(),
             supports_progress: false,
             watcher: None,
@@ -455,6 +499,15 @@ impl Server {
                 format!("`{unknown}` is not implemented"),
             )),
         }
+    }
+
+    pub fn apply_config(&mut self, config: Config) {
+        self.build = self.workspace_root.clone().map(|root| {
+            BazelCli::new(root)
+                .with_program(config.bazel.clone().unwrap_or_else(|| "bazel".to_owned()))
+                .with_output_base(config.output_base.clone())
+        });
+        self.config = config;
     }
 
     /// Takes on an index discovered at startup.
@@ -1081,6 +1134,8 @@ impl Server {
             },
             index_loaded: self.index.is_some(),
             watching: self.watcher.is_some(),
+            output_base: self.config.output_base.as_ref().map(|p| p.to_string()),
+            index_targets: self.config.index.targets.clone(),
             indexed_definitions: self.index.as_ref().map(|i| i.definition_count()).unwrap_or(0),
             open_documents: self.documents.len(),
             vfs_files: self.vfs.len(),
@@ -1107,6 +1162,9 @@ pub struct Status {
     pub position_encoding: &'static str,
     pub index_loaded: bool,
     pub watching: bool,
+    /// `null` when sharing the workspace's default output base.
+    pub output_base: Option<String>,
+    pub index_targets: Vec<String>,
     pub indexed_definitions: usize,
     pub open_documents: usize,
     pub vfs_files: usize,

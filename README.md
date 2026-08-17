@@ -91,6 +91,10 @@ cargo fmt --all
 
 Toolchain is pinned in `rust-toolchain.toml`.
 
+## Configuration
+
+See `docs/configuration.md`. Everything is optional; the defaults work.
+
 ## Editors
 
 `editors/claude-code/` registers jabar as Claude Code's Java language server —

@@ -6,9 +6,11 @@
 //! Server Protocol server.
 
 pub mod aquery;
+mod aspect;
 mod bazel;
 mod label;
 
 pub use crate::aquery::{CompileInfo, ParseError, parse_javac_actions};
+pub use crate::aspect::{AspectConfig, AspectError, AspectRunner};
 pub use crate::bazel::{BazelCli, BazelError};
 pub use crate::label::{LabelError, TargetLabel};

@@ -20,7 +20,7 @@ telemetry = { path = "crates/telemetry" }
 watcher = { path = "crates/watcher" }
 
 anyhow = "1.0.102"
-camino = "1.2.2"
+camino = { version = "1.2.2", features = ["serde1"] }
 crossbeam-channel = "0.5.15"
 indexmap = "2.14.0"
 lsp-server = "0.7.9"

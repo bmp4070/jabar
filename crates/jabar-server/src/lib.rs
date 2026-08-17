@@ -6,6 +6,7 @@
 //! synchronous writer and many snapshot readers.
 
 pub mod capabilities;
+pub mod config;
 pub mod documents;
 pub mod handlers;
 pub mod line_index;

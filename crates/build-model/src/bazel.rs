@@ -26,7 +26,7 @@
 
 use std::process::Command;
 
-use paths::{AbsPath, AbsPathBuf, Utf8Path};
+use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 
 use crate::aquery::{self, CompileInfo};
 use crate::label::TargetLabel;
@@ -43,6 +43,7 @@ const EXIT_PARTIAL_SUCCESS: i32 = 3;
 pub struct BazelCli {
     workspace_root: AbsPathBuf,
     program: String,
+    output_base: Option<Utf8PathBuf>,
 }
 
 impl BazelCli {
@@ -50,13 +51,47 @@ impl BazelCli {
     /// `WORKSPACE`; it is where `bazel` will be run and what paths are
     /// interpreted relative to.
     pub fn new(workspace_root: AbsPathBuf) -> BazelCli {
-        BazelCli { workspace_root, program: "bazel".to_owned() }
+        BazelCli { workspace_root, program: "bazel".to_owned(), output_base: None }
+    }
+
+    /// Runs bazel against its own output base rather than the workspace default.
+    ///
+    /// Bazel takes an exclusive lock per output base, so sharing one means
+    /// jabar's invocations queue behind the user's builds *and* block them. A
+    /// separate base removes that entirely.
+    ///
+    /// It is not free, which is why this is opt-in rather than the default: a
+    /// second base is a second analysis universe and a second set of outputs,
+    /// which on a large repo is gigabytes and a full cold analysis the first
+    /// time. Sharing is right when nothing else is building concurrently, and
+    /// wrong the moment something is.
+    pub fn with_output_base(mut self, output_base: Option<Utf8PathBuf>) -> BazelCli {
+        self.output_base = output_base;
+        self
+    }
+
+    /// The output base in use, or `None` when sharing the workspace default.
+    pub fn output_base(&self) -> Option<&Utf8Path> {
+        self.output_base.as_deref()
     }
 
     /// Overrides the executable, for `bazelisk` or an absolute path.
     pub fn with_program(mut self, program: impl Into<String>) -> BazelCli {
         self.program = program.into();
         self
+    }
+
+    /// The full argument list, with any startup options ahead of the command.
+    ///
+    /// `--output_base` is a *startup* option: bazel rejects it outright if it
+    /// appears after the command, so position is correctness rather than style.
+    fn argv(&self, args: &[&str]) -> Vec<String> {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        if let Some(base) = &self.output_base {
+            argv.push(format!("--output_base={base}"));
+        }
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        argv
     }
 
     pub fn workspace_root(&self) -> &AbsPath {
@@ -159,7 +194,7 @@ impl BazelCli {
         // a path can start a second command. `check_query_safe` covers the
         // remaining risk, which is a path altering the *query* expression.
         let output = Command::new(&self.program)
-            .args(args)
+            .args(self.argv(args))
             .current_dir(self.workspace_root.as_str())
             .output()
             .map_err(|source| BazelError::Spawn { program: self.program.clone(), source })?;
@@ -321,6 +356,26 @@ mod tests {
         // The message has to name the program, or a missing bazel looks like a
         // broken workspace.
         assert!(err.to_string().contains("definitely-not-a-real-bazel-binary"));
+    }
+
+    #[test]
+    fn startup_options_precede_the_command() {
+        // bazel rejects `--output_base` after the command outright, so this is
+        // correctness rather than tidiness.
+        let cli = BazelCli::new(abs("/repo"))
+            .with_output_base(Some(Utf8PathBuf::from("/tmp/jabar-base")));
+        let argv = cli.argv(&["query", "//..."]);
+        assert_eq!(argv, ["--output_base=/tmp/jabar-base", "query", "//..."]);
+        assert_eq!(cli.output_base().map(|p| p.as_str()), Some("/tmp/jabar-base"));
+    }
+
+    #[test]
+    fn sharing_the_default_base_adds_no_arguments() {
+        // The default. Nothing is passed, so bazel behaves exactly as the user's
+        // own invocations do -- same server, same cache, same lock.
+        let cli = BazelCli::new(abs("/repo"));
+        assert_eq!(cli.argv(&["query", "//..."]), ["query", "//..."]);
+        assert_eq!(cli.output_base(), None);
     }
 
     #[test]
