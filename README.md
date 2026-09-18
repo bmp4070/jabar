@@ -147,6 +147,10 @@ default. Scoping the walk to `index.targets` helps a scoped config but not a
 costs O(files). The fast path plus stamp is the change that actually removes the
 startup tax.
 
+`docs/index-cache.md` works this into a concrete design — the two startup costs
+measured on core, the cache layout and freshness model, and the open decision on
+how much of the index to serialize.
+
 ## Indexing a repo that compiles with ECJ
 
 scip-java indexes by re-running the target's compilation with stock `javac` plus a
