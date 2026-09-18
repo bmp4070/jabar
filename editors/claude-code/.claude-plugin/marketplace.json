@@ -13,7 +13,7 @@
       "category": "development",
       "lspServers": {
         "jabar": {
-          "command": "jabar",
+          "command": "/opt/workspace/jabar/target/release/jabar",
           "args": [],
           "extensionToLanguage": {
             ".java": "java"
