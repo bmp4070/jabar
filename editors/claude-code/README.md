@@ -17,7 +17,7 @@ ln -sf "$PWD/target/release/jabar" /usr/local/bin/jabar   # or anywhere on PATH
 Then, in Claude Code:
 
 ```
-/plugin marketplace add /Users/medha/github/jabar/editors/claude-code
+/plugin marketplace add /path/to/jabar/editors/claude-code
 /plugin install jabar-lsp@jabar-local
 ```
 

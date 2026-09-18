@@ -105,82 +105,38 @@ client-specific — but VS Code needs an extension to spawn a custom binary at a
 
 ## Next steps
 
-### Index discovery should not walk all of `bazel-bin`
+### Large repository startup and indexing
 
-`discover_index` (`crates/jabar-server/src/server.rs`) reads shards by handing
-`bazel-bin` to `SymbolIndex::from_dir` (`crates/symbol-index/src/lib.rs`), which
-recurses the whole tree and stats every entry, pruning only `*.scip-targetroot`
-and `*.semanticdb`. On a small repo that is ~350ms; on a megarepo it is not. On
-Salesforce core, `bazel-bin` holds **2.68M files** and the startup walk takes
-**~46s** — paid whether one shard is found or none, because "are there shards?"
-currently means "look everywhere." It runs before the server answers
-`initialize`, so the editor blocks on it.
+On Salesforce core, a reported 2.68M-file `bazel-bin` walk takes ~46s, and
+loading 6,876 SCIP shards takes several more minutes before `initialize`
+returns. These measurements need a repeatable baseline. The proposed fast path
+persists a built symbol index and a build-produced shard manifest, then checks
+their provenance before loading. A concatenated SCIP file or a shard-path list
+alone avoids the walk but still decodes the shards and rebuilds lookup maps.
 
-Locating shards and keeping them fresh are separate problems, and the walk
-conflates them. The index is a build output: it is only ever as fresh as the last
-aspect run, so the walk is *not* what makes results current — re-running the
-aspect is. That splits the work cleanly:
-
-- **Load fast.** Write the produced index to `.jabar/index/` as one concatenated
-  `index.scip` (the aspect README already suggests
-  `find bazel-bin -name '*.scip' … | xargs cat`) or a shard-path manifest, and
-  check `.jabar/index` *before* `bazel-bin` in `discover_index`, short-circuiting
-  on a hit. Startup becomes one read instead of 2.68M stats.
-- **Trust it cheaply.** Stamp the written index with what it was built from (git
-  revision / content hash / newest shard mtime). On startup, compare the stamp;
-  a match takes the fast path, a miss falls back to a rescan or rebuild. This
-  avoids both the walk *and* an unconditional Bazel call in the common case.
-- **Refresh in the background, never on the hot path.** A truly-fresh index means
-  an incremental aspect build (`bazel build //... --output_groups=scip`), which
-  also reports where the outputs are — discovery and refresh in one. But on core
-  even a no-op incremental build pays minutes of Bazel analysis, so it must not
-  run synchronously at startup. Load the cached index instantly, serve queries,
-  and swap a fresh one in when the background build lands. jabar already has the
-  machinery: `Server::adopt_index` swaps an index in, and the `watcher` crate
-  exists to reload when shards or git state change.
-
-For the primary consumer — an AI agent navigating code — a minutes-old index is
-almost always acceptable and far better than a 46s stall or an honest "no index"
-error, so *instant but slightly stale, refreshing in the background* is the right
-default. Scoping the walk to `index.targets` helps a scoped config but not a
-`//...` one; a parallel walker (`ignore`/`jwalk`) softens the cold path but still
-costs O(files). The fast path plus stamp is the change that actually removes the
-startup tax.
-
-`docs/index-cache.md` works this into a concrete design — the two startup costs
-measured on core, the cache layout and freshness model, and the open decision on
-how much of the index to serialize.
+The cache is a performance aid, not proof that an index matches current sources.
+Jabar must report stale and incomplete coverage explicitly, refresh off the LSP
+loop, and avoid recursively watching millions of build outputs. See
+[`docs/index-cache.md`](docs/index-cache.md) for the cache design and
+[`docs/monolith-roadmap.md`](docs/monolith-roadmap.md) for implementation stages,
+measurements, ECJ coverage, and query-scale work. None of these optimizations is
+implemented yet.
 
 ## Indexing a repo that compiles with ECJ
 
-scip-java indexes by re-running the target's compilation with stock `javac` plus a
-`semanticdb` plugin. Repos that compile with the Eclipse compiler (ECJ /
-`JdtJavaBuilder`) instead of `javac` — Salesforce core is one, via a mixed
-ECJ/javac Bazel toolchain — carry **ECJ-only options in each target's
-`javac_options`** (`-preserveAllLocals`, `-Xemacs`, `-Xecj_use_direct_deps_only`,
-`-Xecj_problem_severity_preferences=…`, `-warn:none`). Stock `javac` rejects these
-outright (`error: invalid flag: -preserveAllLocals`, exit 2), and the
-`ScipJavaIndex` action fails for every ECJ-built target. ECJ cannot load the
-`semanticdb` javac plugin, so pointing scip-java at ECJ is not an option — the fix
-is to **strip the ECJ-only options before scip-java runs `javac`**, exactly as such
-repos already do on their own javac toolchain when a target opts out of ECJ.
+scip-java re-runs compilation with `javac` and a SCIP compiler plugin. ECJ
+targets can supply options that `javac` rejects, such as `-preserveAllLocals`
+and `-Xecj_use_direct_deps_only`. The bundled aspect also selects only actions
+whose mnemonic is `Javac`; an ECJ target with a different action mnemonic may
+be skipped before its options are examined. Both behaviors need verification
+against representative targets.
 
-The strip: when assembling `javac_options`, drop the exact flags
-`-preserveAllLocals`, `-Xemacs`, `-warn:none` and the prefixes `-Xecj_`, `-warn:`,
-`-err:`, `-Xep:`, keeping javac-valid options (`-nowarn`, `-parameters`, `-g`,
-`-encoding`, `-source`/`-target`). Point the index build at the same JDK the repo
-compiles with (for core: `onejdk21`, `-source/-target 17`) via
-`--define=java_home=…`. Run with `--keep_going`: the strip clears the invalid-flag
-failures, but any target whose sources ECJ accepts and stricter stock `javac`
-rejects still fails *that* target — those degrade to gaps in the index rather than
-aborting the run.
-
-The bundled aspect (`crates/build-model/aspects/scip_java.bzl`) is kept as the
-unmodified upstream snapshot (see License), so this strip currently lives as a
-patch on the aspect copy installed into the target repo's `.jabar/aspects/`. Making
-it default would mean either upstreaming an ECJ-option filter or teaching jabar to
-inject one into the installed copy — worth doing before ECJ repos are a supported
-target rather than a hand-patched one.
+The ECJ option policy belongs in a maintained aspect or upstream change, with
+tests for the actual toolchain and flags. Hand-editing `.jabar/aspects/` is not a
+supported workaround: Jabar overwrites that copy on the next index build.
+`--keep_going` permits partial output, so the build must also report failed and
+skipped targets rather than silently presenting their symbols as absent. The
+work and acceptance criteria are in [`docs/monolith-roadmap.md`](docs/monolith-roadmap.md).
 
 ## License
 
