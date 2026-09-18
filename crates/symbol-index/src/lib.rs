@@ -197,7 +197,9 @@ pub struct SymbolIndex {
 }
 
 impl SymbolIndex {
-    /// Reads every `*.scip` under `dir`, recursively.
+    /// Reads aggregated `*.scip` shards under `dir`, recursively.
+    /// Intermediate targetroot directories contain per-source shards already
+    /// included in their sibling target shard, so they must be skipped.
     ///
     /// Shards that fail to parse are logged and skipped rather than failing the
     /// load: one corrupt shard should cost its own target's symbols, not the
@@ -211,7 +213,10 @@ impl SymbolIndex {
                 // `symlink_metadata` so a bazel-out symlink loop cannot walk forever.
                 let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
                 if meta.is_dir() {
-                    stack.push(path);
+                    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+                    if !name.ends_with(".scip-targetroot") && !name.ends_with(".semanticdb") {
+                        stack.push(path);
+                    }
                 } else if path.extension().is_some_and(|e| e == "scip") {
                     match std::fs::read(&path) {
                         Ok(bytes) => index.add_shard(&bytes, &path.display().to_string()),
@@ -627,6 +632,20 @@ mod tests {
         index.add_shard(b"this is not protobuf at all", "corrupt.scip");
         assert!(index.is_empty());
         assert_eq!(index.shard_count(), 0, "a shard that did not parse was not counted");
+    }
+
+    #[test]
+    fn intermediate_scip_shards_are_not_loaded_twice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bytes = Index::new().write_to_bytes().expect("encode SCIP");
+        std::fs::write(dir.path().join("target.scip"), &bytes).expect("target shard");
+        for suffix in ["scip-targetroot", "semanticdb"] {
+            let intermediate = dir.path().join(format!("target.{suffix}"));
+            std::fs::create_dir(&intermediate).expect("targetroot");
+            std::fs::write(intermediate.join("source.scip"), &bytes).expect("source shard");
+        }
+        let index = SymbolIndex::from_dir(dir.path()).expect("load index");
+        assert_eq!(index.shard_count(), 1, "only the aggregated target shard is loaded");
     }
 
     #[test]

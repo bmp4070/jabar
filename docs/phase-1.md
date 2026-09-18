@@ -8,6 +8,13 @@ Line references point at a rust-analyzer checkout and will drift. The operation
 surface was verified against Claude Code's LSP tool; the classpath and
 source-mapping claims were verified by attaching `jdb` to `fixtures/megarepo`.
 
+**Current SCIP status (2026-09-17):** This document preserves the historical
+v0.12.3 spike and its fork decision. Upstream `scip-code/scip-java` now includes
+the Bazel 9 and bzlmod fixes. Jabar bundles an unmodified upstream aspect
+snapshot; no separate scip-java fork is needed. See
+[`crates/build-model/aspects/README.md`](../crates/build-model/aspects/README.md)
+for the current integration.
+
 ## 1. Verdict
 
 The phase ordering is sound and the instinct to let Bazel define the workspace is

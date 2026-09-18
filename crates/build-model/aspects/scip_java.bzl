@@ -1,71 +1,41 @@
 """
-Bazel aspect emitting SCIP indexes, forked for Bazel 9.
+Bazel aspect to run scip-java against a Java Bazel codebase.
 
-Derived from scip-java, Copyright (c) 2022 Sourcegraph, Inc., licensed under
-the Apache License, Version 2.0. A copy is at LICENSE-APACHE in this
-repository, and http://www.apache.org/licenses/LICENSE-2.0.
+You can optionally commit this file into your git repository, gitignore it, or
+just delete it. When you run `scip-java index` in a Bazel codebase, this file
+will get re-created and the command will error if the file already exists but with
+different contents.
 
-This file has been modified from the original. The changes are marked `JABAR:`
-and enumerated below, as Apache 2.0 section 4(b) requires.
+This aspect is needed for scip-java to inspect the structure of the Bazel build
+and register actions to index all java_library/java_test/java_binary targets.
+The result of running this aspect is that your bazel-bin/ directory will contain
+many *.scip (https://github.com/scip-code/scip) files.
+These files encode information about which symbols are referenced from which
+locations in your source code.
 
-Upstream: sourcegraph/scip-java v0.12.3, `aspects/scip_java.bzl`, which
-`scip-java index` writes into the workspace. That version targets an older
-Bazel and fails six ways on 9.2.0. This fork carries the fixes; the JVM
-indexer it invokes is used unmodified.
+Use the command below to merge all of these SCIP files into a single index.
+The `*.scip-targetroot` directories are excluded because they contain
+intermediate per-source shards that are already aggregated into the sibling
+`<target>.scip` files:
 
-Every change is marked `JABAR:` below. In order of discovery:
+    find bazel-bin/ -type f -name '*.scip' -not -path '*.scip-targetroot/*' | xargs cat > index.scip
 
-1. Detection. `scip-java index` looks for a `WORKSPACE` file, so a bzlmod-only
-   repo is not recognised as Bazel at all, even with `--build-tool bazel`. Not
-   fixable here -- jabar invokes `bazel build --aspects` directly rather than
-   going through `scip-java index`.
-2. `JavaInfo` is no longer a Starlark global; it moved into `rules_java`.
-3. An aspect implementation may no longer return a `struct`.
-4. `JavaCompilationInfo.javac_options` is a `depset`, not a list.
-5. `struct.to_json()` was removed in favour of the `json` module.
-6. Those javac options arrive as a single shell-quoted string rather than one
-   option per element, and javac rejects the concatenation. See
-   `_split_shell_words`.
+Use `src code-intel upload` to upload the unified SCIP file to Sourcegraph:
 
-These are worth upstreaming; until they are, this file is the source of truth
-and is written into the workspace under test.
+    npm install -g @sourcegraph/src
+    export SRC_ENDPOINT=SOURCEGRAPH_URL
+    export SRC_ACCESS_TOKEN=TOKEN_VALUE
+    src login # confirm you are correctly authenticated
+    src code-intel upload -file=index.scip
+
+Example command to run this aspect directly:
+
+    bazel build //... --aspects path/to/scip_java.bzl%scip_java_aspect --output_groups=scip --define=scip_java_binary=$(which scip-java) --define=java_home=$JAVA_HOME
+
+To learn more about aspects: https://bazel.build/extending/aspects
 """
 
-load("@rules_java//java/common:java_info.bzl", "JavaInfo")  # JABAR: fix 2
-
-
-# JABAR: fix 6.
-def _split_shell_words(text):
-    """Splits a shell-quoted argument string into individual arguments.
-
-    Bazel 9 hands `javac_options` back as one string rather than a list:
-
-        -source 21 '-XDcompilePolicy=simple' -Xep:ReturnMissingNullable:OFF
-
-    Splitting on spaces alone would be right here but wrong in general, since
-    an option's value may contain one -- `-Xbootclasspath/p:/a b/c.jar`, or any
-    path with a space. Single quotes are what Bazel emits, so they are what is
-    honoured; a quote toggles whether a space separates.
-    """
-    args = []
-    current = ""
-    started = False
-    quoted = False
-    for ch in text.elems():
-        if ch == "'":
-            quoted = not quoted
-            started = True
-        elif ch == " " and not quoted:
-            if started:
-                args.append(current)
-            current = ""
-            started = False
-        else:
-            current += ch
-            started = True
-    if started:
-        args.append(current)
-    return args
+load("@rules_java//java/common:java_info.bzl", "JavaInfo")
 
 def _scip_java(target, ctx):
     if JavaInfo not in target or not hasattr(ctx.rule.attr, "srcs"):
@@ -125,27 +95,16 @@ def _scip_java(target, ctx):
         processorpath += [j.path for j in annotations.processor_classpath.to_list()]
         processors = annotations.processor_classnames
 
+    raw_options = compilation.javac_options
+    if hasattr(raw_options, "to_list"):
+        raw_options = raw_options.to_list()
+
     launcher_javac_flags = []
     compiler_javac_flags = []
-
-    # In different versions of bazel javac options are either a nested set or a depset or a list...
-    javac_options = []
-    if hasattr(compilation, "javac_options_list"):
-        javac_options = compilation.javac_options_list
-    elif type(compilation.javac_options) == "depset":
-        # JABAR: fixes 4 and 6. Bazel 9 returns a depset, and its elements are
-        # not individual options -- one element holds the whole option string,
-        # shell-quoted. Flatten, then split each element respecting quotes.
-        for chunk in compilation.javac_options.to_list():
-            javac_options += _split_shell_words(chunk)
-    else:
-        javac_options = compilation.javac_options
-
-    for value in javac_options:
-        # NOTE(Anton): for some bizarre reason I see empty string starting the list of
-        # javac options - which then gets propagated into the JSON config, and ends up
-        # crashing the actual javac invokation.
-        if value != "":
+    for raw in raw_options:
+        for value in ctx.tokenize(raw):
+            if not value:
+                continue
             if value.startswith("-J"):
                 launcher_javac_flags.append(value)
             else:
@@ -165,18 +124,21 @@ def _scip_java(target, ctx):
     build_config_path = ctx.actions.declare_file(ctx.label.name + ".scip.json")
 
     scip_output = ctx.actions.declare_file(ctx.label.name + ".scip")
-    targetroot = ctx.actions.declare_directory(ctx.label.name + ".semanticdb")
+    targetroot = ctx.actions.declare_directory(ctx.label.name + ".scip-targetroot")
     ctx.actions.write(
         output = build_config_path,
-        content = json.encode(build_config),  # JABAR: fix 5
+        content = json.encode(build_config),
     )
 
     deps = [javac_action.inputs, annotations.processor_classpath]
 
     ctx.actions.run_shell(
-        command = "\"{}\" index --no-cleanup --index-semanticdb.allow-empty-index --cwd \"{}\" --targetroot {} --scip-config \"{}\" --output \"{}\"".format(
+        # The action runs in the execroot (sandboxed or not), so bazel-out
+        # paths resolve directly. Prefix them with $PWD to make them absolute,
+        # which keeps them unambiguous regardless of how scip-java resolves
+        # relative paths.
+        command = "\"{}\" index --no-cleanup --aggregate.allow-empty-index --targetroot \"$PWD/{}\" --scip-config \"$PWD/{}\" --output \"$PWD/{}\"".format(
             ctx.var["scip_java_binary"],
-            ctx.var["sourceroot"],
             targetroot.path,
             build_config_path.path,
             scip_output.path,
@@ -195,7 +157,7 @@ def _scip_java(target, ctx):
 def _scip_java_aspect(target, ctx):
     scip = _scip_java(target, ctx)
     if not scip:
-        return []  # JABAR: fix 3 -- a struct return is rejected on Bazel 9
+        return []
     return [OutputGroupInfo(scip = [scip])]
 
 scip_java_aspect = aspect(

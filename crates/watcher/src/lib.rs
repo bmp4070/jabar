@@ -164,7 +164,14 @@ fn dispatch<'a>(paths: impl Iterator<Item = &'a std::path::PathBuf>, sink: &Send
 /// What a changed path means, if anything.
 fn classify(path: &Path) -> Option<Change> {
     if path.extension().is_some_and(|ext| ext == "scip") {
-        return Some(Change::Index);
+        // Per-source shards inside a targetroot are intermediate outputs. The
+        // sibling target shard triggers the reload after aggregation finishes.
+        let intermediate = path.ancestors().skip(1).any(|ancestor| {
+            ancestor.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                name.ends_with(".scip-targetroot") || name.ends_with(".semanticdb")
+            })
+        });
+        return (!intermediate).then_some(Change::Index);
     }
     // `HEAD` moves on checkout and branch switch; `index` moves on any staging
     // operation, which is the cheapest proxy for "the tree was rewritten".
@@ -186,6 +193,17 @@ mod tests {
         assert_eq!(
             classify(Path::new("/repo/bazel-bin/java/com/acme/core/core.scip")),
             Some(Change::Index)
+        );
+    }
+
+    #[test]
+    fn intermediate_scip_shards_do_not_trigger_reload() {
+        assert!(
+            changes_from(&[
+                "/repo/bazel-bin/a/a.scip-targetroot/A.java.scip",
+                "/repo/bazel-bin/b/b.semanticdb/B.java.scip",
+            ])
+            .is_empty()
         );
     }
 

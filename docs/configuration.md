@@ -35,10 +35,9 @@ separate base removes that.
 The cost is real: a second analysis universe and a second set of outputs.
 Gerrit's is several GB, and the first build against it is a full cold analysis.
 
-One wrinkle, handled but worth knowing: switching output base leaves
-`bazel-bin` pointing into the previous one until a command rewrites it, so the
-first aspect run after a switch fails and is retried automatically. You will see
-`the first run repointed bazel-bin…` in the log once.
+Bazel repoints `bazel-bin` at the selected output base during the build. The
+current upstream aspect writes inside Bazel's execroot, so a prior build is not
+required to establish that symlink.
 
 ## `index.auto` — off by default
 

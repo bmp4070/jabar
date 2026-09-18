@@ -107,6 +107,8 @@ client-specific — but VS Code needs an extension to spawn a custom binary at a
 
 MIT or Apache-2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.
 
-`crates/build-model/aspects/scip_java.bzl` is derived from
-[scip-java](https://github.com/sourcegraph/scip-java) (Apache-2.0, © 2022
-Sourcegraph, Inc.) and modified for Bazel 9. See `NOTICE`.
+`crates/build-model/aspects/scip_java.bzl` is an unmodified snapshot of the
+[upstream scip-java aspect](https://github.com/scip-code/scip-java) (Apache-2.0,
+© 2022 Sourcegraph, Inc.). Upstream now supports Bazel 9 and bzlmod, so Jabar
+does not need a separate scip-java fork. See `NOTICE` and the
+[aspect instructions](crates/build-model/aspects/README.md).

@@ -1056,6 +1056,7 @@ dependencies = [
  "protobuf",
  "rustc-hash",
  "scip",
+ "tempfile",
  "tracing",
 ]
 
