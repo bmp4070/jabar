@@ -58,20 +58,21 @@ Gate this stage on no silent coverage gaps in the representative test set.
 
 ## 3. Cut startup cost without weakening provenance
 
-Implement and benchmark `docs/index-cache.md`: publish a generation of the
-built index plus an exact shard manifest, validate workspace/configuration and
-format cheaply, and measure whole-index serialization against a smaller value
+The first implementation of `docs/index-cache.md` publishes the complete built
+index with an exact shard manifest and validates workspace/configuration and
+format cheaply. Benchmark that whole-index format against a smaller value
 snapshot. A concatenated SCIP file or a shard-path list only removes the tree
 walk; neither is sufficient for a seconds-scale startup.
 
-Move index loading and rebuilds off the LSP event loop. Replace recursive
-watching of the entire `bazel-bin` tree with a small manifest/generation watch
-and explicit or periodic reconciliation for external builds. Coalesce updates,
-reject stale worker results, and measure the temporary memory cost of holding
-old and new indexes. Report shard verification separately from source build
-freshness: a scan can prove that the cache matches current shards but cannot
-prove that the shards match current source files. A same-HEAD external rebuild
-cannot be detected from git HEAD alone.
+Index reconciliation and rebuilds now run off the LSP event loop. Cached
+sessions avoid recursively watching `bazel-bin`, periodically reconcile shard
+metadata, coalesce updates, and reject stale worker results. Measure the
+temporary memory cost of holding old and new indexes and evaluate a build hook
+or manifest watch for faster external-build detection. Shard verification is
+reported separately from source build freshness: a scan can prove that the
+cache matches current shards but cannot prove that the shards match current
+source files. A same-HEAD external rebuild cannot be detected from git HEAD
+alone.
 
 A cache miss still incurs today's long walk. Decide and test the cold-start
 client behavior separately: prebuild/distribute a cache in CI or a developer

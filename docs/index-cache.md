@@ -102,5 +102,12 @@ baseline, then accept the cache only when the warm path meets them and produces
 the same answers as a fresh shard load. `docs/monolith-roadmap.md` tracks the
 other requirements for large repositories.
 
-**Status:** design only. The current server still scans `bazel-bin` before
-`initialize` and reloads synchronously.
+**Status:** the first implementation persists the complete built index with a
+versioned MessagePack snapshot, checksum, configuration/HEAD key, exact shard
+metadata, atomic generation pointer, and bounded old-generation cleanup. A hit
+loads before scanning `bazel-bin`; reconciliation and reload run on worker
+threads, cached sessions avoid a recursive output-tree watcher, and
+`jabar/status` distinguishes a cache hit from verified shard metadata. Cache
+misses still scan and decode synchronously, and the representative-monolith
+benchmarks, source-build freshness, indexing coverage, and CI distribution
+work remain open.

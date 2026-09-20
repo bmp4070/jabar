@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod config;
 pub mod documents;
 pub mod handlers;
+mod index_cache;
 pub mod line_index;
 pub mod server;
 pub mod uri;

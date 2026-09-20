@@ -1,20 +1,21 @@
 //! Server state and the main loop.
 //!
-//! One thread, one owner of the state. There is no task pool yet because there
-//! is nothing expensive to run on it: every handler here is bookkeeping. The
-//! pool arrives with the first query that touches the database, and with it the
-//! snapshot split rust-analyzer uses — see `docs/phase-1.md`, which explains why
-//! salsa cancellation wants exactly one writer.
+//! One thread owns protocol state. Index reconciliation and cache writes run on
+//! workers and send completed results back to that thread.
 //!
 //! What the loop guarantees now is the part that is painful to retrofit: every
 //! request gets exactly one response, unknown methods are refused rather than
 //! ignored, and a handler that panics does not take the session down.
 
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use build_model::{AspectConfig, AspectRunner, BazelCli};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
@@ -27,10 +28,11 @@ use crate::capabilities::{negotiate_encoding, server_capabilities, workspace_roo
 use crate::config::Config;
 use crate::documents::Documents;
 use crate::handlers;
+use crate::index_cache::{self, CacheKey};
 use crate::line_index::PositionEncoding;
 use crate::uri;
 use overlay::Overlay;
-use symbol_index::SymbolIndex;
+use symbol_index::{ShardMetadata, SymbolIndex};
 use watcher::{Change, FileWatcher};
 
 /// Custom request: what the server currently believes about itself.
@@ -84,7 +86,7 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     // Find an index before advertising, because LSP has no way to say
     // "supported, but not yet": a provider advertised with nothing behind it
     // means clients call it and get nothing, which reads as "no such symbol".
-    let mut discovered = root.as_deref().and_then(discover_index);
+    let mut discovered = root.as_deref().and_then(|root| discover_index(root, &config));
 
     // Building takes minutes and blocks the handshake, so it happens only when
     // the client asked for it and there is nothing to serve otherwise.
@@ -93,15 +95,16 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
         && let Some(root) = root.as_deref()
     {
         match build_index(root, &config) {
-            Ok(()) => discovered = discover_index(root),
+            Ok(()) => discovered = discover_index(root, &config),
             Err(err) => tracing::warn!(%err, "could not build an index"),
         }
     }
-    if let Some((dir, index)) = &discovered {
+    if let Some(discovered) = &discovered {
         tracing::info!(
-            %dir,
-            shards = index.shard_count(),
-            definitions = index.definition_count(),
+            dir = %discovered.dir,
+            cached = discovered.cache_hit,
+            shards = discovered.index.shard_count(),
+            definitions = discovered.index.definition_count(),
             "found an index at startup"
         );
     } else {
@@ -124,8 +127,8 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     let mut server = Server::new(connection.sender.clone(), encoding, root);
     server.supports_progress = supports_progress;
     server.apply_config(config);
-    if let Some((dir, index)) = discovered {
-        server.adopt_index(dir, index);
+    if let Some(discovered) = discovered {
+        server.adopt_discovered(discovered);
     }
     server.run(&connection)
 }
@@ -159,21 +162,92 @@ fn build_index(root: &AbsPath, config: &Config) -> Result<(), String> {
 /// The conventional home is `bazel-bin`, the convenience symlink Bazel writes at
 /// the workspace root; shards land one per target beneath it.
 ///
-/// Reading the whole index is the only honest way to know it is usable — a
-/// directory of unparseable files is not an index — and the result is handed to
-/// the server rather than rebuilt. On Gerrit that read is 97 shards and ~350ms,
-/// paid exactly once.
-fn discover_index(root: &AbsPath) -> Option<(paths::Utf8PathBuf, SymbolIndex)> {
+/// A validated built-index snapshot is tried first. On a miss, reading every
+/// shard is the only honest way to know the directory is usable; the resulting
+/// index is handed to the server and cached asynchronously rather than rebuilt.
+struct Discovered {
+    dir: paths::Utf8PathBuf,
+    index: SymbolIndex,
+    cache: Option<CacheState>,
+    cache_hit: bool,
+}
+
+#[derive(Clone)]
+struct CacheState {
+    root: PathBuf,
+    dir: PathBuf,
+    key: CacheKey,
+    shards: Vec<ShardMetadata>,
+}
+
+struct RefreshResult {
+    revision: u64,
+    result: std::io::Result<RefreshWork>,
+}
+
+enum RefreshWork {
+    Unchanged,
+    Loaded(Box<SymbolIndex>, Vec<ShardMetadata>),
+    Empty(Vec<ShardMetadata>),
+}
+
+fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
     // `bazel-bin` is a symlink into the output base; `symlink_metadata` would
     // see the link rather than the directory, so follow it deliberately.
-    for candidate in ["bazel-bin", ".jabar/index"] {
-        let dir = root.join(candidate);
-        if !dir.as_utf8_path().is_dir() {
-            continue;
+    let dir = root.join("bazel-bin");
+    if dir.as_utf8_path().is_dir() {
+        let path = Path::new(dir.as_str());
+        let key = CacheKey::new(Path::new(root.as_str()), path, config).ok();
+        if let Some(key) = &key {
+            match index_cache::load(Path::new(root.as_str()), key) {
+                Ok(Some(hit)) if !hit.index.is_empty() => {
+                    return Some(Discovered {
+                        dir: dir.as_utf8_path().to_path_buf(),
+                        index: hit.index,
+                        cache: Some(CacheState {
+                            root: PathBuf::from(root.as_str()),
+                            dir: path.to_path_buf(),
+                            key: key.clone(),
+                            shards: hit.shards,
+                        }),
+                        cache_hit: true,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "index cache unreadable; loading shards"),
+            }
         }
-        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
+        match SymbolIndex::scan_shards(path) {
+            Ok(shards) => {
+                let index = SymbolIndex::from_shards(path, &shards);
+                if !index.is_empty() {
+                    let cache = key.map(|key| CacheState {
+                        root: PathBuf::from(root.as_str()),
+                        dir: path.to_path_buf(),
+                        key,
+                        shards,
+                    });
+                    return Some(Discovered {
+                        dir: dir.into_utf8_path_buf(),
+                        index,
+                        cache,
+                        cache_hit: false,
+                    });
+                }
+            }
+            Err(err) => tracing::debug!(%dir, %err, "could not scan shards"),
+        }
+    }
+    let dir = root.join(".jabar/index");
+    if dir.as_utf8_path().is_dir() {
+        match SymbolIndex::from_dir(Path::new(dir.as_str())) {
             Ok(index) if !index.is_empty() => {
-                return Some((dir.into_utf8_path_buf(), index));
+                return Some(Discovered {
+                    dir: dir.into_utf8_path_buf(),
+                    index,
+                    cache: None,
+                    cache_hit: false,
+                });
             }
             Ok(_) => tracing::debug!(%dir, "no shards here"),
             Err(err) => tracing::debug!(%dir, %err, "could not read"),
@@ -208,7 +282,17 @@ pub struct Server {
     /// `None` means no index, which is a different answer from an empty one --
     /// see `handlers`. Loading is explicit for now: the aspect that produces
     /// shards has to run first, and jabar does not yet run it.
-    index: Option<SymbolIndex>,
+    index: Option<Arc<SymbolIndex>>,
+    cache: Option<CacheState>,
+    cache_hit: bool,
+    shards_verified: bool,
+    cache_epoch: Arc<AtomicU64>,
+    refresh_tx: Sender<RefreshResult>,
+    refresh_rx: Receiver<RefreshResult>,
+    refresh_revision: u64,
+    refresh_running: bool,
+    refresh_again: bool,
+    refresh_progress: Option<String>,
     telemetry: Telemetry,
     shutdown_requested: bool,
 }
@@ -220,6 +304,7 @@ impl Server {
         workspace_root: Option<AbsPathBuf>,
     ) -> Server {
         let build = workspace_root.clone().map(BazelCli::new);
+        let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         Server {
             sender,
             encoding,
@@ -228,6 +313,16 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            cache: None,
+            cache_hit: false,
+            shards_verified: false,
+            cache_epoch: Arc::new(AtomicU64::new(0)),
+            refresh_tx,
+            refresh_rx,
+            refresh_revision: 0,
+            refresh_running: false,
+            refresh_again: false,
+            refresh_progress: None,
             config: Config::default(),
             overlay: Overlay::new(),
             supports_progress: false,
@@ -247,6 +342,7 @@ impl Server {
     /// `InvalidRequest` until `exit` arrives. A client that has a request in
     /// flight when the user quits should get an error, not a dead socket.
     fn run(mut self, connection: &Connection) -> anyhow::Result<()> {
+        let refresh_tick = crossbeam_channel::tick(Duration::from_secs(300));
         loop {
             // The watcher channel is swapped in as the index is loaded, so it is
             // re-read each turn rather than captured once. `never()` parks the
@@ -270,7 +366,17 @@ impl Server {
                         self.on_file_change(change);
                     }
                     continue;
-                }
+                },
+                recv(self.refresh_rx) -> result => {
+                    if let Ok(result) = result {
+                        self.on_refresh_result(result);
+                    }
+                    continue;
+                },
+                recv(refresh_tick) -> _ => {
+                    self.schedule_reconcile(false);
+                    continue;
+                },
             };
             match message {
                 Message::Request(request) => {
@@ -305,16 +411,16 @@ impl Server {
         }
     }
 
-    /// Reacts to something changing on disk.
-    ///
-    /// Reloading is synchronous, which is fine while it is a directory read —
-    /// Ray's seven shards load in 132ms. When the index grows, or when jabar
-    /// runs the aspect itself, this moves to the task pool.
+    /// Reacts to something changing on disk without loading shards on the loop.
     fn on_file_change(&mut self, change: Change) {
         match change {
             Change::Index => {
-                tracing::info!("shards changed on disk; reloading the index");
-                self.reload_index();
+                tracing::info!("shards changed on disk; scheduling an index reload");
+                if self.cache.is_some() {
+                    self.schedule_reconcile(true);
+                } else {
+                    self.schedule_reload(true);
+                }
             }
             Change::Workspace => {
                 // A branch switch invalidates the index without necessarily
@@ -323,31 +429,150 @@ impl Server {
                 // honest move is to drop the index and say so.
                 tracing::info!("the workspace moved; dropping the index as stale");
                 self.index = None;
+                self.cache_hit = false;
+                self.shards_verified = false;
+                self.refresh_revision = self.refresh_revision.wrapping_add(1);
+                self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+                if let Some(cache) = &mut self.cache
+                    && let Ok(key) = CacheKey::new(&cache.root, &cache.dir, &self.config)
+                {
+                    cache.key = key;
+                }
                 self.notify_index_stale();
+                if self.cache.is_some() {
+                    self.schedule_reconcile(true);
+                }
             }
         }
     }
 
-    fn reload_index(&mut self) {
-        let Some(dir) = self.index_dir.clone() else { return };
-        // Reloading blocks the loop, and on a large repo that is long enough
-        // for a user to wonder whether the server has died. Say what is
-        // happening rather than going quiet.
-        let progress = self.begin_progress("jabar", "reloading the symbol index");
-        let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
-        match SymbolIndex::from_dir(std::path::Path::new(dir.as_str())) {
-            Ok(index) => {
-                let definitions = index.definition_count();
-                guard.finish(telemetry::Outcome::answered(definitions));
-                tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
-                self.index = Some(index);
+    fn schedule_reconcile(&mut self, changed: bool) {
+        let Some(cache) = self.cache.clone() else { return };
+        self.schedule_refresh(changed, move || {
+            let shards = SymbolIndex::scan_shards(&cache.dir)?;
+            if shards == cache.shards {
+                return Ok(RefreshWork::Unchanged);
             }
-            Err(err) => {
-                guard.mark_failed(telemetry::Failure::Io);
-                tracing::warn!(%err, dir = %dir, "could not reload the index; keeping the old one");
+            if shards.is_empty() {
+                return Ok(RefreshWork::Empty(shards));
+            }
+            let index = SymbolIndex::from_shards(&cache.dir, &shards);
+            if SymbolIndex::scan_shards(&cache.dir)? != shards {
+                return Err(std::io::Error::other("shards changed during reload"));
+            }
+            if index.is_empty() {
+                return Err(std::io::Error::other("no usable SCIP shards after reload"));
+            }
+            Ok(RefreshWork::Loaded(Box::new(index), shards))
+        });
+    }
+
+    fn schedule_reload(&mut self, changed: bool) {
+        let Some(dir) = self.index_dir.as_ref().map(|dir| PathBuf::from(dir.as_str())) else {
+            return;
+        };
+        self.schedule_refresh(changed, move || {
+            let shards = SymbolIndex::scan_shards(&dir)?;
+            if shards.is_empty() {
+                return Ok(RefreshWork::Empty(shards));
+            }
+            let index = SymbolIndex::from_shards(&dir, &shards);
+            if index.is_empty() {
+                return Err(std::io::Error::other("no usable SCIP shards after reload"));
+            }
+            Ok(RefreshWork::Loaded(Box::new(index), shards))
+        });
+    }
+
+    fn schedule_refresh(
+        &mut self,
+        changed: bool,
+        work: impl FnOnce() -> std::io::Result<RefreshWork> + Send + 'static,
+    ) {
+        if self.refresh_running {
+            if changed {
+                self.refresh_revision = self.refresh_revision.wrapping_add(1);
+                self.refresh_again = true;
+            }
+            return;
+        }
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        self.refresh_running = true;
+        self.refresh_progress = self.begin_progress("jabar", "reloading the symbol index");
+        let tx = self.refresh_tx.clone();
+        let revision = self.refresh_revision;
+        std::thread::spawn(move || {
+            let _ = tx.send(RefreshResult { revision, result: work() });
+        });
+    }
+
+    fn on_refresh_result(&mut self, result: RefreshResult) {
+        self.refresh_running = false;
+        let progress = self.refresh_progress.take();
+        self.end_progress(progress);
+        if self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| !cache.key.still_current(&cache.root, &cache.dir))
+        {
+            tracing::warn!("workspace or Bazel output tree moved; dropping the old index");
+            self.index = None;
+            self.cache_hit = false;
+            self.shards_verified = false;
+            self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+            self.notify_index_stale();
+            if let Some(cache) = &mut self.cache
+                && let Ok(key) = CacheKey::new(&cache.root, &cache.dir, &self.config)
+            {
+                cache.key = key;
+                self.schedule_reconcile(true);
+            }
+            return;
+        }
+        if result.revision == self.refresh_revision {
+            match result.result {
+                Ok(RefreshWork::Unchanged) => self.shards_verified = true,
+                Ok(RefreshWork::Empty(shards)) => {
+                    tracing::info!("all indexed shards were removed; clearing the index");
+                    self.index = None;
+                    if let Some(cache) = &mut self.cache {
+                        cache.shards = shards;
+                        index_cache::invalidate(&cache.root);
+                    }
+                    self.cache_hit = false;
+                    self.shards_verified = true;
+                    self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+                    self.notify_index_stale();
+                }
+                Ok(RefreshWork::Loaded(index, shards)) => {
+                    let was_unavailable = self.index.is_none();
+                    let definitions = index.definition_count();
+                    tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
+                    self.index = Some(Arc::from(index));
+                    if let Some(cache) = &mut self.cache {
+                        cache.shards = shards;
+                        self.shards_verified = true;
+                        self.cache_hit = false;
+                        self.write_cache_async();
+                    }
+                    if was_unavailable {
+                        self.register_workspace_symbol();
+                    }
+                }
+                Err(err) => {
+                    self.shards_verified = false;
+                    tracing::warn!(%err, "could not reconcile shards; keeping the old index");
+                }
             }
         }
-        self.end_progress(progress);
+        if self.refresh_again {
+            self.refresh_again = false;
+            if self.cache.is_some() {
+                self.schedule_reconcile(false);
+            } else if self.index_dir.is_some() {
+                self.schedule_reload(false);
+            }
+        }
     }
 
     /// Tells the client that something slow has started, if it can show that.
@@ -516,9 +741,53 @@ impl Server {
     /// paid for the read, and doing it twice was ~350ms of startup latency on
     /// Gerrit for nothing.
     pub fn adopt_index(&mut self, dir: paths::Utf8PathBuf, index: SymbolIndex) {
-        self.index = Some(index);
-        self.start_watching(dir.as_str());
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cache = None;
+        self.cache_hit = false;
+        self.shards_verified = false;
+        self.index = Some(Arc::new(index));
+        self.start_watching(Some(dir.as_str()));
         self.index_dir = Some(dir);
+    }
+
+    fn adopt_discovered(&mut self, discovered: Discovered) {
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        self.cache = discovered.cache;
+        self.cache_hit = discovered.cache_hit;
+        self.shards_verified = false;
+        self.index = Some(Arc::new(discovered.index));
+        // Watching millions of bazel-bin entries recursively can itself stall
+        // startup. Cached indexes reconcile in a worker instead.
+        let watch_dir = self.cache.is_none().then_some(discovered.dir.as_str());
+        self.start_watching(watch_dir);
+        self.index_dir = Some(discovered.dir);
+        if self.cache_hit {
+            self.schedule_reconcile(false);
+        } else if self.cache.is_some() {
+            self.write_cache_async();
+        }
+    }
+
+    fn write_cache_async(&self) {
+        let (Some(cache), Some(index)) = (self.cache.clone(), self.index.clone()) else {
+            return;
+        };
+        let epoch = Arc::clone(&self.cache_epoch);
+        let ticket = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        std::thread::spawn(move || {
+            match index_cache::store(
+                &cache.root,
+                &cache.dir,
+                &cache.key,
+                &cache.shards,
+                &index,
+                || epoch.load(Ordering::SeqCst) == ticket,
+            ) {
+                Ok(()) => tracing::info!("built index cache published"),
+                Err(err) => tracing::warn!(%err, "could not publish index cache"),
+            }
+        });
     }
 
     /// Loads a directory of SCIP shards into the global index.
@@ -551,9 +820,14 @@ impl Server {
         });
 
         tracing::info!(shards, definitions, path = %params.path, "index loaded");
-        self.index = Some(index);
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        self.index = Some(Arc::new(index));
+        self.cache = None;
+        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cache_hit = false;
+        self.shards_verified = false;
         self.index_dir = Some(paths::Utf8PathBuf::from(params.path.clone()));
-        self.start_watching(&params.path);
+        self.start_watching(Some(&params.path));
         // The capability was not advertised at initialize, because there was
         // nothing behind it. Tell the client it exists now.
         self.register_workspace_symbol();
@@ -970,12 +1244,11 @@ impl Server {
     /// Failing to watch is not failing to serve: the index is loaded and every
     /// query still works, it just will not notice a rebuild. Worth a warning,
     /// not an error.
-    fn start_watching(&mut self, index_dir: &str) {
-        let dir = paths::Utf8Path::new(index_dir);
-        let index_dir = paths::AbsPath::try_new(dir);
+    fn start_watching(&mut self, index_dir: Option<&str>) {
+        let index_dir = index_dir.map(paths::Utf8Path::new).and_then(paths::AbsPath::try_new);
         match FileWatcher::spawn(index_dir, self.workspace_root.as_deref()) {
             Ok(watcher) => {
-                tracing::debug!(dir = %dir, "watching for index changes");
+                tracing::debug!(?index_dir, "watching for index changes");
                 self.watcher = Some(watcher);
             }
             Err(err) => tracing::warn!(%err, "not watching for changes; reloads must be manual"),
@@ -1141,6 +1414,15 @@ impl Server {
             },
             index_loaded: self.index.is_some(),
             watching: self.watcher.is_some(),
+            index_cache_loaded: self.cache_hit,
+            shards_verified: self.shards_verified,
+            shard_refresh_mode: if self.cache.is_some() {
+                "periodic"
+            } else if self.watcher.is_some() {
+                "watch"
+            } else {
+                "none"
+            },
             output_base: self.config.output_base.as_ref().map(|p| p.to_string()),
             index_targets: self.config.index.targets.clone(),
             indexed_definitions: self.index.as_ref().map(|i| i.definition_count()).unwrap_or(0),
@@ -1169,6 +1451,12 @@ pub struct Status {
     pub position_encoding: &'static str,
     pub index_loaded: bool,
     pub watching: bool,
+    /// True when startup loaded the persisted built-index snapshot.
+    pub index_cache_loaded: bool,
+    /// Whether the snapshot was compared with the current shard metadata.
+    /// This says nothing about whether sources have been rebuilt.
+    pub shards_verified: bool,
+    pub shard_refresh_mode: &'static str,
     /// `null` when sharing the workspace's default output base.
     pub output_base: Option<String>,
     pub index_targets: Vec<String>,
@@ -1180,6 +1468,107 @@ pub struct Status {
     /// read-after-write signal from `docs/phase-1.md` (F3).
     pub pending_changes: bool,
     pub health: telemetry::Health,
+}
+
+#[cfg(test)]
+mod startup_cache_tests {
+    use super::*;
+    use symbol_index::{Definition, PositionEncoding as IndexEncoding, Range, SymbolKind};
+
+    fn test_index() -> SymbolIndex {
+        let mut index = SymbolIndex::default();
+        index.insert(Definition {
+            symbol: "java Foo#".into(),
+            name: "Foo".into(),
+            kind: SymbolKind::Class,
+            path: "src/Foo.java".into(),
+            range: Range { start_line: 0, start_col: 0, end_line: 0, end_col: 3 },
+            encoding: IndexEncoding::Utf16,
+            implements: Vec::new(),
+            documentation: Vec::new(),
+            signature: String::new(),
+            enclosing: None,
+        });
+        index
+    }
+
+    fn server() -> Server {
+        let (connection, _client) = Connection::memory();
+        Server::new(connection.sender, PositionEncoding::Utf16, None)
+    }
+
+    #[test]
+    fn startup_uses_built_snapshot_before_scanning_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("bazel-bin");
+        std::fs::create_dir(&dir).unwrap();
+        // No SCIP shard exists. Only a successful cache read can discover Foo.
+        let index = test_index();
+        let config = Config::default();
+        let key = CacheKey::new(temp.path(), &dir, &config).unwrap();
+        index_cache::store(temp.path(), &dir, &key, &[], &index, || true).unwrap();
+        let root = AbsPath::try_new(paths::Utf8Path::new(temp.path().to_str().unwrap())).unwrap();
+        let discovered = discover_index(root, &config).unwrap();
+        assert!(discovered.cache_hit);
+        assert_eq!(discovered.index.search("Foo").len(), 1);
+    }
+
+    #[test]
+    fn a_refresh_can_restore_an_index_after_invalidation() {
+        let mut server = server();
+        server.on_refresh_result(RefreshResult {
+            revision: 0,
+            result: Ok(RefreshWork::Loaded(
+                Box::new(test_index()),
+                vec![ShardMetadata { path: "foo.scip".into(), len: 1, modified_ns: 1 }],
+            )),
+        });
+        assert_eq!(server.index.as_ref().unwrap().search("Foo").len(), 1);
+    }
+
+    #[test]
+    fn a_confirmed_empty_shard_set_clears_stale_symbols() {
+        let mut server = server();
+        server.index = Some(Arc::new(test_index()));
+        server.on_refresh_result(RefreshResult {
+            revision: 0,
+            result: Ok(RefreshWork::Empty(Vec::new())),
+        });
+        assert!(server.index.is_none());
+        assert!(server.shards_verified);
+    }
+
+    #[test]
+    fn a_timer_tick_does_not_cancel_a_long_refresh() {
+        let mut server = server();
+        server.refresh_running = true;
+        server.refresh_revision = 7;
+        server.schedule_refresh(false, || Ok(RefreshWork::Unchanged));
+        assert_eq!(server.refresh_revision, 7);
+        assert!(!server.refresh_again);
+
+        server.schedule_refresh(true, || Ok(RefreshWork::Unchanged));
+        assert_eq!(server.refresh_revision, 8);
+        assert!(server.refresh_again);
+    }
+
+    #[test]
+    fn a_queued_reload_runs_after_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = server();
+        server.index_dir = Some(paths::Utf8PathBuf::from(temp.path().to_str().unwrap().to_owned()));
+        server.refresh_revision = 2;
+        server.refresh_running = true;
+        server.refresh_again = true;
+
+        // Revision 1 is the first worker, made obsolete by a second shard
+        // notification. Its completion must launch the queued worker even
+        // though workspace invalidation already cleared the index.
+        server.on_refresh_result(RefreshResult { revision: 1, result: Ok(RefreshWork::Unchanged) });
+        assert!(server.refresh_running);
+        assert!(!server.refresh_again);
+        assert_eq!(server.refresh_revision, 3);
+    }
 }
 
 /// Both shapes of a references answer: the LSP-conformant array, and the

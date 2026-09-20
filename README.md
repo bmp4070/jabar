@@ -115,12 +115,14 @@ their provenance before loading. A concatenated SCIP file or a shard-path list
 alone avoids the walk but still decodes the shards and rebuilds lookup maps.
 
 The cache is a performance aid, not proof that an index matches current sources.
-Jabar must report stale and incomplete coverage explicitly, refresh off the LSP
-loop, and avoid recursively watching millions of build outputs. See
+Jabar now persists the built index after loading shards from `bazel-bin` and
+checks that cache before walking the output tree. It reconciles shard metadata and performs reloads
+off the LSP loop, and cached sessions avoid a recursive `bazel-bin` watcher.
+The cache reports whether its shards have been verified; that does not prove
+the sources have been rebuilt. Indexing coverage remains to be implemented. See
 [`docs/index-cache.md`](docs/index-cache.md) for the cache design and
 [`docs/monolith-roadmap.md`](docs/monolith-roadmap.md) for implementation stages,
-measurements, ECJ coverage, and query-scale work. None of these optimizations is
-implemented yet.
+measurements, ECJ coverage, and query-scale work.
 
 ## Indexing a repo that compiles with ECJ
 

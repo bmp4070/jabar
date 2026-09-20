@@ -24,18 +24,21 @@
 //! and a test pins that. If a future scip-java starts populating the field
 //! honestly, that test is what will notice.
 
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use protobuf::Message as _;
 use rustc_hash::FxHashMap;
 use scip::types::{Index, SymbolRole};
+use serde::{Deserialize, Serialize};
 
 /// Where a symbol is, in the index's own coordinates.
 ///
 /// Columns are in whatever [`PositionEncoding`] the containing document used.
 /// Converting to a client's negotiated encoding is the server's job, not this
 /// crate's — it has the file text and this does not.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start_line: u32,
     pub start_col: u32,
@@ -70,7 +73,7 @@ impl Range {
 }
 
 /// How a document's columns are counted.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionEncoding {
     Utf8,
     Utf16,
@@ -97,7 +100,7 @@ impl PositionEncoding {
 
 /// What kind of thing a symbol is. A narrowing of SCIP's much longer list to
 /// what a Java client can act on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
     Interface,
@@ -124,7 +127,7 @@ impl SymbolKind {
 }
 
 /// A symbol's definition site.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Definition {
     /// The SCIP symbol string. Globally unique, and the key everything joins on.
     pub symbol: String,
@@ -152,7 +155,7 @@ pub struct Definition {
 }
 
 /// One use of a symbol somewhere other than its definition.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reference {
     pub symbol: String,
     pub path: String,
@@ -168,14 +171,14 @@ pub struct Reference {
 /// Symbols are held as ids into [`SymbolIndex::symbol_names`] rather than as
 /// strings: a large repo has far more occurrences than distinct symbols, and a
 /// SCIP symbol string runs to sixty-odd bytes.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 struct Occurrence {
     range: Range,
     symbol: u32,
 }
 
 /// Symbols and references, keyed for lookup.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct SymbolIndex {
     definitions: Vec<Definition>,
     /// Lowercased short name to definition indices, for case-insensitive search.
@@ -196,6 +199,15 @@ pub struct SymbolIndex {
     shards: usize,
 }
 
+/// The cheap filesystem identity of one aggregated shard. This detects shard
+/// additions and normal rewrites without decoding them during reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardMetadata {
+    pub path: PathBuf,
+    pub len: u64,
+    pub modified_ns: u64,
+}
+
 impl SymbolIndex {
     /// Reads aggregated `*.scip` shards under `dir`, recursively.
     /// Intermediate targetroot directories contain per-source shards already
@@ -205,12 +217,18 @@ impl SymbolIndex {
     /// load: one corrupt shard should cost its own target's symbols, not the
     /// whole index.
     pub fn from_dir(dir: &Path) -> std::io::Result<SymbolIndex> {
-        let mut index = SymbolIndex::default();
+        let shards = Self::scan_shards(dir)?;
+        Ok(Self::from_shards(dir, &shards))
+    }
+
+    /// Walks the tree without reading or decoding shard contents.
+    pub fn scan_shards(dir: &Path) -> std::io::Result<Vec<ShardMetadata>> {
+        let mut shards = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
             for entry in std::fs::read_dir(&current)?.flatten() {
                 let path = entry.path();
-                // `symlink_metadata` so a bazel-out symlink loop cannot walk forever.
+                // Do not follow directory symlinks into Bazel output loops.
                 let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
                 if meta.is_dir() {
                     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
@@ -218,14 +236,52 @@ impl SymbolIndex {
                         stack.push(path);
                     }
                 } else if path.extension().is_some_and(|e| e == "scip") {
-                    match std::fs::read(&path) {
-                        Ok(bytes) => index.add_shard(&bytes, &path.display().to_string()),
-                        Err(err) => tracing::warn!(?path, %err, "unreadable shard"),
+                    // Follow file symlinks: the loader reads their targets, so
+                    // the metadata must describe those same bytes.
+                    let Ok(meta) = std::fs::metadata(&path) else { continue };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    let modified_ns = meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+                        .unwrap_or(0);
+                    if let Ok(relative) = path.strip_prefix(dir) {
+                        shards.push(ShardMetadata {
+                            path: relative.to_path_buf(),
+                            len: meta.len(),
+                            modified_ns,
+                        });
                     }
                 }
             }
         }
-        Ok(index)
+        shards.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(shards)
+    }
+
+    /// Reads a previously discovered shard list without walking the tree again.
+    pub fn from_shards(dir: &Path, shards: &[ShardMetadata]) -> SymbolIndex {
+        let mut index = SymbolIndex::default();
+        for shard in shards {
+            let path = dir.join(&shard.path);
+            match std::fs::read(&path) {
+                Ok(bytes) => index.add_shard(&bytes, &path.display().to_string()),
+                Err(err) => tracing::warn!(?path, %err, "unreadable shard"),
+            }
+        }
+        index
+    }
+
+    /// Persists all lookup tables so a cache hit needs no SCIP decode or map build.
+    pub fn write_snapshot(&self, mut writer: impl Write) -> std::io::Result<()> {
+        rmp_serde::encode::write(&mut writer, self).map_err(std::io::Error::other)
+    }
+
+    pub fn read_snapshot(reader: impl Read) -> std::io::Result<SymbolIndex> {
+        rmp_serde::from_read(reader).map_err(std::io::Error::other)
     }
 
     /// Adds one shard's contents. `origin` is used only for diagnostics.
@@ -646,6 +702,25 @@ mod tests {
         }
         let index = SymbolIndex::from_dir(dir.path()).expect("load index");
         assert_eq!(index.shard_count(), 1, "only the aggregated target shard is loaded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shard_metadata_follows_file_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"one").unwrap();
+        symlink(&target, dir.path().join("target.scip")).unwrap();
+        let before = SymbolIndex::scan_shards(dir.path()).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].len, 3);
+
+        std::fs::write(&target, b"longer shard").unwrap();
+        let after = SymbolIndex::scan_shards(dir.path()).unwrap();
+        assert_eq!(after[0].len, 12);
+        assert_ne!(before, after);
     }
 
     #[test]

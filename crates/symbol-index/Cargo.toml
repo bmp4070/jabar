@@ -11,7 +11,9 @@ paths.workspace = true
 
 protobuf.workspace = true
 rustc-hash.workspace = true
+rmp-serde.workspace = true
 scip.workspace = true
+serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
