@@ -219,14 +219,26 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
         }
         match SymbolIndex::scan_shards(path) {
             Ok(shards) => {
-                let index = SymbolIndex::from_shards(path, &shards);
+                let loaded = SymbolIndex::load_shards(path, &shards);
+                let complete = loaded.failed.is_empty();
+                if !complete {
+                    tracing::warn!(
+                        failed = loaded.failed.len(),
+                        "some SCIP shards could not be loaded; serving a partial, unverified index"
+                    );
+                }
+                let index = loaded.index;
                 if !index.is_empty() {
-                    let cache = key.map(|key| CacheState {
-                        root: PathBuf::from(root.as_str()),
-                        dir: path.to_path_buf(),
-                        key,
-                        shards,
-                    });
+                    let cache = if complete {
+                        key.map(|key| CacheState {
+                            root: PathBuf::from(root.as_str()),
+                            dir: path.to_path_buf(),
+                            key,
+                            shards,
+                        })
+                    } else {
+                        None
+                    };
                     return Some(Discovered {
                         dir: dir.into_utf8_path_buf(),
                         index,
@@ -374,7 +386,15 @@ impl Server {
                     continue;
                 },
                 recv(refresh_tick) -> _ => {
-                    self.schedule_reconcile(false);
+                    if self.cache.is_some() {
+                        self.schedule_reconcile(false);
+                    } else if self.index_dir.is_some() {
+                        // Manual and partial startup loads have no cache
+                        // manifest to compare. Retry them periodically so a
+                        // transient unreadable shard can recover without a
+                        // filesystem event.
+                        self.schedule_reload(false);
+                    }
                     continue;
                 },
             };
@@ -456,10 +476,17 @@ impl Server {
             if shards.is_empty() {
                 return Ok(RefreshWork::Empty(shards));
             }
-            let index = SymbolIndex::from_shards(&cache.dir, &shards);
+            let loaded = SymbolIndex::load_shards(&cache.dir, &shards);
             if SymbolIndex::scan_shards(&cache.dir)? != shards {
                 return Err(std::io::Error::other("shards changed during reload"));
             }
+            if !loaded.failed.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "{} SCIP shards could not be loaded",
+                    loaded.failed.len()
+                )));
+            }
+            let index = loaded.index;
             if index.is_empty() {
                 return Err(std::io::Error::other("no usable SCIP shards after reload"));
             }
@@ -476,7 +503,14 @@ impl Server {
             if shards.is_empty() {
                 return Ok(RefreshWork::Empty(shards));
             }
-            let index = SymbolIndex::from_shards(&dir, &shards);
+            let loaded = SymbolIndex::load_shards(&dir, &shards);
+            if !loaded.failed.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "{} SCIP shards could not be loaded",
+                    loaded.failed.len()
+                )));
+            }
+            let index = loaded.index;
             if index.is_empty() {
                 return Err(std::io::Error::other("no usable SCIP shards after reload"));
             }
@@ -804,13 +838,26 @@ impl Server {
         })?;
 
         let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
-        let index = SymbolIndex::from_dir(std::path::Path::new(&params.path)).map_err(|err| {
+        let path = std::path::Path::new(&params.path);
+        let shards = SymbolIndex::scan_shards(path).map_err(|err| {
             guard_failed(&mut guard);
             RequestError::new(
                 ErrorCode::InvalidParams,
                 format!("could not read `{}`: {err}", params.path),
             )
         })?;
+        let loaded = SymbolIndex::load_shards(path, &shards);
+        if !loaded.failed.is_empty() {
+            guard_failed(&mut guard);
+            return Err(RequestError::new(
+                ErrorCode::InternalError,
+                format!(
+                    "refusing to replace the index because {} SCIP shards could not be loaded",
+                    loaded.failed.len()
+                ),
+            ));
+        }
+        let index = loaded.index;
 
         let (shards, definitions) = (index.shard_count(), index.definition_count());
         guard.finish(if definitions == 0 {
@@ -870,16 +917,16 @@ impl Server {
                 Some((relative, doc.text.clone()))
             })
             .collect();
-        let live: Vec<symbol_index::Definition> = dirty
-            .into_iter()
-            .flat_map(|(relative, text)| self.overlay.parse(&relative, &text))
-            .collect();
+        let live: Vec<symbol_index::Definition> =
+            dirty.iter().flat_map(|(relative, text)| self.overlay.parse(relative, text)).collect();
+        let shadowed: Vec<String> = dirty.into_iter().map(|(relative, _)| relative).collect();
 
         let index = self.index.as_ref().expect("resolve_query established there is one");
         let read = file_reader(&self.documents, &root);
         let results = handlers::workspace_symbol_with(
             index,
             &live,
+            &shadowed,
             &params.query,
             &root,
             self.encoding,
@@ -1075,13 +1122,13 @@ impl Server {
         let index = self.index.as_ref().expect("resolve_query established there is one");
         let read = file_reader(&self.documents, &root);
         let symbols = match &live {
-            Some(defs) if !defs.is_empty() => {
+            Some(defs) => {
                 let borrowed: Vec<&symbol_index::Definition> = defs.iter().collect();
                 handlers::document_symbols_from(&borrowed, &relative, self.encoding, &read)
             }
-            // Not open, or open and unparseable. Fall back to the index, which
-            // may still know this file from the last build.
-            _ => handlers::document_symbols(index, &relative, self.encoding, &read),
+            // Only a closed file may fall back to the built index. An empty or
+            // temporarily unparseable open buffer is still authoritative.
+            None => handlers::document_symbols(index, &relative, self.encoding, &read),
         };
 
         if symbols.is_empty() {

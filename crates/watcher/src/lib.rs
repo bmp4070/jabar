@@ -33,7 +33,7 @@
 //! explicit refresh request from the client is a better answer, since the
 //! client is the thing running the builds.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -82,12 +82,14 @@ impl FileWatcher {
     ) -> notify::Result<FileWatcher> {
         let (tx, receiver) = unbounded();
         let sink = tx.clone();
+        let git_dir = workspace_root.and_then(resolve_git_dir);
+        let dispatch_git_dir = git_dir.clone();
 
         let mut debouncer =
             new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     let paths = events.iter().flat_map(|event| event.paths.iter());
-                    dispatch(paths, &sink);
+                    dispatch(paths, &sink, dispatch_git_dir.as_deref());
                 }
                 Err(errors) => {
                     // A dropped event means we may miss a change. Worth saying
@@ -95,6 +97,12 @@ impl FileWatcher {
                     for error in errors {
                         tracing::warn!(%error, "file watch error; the index may go stale");
                     }
+                    // The backend cannot tell us which event was lost. Drop
+                    // provenance first and then request an index reload; the
+                    // server will keep serving only if it can re-establish a
+                    // current index.
+                    let _ = sink.send(Change::Workspace);
+                    let _ = sink.send(Change::Index);
                 }
             })?;
 
@@ -107,9 +115,13 @@ impl FileWatcher {
         // Non-recursive: `.git` holds thousands of loose objects that change on
         // every fetch and tell us nothing. Only HEAD and index matter, and both
         // sit at the top level.
-        if let Some(root) = workspace_root {
-            let git = root.join(".git");
-            watch(&mut debouncer, git.as_str(), RecursiveMode::NonRecursive, "git state");
+        if let Some(git) = &git_dir {
+            watch(
+                &mut debouncer,
+                git.to_string_lossy().as_ref(),
+                RecursiveMode::NonRecursive,
+                "git state",
+            );
         }
 
         Ok(FileWatcher { _debouncer: debouncer, receiver })
@@ -119,6 +131,20 @@ impl FileWatcher {
     pub fn receiver(&self) -> &Receiver<Change> {
         &self.receiver
     }
+}
+
+/// Resolves both an ordinary `.git` directory and a linked-worktree `.git`
+/// file containing `gitdir: <path>`.
+fn resolve_git_dir(root: &AbsPath) -> Option<PathBuf> {
+    let dot_git = PathBuf::from(root.as_str()).join(".git");
+    if dot_git.is_dir() {
+        return Some(std::fs::canonicalize(&dot_git).unwrap_or(dot_git));
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let raw = contents.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(raw);
+    let resolved = if path.is_absolute() { path } else { PathBuf::from(root.as_str()).join(path) };
+    Some(std::fs::canonicalize(&resolved).unwrap_or(resolved))
 }
 
 fn watch(
@@ -139,12 +165,16 @@ fn watch(
 ///
 /// Deduplicating here rather than at the receiver keeps a thousand-file
 /// checkout from becoming a thousand reload requests.
-fn dispatch<'a>(paths: impl Iterator<Item = &'a std::path::PathBuf>, sink: &Sender<Change>) {
+fn dispatch<'a>(
+    paths: impl Iterator<Item = &'a std::path::PathBuf>,
+    sink: &Sender<Change>,
+    git_dir: Option<&Path>,
+) {
     let mut index = false;
     let mut workspace = false;
 
     for path in paths {
-        match classify(path) {
+        match classify(path, git_dir) {
             Some(Change::Index) => index = true,
             Some(Change::Workspace) => workspace = true,
             None => {}
@@ -162,7 +192,7 @@ fn dispatch<'a>(paths: impl Iterator<Item = &'a std::path::PathBuf>, sink: &Send
 }
 
 /// What a changed path means, if anything.
-fn classify(path: &Path) -> Option<Change> {
+fn classify(path: &Path, git_dir: Option<&Path>) -> Option<Change> {
     if path.extension().is_some_and(|ext| ext == "scip") {
         // Per-source shards inside a targetroot are intermediate outputs. The
         // sibling target shard triggers the reload after aggregation finishes.
@@ -177,7 +207,9 @@ fn classify(path: &Path) -> Option<Change> {
     // operation, which is the cheapest proxy for "the tree was rewritten".
     // Ignore `HEAD.lock` and friends, which appear mid-operation.
     let name = path.file_name()?.to_str()?;
-    if matches!(name, "HEAD" | "index") && path.parent()?.file_name()? == ".git" {
+    let directly_in_git_dir = git_dir.is_some_and(|dir| path.parent() == Some(dir));
+    let directly_in_dot_git = path.parent()?.file_name().is_some_and(|name| name == ".git");
+    if matches!(name, "HEAD" | "index") && (directly_in_git_dir || directly_in_dot_git) {
         return Some(Change::Workspace);
     }
     None
@@ -191,7 +223,7 @@ mod tests {
     #[test]
     fn scip_shards_mean_the_index_changed() {
         assert_eq!(
-            classify(Path::new("/repo/bazel-bin/java/com/acme/core/core.scip")),
+            classify(Path::new("/repo/bazel-bin/java/com/acme/core/core.scip"), None),
             Some(Change::Index)
         );
     }
@@ -209,41 +241,61 @@ mod tests {
 
     #[test]
     fn git_head_and_index_mean_the_workspace_moved() {
-        assert_eq!(classify(Path::new("/repo/.git/HEAD")), Some(Change::Workspace));
-        assert_eq!(classify(Path::new("/repo/.git/index")), Some(Change::Workspace));
+        assert_eq!(classify(Path::new("/repo/.git/HEAD"), None), Some(Change::Workspace));
+        assert_eq!(classify(Path::new("/repo/.git/index"), None), Some(Change::Workspace));
     }
 
     #[test]
     fn transient_git_files_are_ignored() {
         // These appear and vanish during any git operation. Treating them as
         // changes would fire a reload several times per checkout.
-        assert_eq!(classify(Path::new("/repo/.git/HEAD.lock")), None);
-        assert_eq!(classify(Path::new("/repo/.git/index.lock")), None);
-        assert_eq!(classify(Path::new("/repo/.git/objects/ab/cdef")), None);
-        assert_eq!(classify(Path::new("/repo/.git/refs/heads/main")), None);
+        assert_eq!(classify(Path::new("/repo/.git/HEAD.lock"), None), None);
+        assert_eq!(classify(Path::new("/repo/.git/index.lock"), None), None);
+        assert_eq!(classify(Path::new("/repo/.git/objects/ab/cdef"), None), None);
+        assert_eq!(classify(Path::new("/repo/.git/refs/heads/main"), None), None);
     }
 
     #[test]
     fn a_file_named_index_outside_git_is_not_a_workspace_change() {
         // `src/index` or `docs/HEAD` are ordinary files.
-        assert_eq!(classify(Path::new("/repo/src/index")), None);
-        assert_eq!(classify(Path::new("/repo/docs/HEAD")), None);
+        assert_eq!(classify(Path::new("/repo/src/index"), None), None);
+        assert_eq!(classify(Path::new("/repo/docs/HEAD"), None), None);
     }
 
     #[test]
     fn ordinary_source_files_are_ignored() {
         // The whole point: editing source does not go through the watcher. The
         // client already told us, and the index only moves when a build runs.
-        assert_eq!(classify(Path::new("/repo/java/com/acme/A.java")), None);
-        assert_eq!(classify(Path::new("/repo/BUILD.bazel")), None);
+        assert_eq!(classify(Path::new("/repo/java/com/acme/A.java"), None), None);
+        assert_eq!(classify(Path::new("/repo/BUILD.bazel"), None), None);
     }
 
     fn changes_from(paths: &[&str]) -> Vec<Change> {
         let (tx, rx) = unbounded();
         let owned: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-        dispatch(owned.iter(), &tx);
+        dispatch(owned.iter(), &tx, None);
         drop(tx);
         rx.into_iter().collect()
+    }
+
+    #[test]
+    fn a_linked_worktree_uses_and_classifies_its_real_git_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let git_dir = temp.path().join("git/worktrees/checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+        let root = paths::Utf8Path::from_path(&checkout)
+            .and_then(paths::AbsPath::try_new)
+            .expect("absolute UTF-8 temp path");
+        let canonical_git_dir = std::fs::canonicalize(&git_dir).unwrap();
+
+        assert_eq!(resolve_git_dir(root).as_deref(), Some(canonical_git_dir.as_path()));
+        assert_eq!(
+            classify(&canonical_git_dir.join("HEAD"), Some(&canonical_git_dir)),
+            Some(Change::Workspace)
+        );
     }
 
     #[test]

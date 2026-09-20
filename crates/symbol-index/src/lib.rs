@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use protobuf::Message as _;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use scip::types::{Index, SymbolRole};
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +208,16 @@ pub struct ShardMetadata {
     pub modified_ns: u64,
 }
 
+/// The result of loading a previously scanned shard set.
+///
+/// A partial index can still be useful, but callers must not persist it or mark
+/// it verified. `failed` names every shard that could not be read or decoded so
+/// the caller can retain an older complete index and retry later.
+pub struct ShardLoad {
+    pub index: SymbolIndex,
+    pub failed: Vec<PathBuf>,
+}
+
 impl SymbolIndex {
     /// Reads aggregated `*.scip` shards under `dir`, recursively.
     /// Intermediate targetroot directories contain per-source shards already
@@ -264,15 +274,28 @@ impl SymbolIndex {
 
     /// Reads a previously discovered shard list without walking the tree again.
     pub fn from_shards(dir: &Path, shards: &[ShardMetadata]) -> SymbolIndex {
+        Self::load_shards(dir, shards).index
+    }
+
+    /// Reads a shard list and reports whether every shard contributed.
+    pub fn load_shards(dir: &Path, shards: &[ShardMetadata]) -> ShardLoad {
         let mut index = SymbolIndex::default();
+        let mut failed = Vec::new();
         for shard in shards {
             let path = dir.join(&shard.path);
             match std::fs::read(&path) {
-                Ok(bytes) => index.add_shard(&bytes, &path.display().to_string()),
-                Err(err) => tracing::warn!(?path, %err, "unreadable shard"),
+                Ok(bytes) => {
+                    if !index.add_shard(&bytes, &path.display().to_string()) {
+                        failed.push(shard.path.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(?path, %err, "unreadable shard");
+                    failed.push(shard.path.clone());
+                }
             }
         }
-        index
+        ShardLoad { index, failed }
     }
 
     /// Persists all lookup tables so a cache hit needs no SCIP decode or map build.
@@ -285,12 +308,12 @@ impl SymbolIndex {
     }
 
     /// Adds one shard's contents. `origin` is used only for diagnostics.
-    pub fn add_shard(&mut self, bytes: &[u8], origin: &str) {
+    pub fn add_shard(&mut self, bytes: &[u8], origin: &str) -> bool {
         let index = match Index::parse_from_bytes(bytes) {
             Ok(index) => index,
             Err(err) => {
                 tracing::warn!(origin, %err, "unparseable SCIP shard; skipping");
-                return;
+                return false;
             }
         };
         self.shards += 1;
@@ -374,6 +397,7 @@ impl SymbolIndex {
                 occurrences.sort_by_key(|o| (o.range.start_line, o.range.start_col));
             }
         }
+        true
     }
 
     fn intern_symbol(&mut self, symbol: &str) -> u32 {
@@ -502,13 +526,43 @@ impl SymbolIndex {
     /// distinct symbol once, with the first position it appears at, because a
     /// call hierarchy wants "calls X" rather than "calls X four times".
     pub fn references_within(&self, path: &str, span: Range) -> Vec<(&str, Range)> {
+        self.references_within_owner(path, span, None)
+    }
+
+    /// References whose innermost callable is `owner`.
+    ///
+    /// A method's declaration span can contain a nested class and its methods.
+    /// Their calls belong to those nested methods, not to the outer method.
+    pub fn references_within_callable(
+        &self,
+        path: &str,
+        span: Range,
+        owner: &str,
+    ) -> Vec<(&str, Range)> {
+        self.references_within_owner(path, span, Some(owner))
+    }
+
+    fn references_within_owner(
+        &self,
+        path: &str,
+        span: Range,
+        owner: Option<&str>,
+    ) -> Vec<(&str, Range)> {
         let Some(occurrences) = self.occurrences.get(path) else { return Vec::new() };
-        let mut seen: Vec<(&str, Range)> = Vec::new();
+        let mut seen_ids = FxHashSet::default();
+        let mut seen = Vec::new();
         for occ in occurrences {
             if occ.range.start_line > span.end_line {
                 break;
             }
             if !encloses(&span, &occ.range) {
+                continue;
+            }
+            if let Some(owner) = owner
+                && self
+                    .enclosing_callable(path, occ.range)
+                    .is_some_and(|callable| callable.symbol != owner)
+            {
                 continue;
             }
             let symbol = self.symbol_names[occ.symbol as usize].as_str();
@@ -519,7 +573,7 @@ impl SymbolIndex {
             }) {
                 continue;
             }
-            if !seen.iter().any(|(s, _)| *s == symbol) {
+            if seen_ids.insert(occ.symbol) {
                 seen.push((symbol, occ.range));
             }
         }
@@ -685,9 +739,26 @@ mod tests {
     fn an_unparseable_shard_is_skipped_not_fatal() {
         // One corrupt shard should cost its own target's symbols, not the index.
         let mut index = SymbolIndex::default();
-        index.add_shard(b"this is not protobuf at all", "corrupt.scip");
+        assert!(!index.add_shard(b"this is not protobuf at all", "corrupt.scip"));
         assert!(index.is_empty());
         assert_eq!(index.shard_count(), 0, "a shard that did not parse was not counted");
+    }
+
+    #[test]
+    fn a_partial_shard_load_reports_every_failed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.scip"), Index::new().write_to_bytes().unwrap())
+            .unwrap();
+        std::fs::write(dir.path().join("bad.scip"), b"not protobuf").unwrap();
+        let shards = vec![
+            ShardMetadata { path: "good.scip".into(), len: 0, modified_ns: 0 },
+            ShardMetadata { path: "bad.scip".into(), len: 0, modified_ns: 0 },
+            ShardMetadata { path: "missing.scip".into(), len: 0, modified_ns: 0 },
+        ];
+
+        let loaded = SymbolIndex::load_shards(dir.path(), &shards);
+        assert_eq!(loaded.index.shard_count(), 1);
+        assert_eq!(loaded.failed, [PathBuf::from("bad.scip"), PathBuf::from("missing.scip")]);
     }
 
     #[test]
@@ -840,6 +911,38 @@ mod tests {
         let index = SymbolIndex::default();
         assert!(index.enclosing_callable("nowhere.java", r(0, 0, 0, 1)).is_none());
         assert!(index.references_within("nowhere.java", r(0, 0, 99, 0)).is_empty());
+    }
+
+    #[test]
+    fn an_outer_callable_does_not_claim_calls_from_a_nested_callable() {
+        let mut index = SymbolIndex::default();
+        let mut outer = def("com/acme/A#outer().", "outer");
+        outer.kind = SymbolKind::Method;
+        outer.path = "java/A.java".into();
+        outer.range = r(0, 5, 0, 10);
+        outer.enclosing = Some(r(0, 0, 20, 1));
+        let outer_symbol = outer.symbol.clone();
+        index.insert(outer);
+
+        let mut nested = def("com/acme/A$Nested#inner().", "inner");
+        nested.kind = SymbolKind::Method;
+        nested.path = "java/A.java".into();
+        nested.range = r(5, 5, 5, 10);
+        nested.enclosing = Some(r(5, 0, 10, 1));
+        index.insert(nested);
+
+        let outer_call = index.intern_symbol("com/acme/B#outerCallee().");
+        let nested_call = index.intern_symbol("com/acme/B#nestedCallee().");
+        index.occurrences.insert(
+            "java/A.java".into(),
+            vec![
+                Occurrence { range: r(2, 4, 2, 15), symbol: outer_call },
+                Occurrence { range: r(7, 4, 7, 16), symbol: nested_call },
+            ],
+        );
+
+        let calls = index.references_within_callable("java/A.java", r(0, 0, 20, 1), &outer_symbol);
+        assert_eq!(calls, [("com/acme/B#outerCallee().", r(2, 4, 2, 15))]);
     }
 
     #[test]

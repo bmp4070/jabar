@@ -13,6 +13,7 @@
 //! agent believe it has seen every call site.
 
 use lsp_types::{Location, Position, Range, SymbolInformation, SymbolKind as LspKind, Url};
+use rustc_hash::{FxHashMap, FxHashSet};
 use symbol_index::{Definition, PositionEncoding, SymbolIndex, SymbolKind};
 use telemetry::{EmptyReason, Failure, Outcome};
 
@@ -54,7 +55,7 @@ pub fn workspace_symbol(
     client_encoding: ClientEncoding,
     read_file: impl Fn(&str) -> Option<String>,
 ) -> SearchResults {
-    workspace_symbol_with(index, &[], query, workspace_root, client_encoding, read_file)
+    workspace_symbol_with(index, &[], &[], query, workspace_root, client_encoding, read_file)
 }
 
 /// The same, plus definitions parsed from files the index cannot see yet.
@@ -66,6 +67,7 @@ pub fn workspace_symbol(
 pub fn workspace_symbol_with(
     index: &SymbolIndex,
     live: &[Definition],
+    shadowed_paths: &[String],
     query: &str,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
@@ -79,9 +81,9 @@ pub fn workspace_symbol_with(
 
     // Files the overlay covers are represented entirely by it, so an indexed
     // symbol for such a file is a stale duplicate rather than an extra result.
-    let shadowed: Vec<&str> = live.iter().map(|d| d.path.as_str()).collect();
+    let shadowed: FxHashSet<&str> = shadowed_paths.iter().map(String::as_str).collect();
     let indexed =
-        index.search(query).into_iter().filter(|def| !shadowed.contains(&def.path.as_str()));
+        index.search(query).into_iter().filter(|def| !shadowed.contains(def.path.as_str()));
 
     // Live first: a symbol the client just wrote is what it is most likely
     // asking about.
@@ -580,8 +582,9 @@ pub fn incoming_calls(
     // One entry per caller, carrying every site it calls from -- which is what
     // `from_ranges` is for, and why a caller appearing twice is one result.
     let mut callers: Vec<(&Definition, Vec<Range>)> = Vec::new();
+    let mut caller_ids: FxHashMap<&str, usize> = FxHashMap::default();
 
-    for reference in index.references(symbol).iter().take(CALL_HIERARCHY_LIMIT) {
+    for reference in index.references(symbol) {
         let Some(caller) = index.enclosing_callable(&reference.path, reference.range) else {
             continue;
         };
@@ -592,14 +595,18 @@ pub fn incoming_calls(
             client_encoding,
             read_file,
         );
-        match callers.iter_mut().find(|(def, _)| def.symbol == caller.symbol) {
-            Some((_, ranges)) => ranges.push(range),
-            None => callers.push((caller, vec![range])),
+        match caller_ids.get(caller.symbol.as_str()).copied() {
+            Some(index) => callers[index].1.push(range),
+            None => {
+                caller_ids.insert(caller.symbol.as_str(), callers.len());
+                callers.push((caller, vec![range]));
+            }
         }
     }
 
     callers
         .into_iter()
+        .take(CALL_HIERARCHY_LIMIT)
         .filter_map(|(def, from_ranges)| {
             Some(lsp_types::CallHierarchyIncomingCall {
                 from: to_call_item(def, workspace_root, client_encoding, read_file)?,
@@ -622,7 +629,7 @@ pub fn outgoing_calls(
     let Some(span) = def.enclosing else { return Vec::new() };
 
     index
-        .references_within(&def.path, span)
+        .references_within_callable(&def.path, span, &def.symbol)
         .into_iter()
         .filter_map(|(referenced, at)| {
             let callee = index.definition(referenced)?;
@@ -816,5 +823,21 @@ mod tests {
         assert_eq!(results.symbols.len(), SEARCH_LIMIT, "the response is capped");
         assert_eq!(results.total, SEARCH_LIMIT + 25, "but the true total is reported");
         assert!(results.outcome().is_truncated());
+    }
+
+    #[test]
+    fn an_empty_open_file_shadows_its_stale_indexed_symbols() {
+        let index = index_with("Empty.java", "Deleted", 0, 0, 7);
+        let results = workspace_symbol_with(
+            &index,
+            &[],
+            &["Empty.java".to_owned()],
+            "Deleted",
+            &root(),
+            ClientEncoding::Utf16,
+            |_| None,
+        );
+        assert_eq!(results.total, 0);
+        assert!(results.symbols.is_empty());
     }
 }

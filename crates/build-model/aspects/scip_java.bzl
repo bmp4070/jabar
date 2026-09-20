@@ -62,7 +62,9 @@ def _scip_java(target, ctx):
         elif src.path.endswith(".srcjar"):
             source_jars.append(src)
 
-    if len(source_files) == 0:
+    # A generated target may consist entirely of source jars. Those still need
+    # to be extracted and indexed; only a target with neither form is empty.
+    if len(source_files) == 0 and len(source_jars) == 0:
         return None
 
     output_dir = []
