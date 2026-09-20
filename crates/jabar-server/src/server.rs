@@ -168,8 +168,11 @@ fn build_index(root: &AbsPath, config: &Config) -> Result<(), String> {
 struct Discovered {
     dir: paths::Utf8PathBuf,
     index: SymbolIndex,
+    shards: Vec<ShardMetadata>,
+    provenance: Option<CacheKey>,
     cache: Option<CacheState>,
     cache_hit: bool,
+    verified: bool,
 }
 
 #[derive(Clone)]
@@ -191,6 +194,54 @@ enum RefreshWork {
     Empty(Vec<ShardMetadata>),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RefreshIntent {
+    /// The current generation is complete; only normal cache reconciliation is needed.
+    Idle,
+    /// Validation failed or watcher events may have been lost. Retry safely.
+    Retry,
+    /// Git confirmed that sources moved. Wait for evidence of a new index build.
+    AwaitingBuild,
+}
+
+fn provenance_is_current(provenance: Option<&CacheKey>, root: Option<&Path>, dir: &Path) -> bool {
+    match (provenance, root) {
+        (Some(key), Some(root)) => key.still_current(root, dir),
+        _ => true,
+    }
+}
+
+fn load_validated_generation(
+    dir: &Path,
+    provenance: Option<&CacheKey>,
+    root: Option<&Path>,
+) -> std::io::Result<symbol_index::ValidatedIndex> {
+    if !provenance_is_current(provenance, root, dir) {
+        return Err(std::io::Error::other("workspace moved before index reload"));
+    }
+    let loaded = SymbolIndex::load_validated(dir)?;
+    if !provenance_is_current(provenance, root, dir) {
+        return Err(std::io::Error::other("workspace moved during index reload"));
+    }
+    Ok(loaded)
+}
+
+fn load_validated_generation_from(
+    dir: &Path,
+    shards: Vec<ShardMetadata>,
+    provenance: Option<&CacheKey>,
+    root: Option<&Path>,
+) -> std::io::Result<symbol_index::ValidatedIndex> {
+    if !provenance_is_current(provenance, root, dir) {
+        return Err(std::io::Error::other("workspace moved before index reload"));
+    }
+    let loaded = SymbolIndex::load_validated_shards(dir, shards)?;
+    if !provenance_is_current(provenance, root, dir) {
+        return Err(std::io::Error::other("workspace moved during index reload"));
+    }
+    Ok(loaded)
+}
+
 fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
     // `bazel-bin` is a symlink into the output base; `symlink_metadata` would
     // see the link rather than the directory, so follow it deliberately.
@@ -204,6 +255,8 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                     return Some(Discovered {
                         dir: dir.as_utf8_path().to_path_buf(),
                         index: hit.index,
+                        shards: hit.shards.clone(),
+                        provenance: Some(key.clone()),
                         cache: Some(CacheState {
                             root: PathBuf::from(root.as_str()),
                             dir: path.to_path_buf(),
@@ -211,54 +264,51 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                             shards: hit.shards,
                         }),
                         cache_hit: true,
+                        verified: false,
                     });
                 }
                 Ok(_) => {}
                 Err(err) => tracing::warn!(%err, "index cache unreadable; loading shards"),
             }
         }
-        match SymbolIndex::scan_shards(path) {
-            Ok(shards) => {
-                let loaded = SymbolIndex::load_shards(path, &shards);
-                let complete = loaded.failed.is_empty();
-                if !complete {
-                    tracing::warn!(
-                        failed = loaded.failed.len(),
-                        "some SCIP shards could not be loaded; serving a partial, unverified index"
-                    );
-                }
+        match load_validated_generation(path, key.as_ref(), Some(Path::new(root.as_str()))) {
+            Ok(loaded) => {
                 let index = loaded.index;
                 if !index.is_empty() {
-                    let cache = if complete {
-                        key.map(|key| CacheState {
-                            root: PathBuf::from(root.as_str()),
-                            dir: path.to_path_buf(),
-                            key,
-                            shards,
-                        })
-                    } else {
-                        None
-                    };
+                    let cache = key.clone().map(|key| CacheState {
+                        root: PathBuf::from(root.as_str()),
+                        dir: path.to_path_buf(),
+                        key,
+                        shards: loaded.shards.clone(),
+                    });
                     return Some(Discovered {
                         dir: dir.into_utf8_path_buf(),
                         index,
+                        shards: loaded.shards,
+                        provenance: key,
                         cache,
                         cache_hit: false,
+                        verified: true,
                     });
                 }
             }
-            Err(err) => tracing::debug!(%dir, %err, "could not scan shards"),
+            Err(err) => tracing::debug!(%dir, %err, "could not load a complete shard generation"),
         }
     }
     let dir = root.join(".jabar/index");
     if dir.as_utf8_path().is_dir() {
-        match SymbolIndex::from_dir(Path::new(dir.as_str())) {
-            Ok(index) if !index.is_empty() => {
+        let path = Path::new(dir.as_str());
+        let provenance = CacheKey::new(Path::new(root.as_str()), path, config).ok();
+        match load_validated_generation(path, provenance.as_ref(), Some(Path::new(root.as_str()))) {
+            Ok(loaded) if !loaded.index.is_empty() => {
                 return Some(Discovered {
                     dir: dir.into_utf8_path_buf(),
-                    index,
+                    index: loaded.index,
+                    shards: loaded.shards,
+                    provenance,
                     cache: None,
                     cache_hit: false,
+                    verified: true,
                 });
             }
             Ok(_) => tracing::debug!(%dir, "no shards here"),
@@ -295,6 +345,11 @@ pub struct Server {
     /// see `handlers`. Loading is explicit for now: the aspect that produces
     /// shards has to run first, and jabar does not yet run it.
     index: Option<Arc<SymbolIndex>>,
+    /// Manifest for the complete generation backing `index`, independent of
+    /// whether that generation is eligible for the persistent cache.
+    index_shards: Option<Vec<ShardMetadata>>,
+    /// Workspace and output-tree identity captured for the loaded generation.
+    provenance: Option<CacheKey>,
     cache: Option<CacheState>,
     cache_hit: bool,
     shards_verified: bool,
@@ -304,6 +359,7 @@ pub struct Server {
     refresh_revision: u64,
     refresh_running: bool,
     refresh_again: bool,
+    refresh_intent: RefreshIntent,
     refresh_progress: Option<String>,
     telemetry: Telemetry,
     shutdown_requested: bool,
@@ -325,6 +381,8 @@ impl Server {
             vfs: Vfs::default(),
             documents: Documents::default(),
             index: None,
+            index_shards: None,
+            provenance: None,
             cache: None,
             cache_hit: false,
             shards_verified: false,
@@ -334,6 +392,7 @@ impl Server {
             refresh_revision: 0,
             refresh_running: false,
             refresh_again: false,
+            refresh_intent: RefreshIntent::Idle,
             refresh_progress: None,
             config: Config::default(),
             overlay: Overlay::new(),
@@ -386,15 +445,7 @@ impl Server {
                     continue;
                 },
                 recv(refresh_tick) -> _ => {
-                    if self.cache.is_some() {
-                        self.schedule_reconcile(false);
-                    } else if self.index_dir.is_some() {
-                        // Manual and partial startup loads have no cache
-                        // manifest to compare. Retry them periodically so a
-                        // transient unreadable shard can recover without a
-                        // filesystem event.
-                        self.schedule_reload(false);
-                    }
+                    self.on_refresh_tick();
                     continue;
                 },
             };
@@ -431,16 +482,27 @@ impl Server {
         }
     }
 
+    fn on_refresh_tick(&mut self) {
+        // A branch switch makes existing shards suspect until a build changes
+        // them. A timer is not evidence of a build and must not resurrect the
+        // old branch's index.
+        if self.refresh_intent == RefreshIntent::AwaitingBuild {
+            return;
+        }
+        if self.cache.is_some() || self.refresh_intent == RefreshIntent::Retry {
+            self.schedule_index_refresh(false, self.index.is_none());
+        }
+    }
+
     /// Reacts to something changing on disk without loading shards on the loop.
     fn on_file_change(&mut self, change: Change) {
         match change {
             Change::Index => {
                 tracing::info!("shards changed on disk; scheduling an index reload");
-                if self.cache.is_some() {
-                    self.schedule_reconcile(true);
-                } else {
-                    self.schedule_reload(true);
-                }
+                let force =
+                    self.refresh_intent == RefreshIntent::AwaitingBuild || self.index.is_none();
+                self.refresh_intent = RefreshIntent::Retry;
+                self.schedule_index_refresh(true, force);
             }
             Change::Workspace => {
                 // A branch switch invalidates the index without necessarily
@@ -451,70 +513,65 @@ impl Server {
                 self.index = None;
                 self.cache_hit = false;
                 self.shards_verified = false;
+                self.refresh_intent = RefreshIntent::AwaitingBuild;
+                self.refresh_again = false;
                 self.refresh_revision = self.refresh_revision.wrapping_add(1);
                 self.cache_epoch.fetch_add(1, Ordering::SeqCst);
                 if let Some(cache) = &mut self.cache
                     && let Ok(key) = CacheKey::new(&cache.root, &cache.dir, &self.config)
                 {
-                    cache.key = key;
+                    cache.key = key.clone();
+                    self.provenance = Some(key);
+                } else if let (Some(root), Some(dir)) = (&self.workspace_root, &self.index_dir) {
+                    self.provenance = CacheKey::new(
+                        Path::new(root.as_str()),
+                        Path::new(dir.as_str()),
+                        &self.config,
+                    )
+                    .ok();
                 }
                 self.notify_index_stale();
-                if self.cache.is_some() {
-                    self.schedule_reconcile(true);
+            }
+            Change::WatcherError => {
+                tracing::warn!("watcher may have dropped events; validating the current index");
+                if self.refresh_intent == RefreshIntent::AwaitingBuild {
+                    return;
                 }
+                self.shards_verified = false;
+                self.refresh_intent = RefreshIntent::Retry;
+                self.schedule_index_refresh(true, self.index.is_none());
             }
         }
     }
 
-    fn schedule_reconcile(&mut self, changed: bool) {
-        let Some(cache) = self.cache.clone() else { return };
-        self.schedule_refresh(changed, move || {
-            let shards = SymbolIndex::scan_shards(&cache.dir)?;
-            if shards == cache.shards {
-                return Ok(RefreshWork::Unchanged);
-            }
-            if shards.is_empty() {
-                return Ok(RefreshWork::Empty(shards));
-            }
-            let loaded = SymbolIndex::load_shards(&cache.dir, &shards);
-            if SymbolIndex::scan_shards(&cache.dir)? != shards {
-                return Err(std::io::Error::other("shards changed during reload"));
-            }
-            if !loaded.failed.is_empty() {
-                return Err(std::io::Error::other(format!(
-                    "{} SCIP shards could not be loaded",
-                    loaded.failed.len()
-                )));
-            }
-            let index = loaded.index;
-            if index.is_empty() {
-                return Err(std::io::Error::other("no usable SCIP shards after reload"));
-            }
-            Ok(RefreshWork::Loaded(Box::new(index), shards))
-        });
-    }
-
-    fn schedule_reload(&mut self, changed: bool) {
+    fn schedule_index_refresh(&mut self, changed: bool, force: bool) {
         let Some(dir) = self.index_dir.as_ref().map(|dir| PathBuf::from(dir.as_str())) else {
             return;
         };
+        let previous = self.index_shards.clone();
+        let provenance = self.provenance.clone();
+        let root = self.workspace_root.as_ref().map(|root| PathBuf::from(root.as_str()));
         self.schedule_refresh(changed, move || {
-            let shards = SymbolIndex::scan_shards(&dir)?;
-            if shards.is_empty() {
-                return Ok(RefreshWork::Empty(shards));
+            if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
+                return Err(std::io::Error::other("workspace moved before index reload"));
             }
-            let loaded = SymbolIndex::load_shards(&dir, &shards);
-            if !loaded.failed.is_empty() {
-                return Err(std::io::Error::other(format!(
-                    "{} SCIP shards could not be loaded",
-                    loaded.failed.len()
-                )));
+            let shards = SymbolIndex::scan_shards(&dir)?;
+            if !force && previous.as_ref().is_some_and(|previous| *previous == shards) {
+                if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
+                    return Err(std::io::Error::other("workspace moved during index validation"));
+                }
+                return Ok(RefreshWork::Unchanged);
+            }
+            let loaded =
+                load_validated_generation_from(&dir, shards, provenance.as_ref(), root.as_deref())?;
+            if loaded.shards.is_empty() {
+                return Ok(RefreshWork::Empty(loaded.shards));
             }
             let index = loaded.index;
             if index.is_empty() {
                 return Err(std::io::Error::other("no usable SCIP shards after reload"));
             }
-            Ok(RefreshWork::Loaded(Box::new(index), shards))
+            Ok(RefreshWork::Loaded(Box::new(index), loaded.shards))
         });
     }
 
@@ -544,37 +601,27 @@ impl Server {
         self.refresh_running = false;
         let progress = self.refresh_progress.take();
         self.end_progress(progress);
-        if self
-            .cache
-            .as_ref()
-            .is_some_and(|cache| !cache.key.still_current(&cache.root, &cache.dir))
-        {
-            tracing::warn!("workspace or Bazel output tree moved; dropping the old index");
-            self.index = None;
-            self.cache_hit = false;
-            self.shards_verified = false;
-            self.cache_epoch.fetch_add(1, Ordering::SeqCst);
-            self.notify_index_stale();
-            if let Some(cache) = &mut self.cache
-                && let Ok(key) = CacheKey::new(&cache.root, &cache.dir, &self.config)
-            {
-                cache.key = key;
-                self.schedule_reconcile(true);
-            }
-            return;
-        }
         if result.revision == self.refresh_revision {
             match result.result {
-                Ok(RefreshWork::Unchanged) => self.shards_verified = true,
+                Ok(RefreshWork::Unchanged) if self.index.is_some() => {
+                    self.shards_verified = true;
+                    self.refresh_intent = RefreshIntent::Idle;
+                }
+                Ok(RefreshWork::Unchanged) => {
+                    self.shards_verified = false;
+                    self.refresh_intent = RefreshIntent::Retry;
+                }
                 Ok(RefreshWork::Empty(shards)) => {
                     tracing::info!("all indexed shards were removed; clearing the index");
                     self.index = None;
+                    self.index_shards = Some(shards.clone());
                     if let Some(cache) = &mut self.cache {
                         cache.shards = shards;
                         index_cache::invalidate(&cache.root);
                     }
                     self.cache_hit = false;
                     self.shards_verified = true;
+                    self.refresh_intent = RefreshIntent::Idle;
                     self.cache_epoch.fetch_add(1, Ordering::SeqCst);
                     self.notify_index_stale();
                 }
@@ -583,9 +630,11 @@ impl Server {
                     let definitions = index.definition_count();
                     tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
                     self.index = Some(Arc::from(index));
+                    self.index_shards = Some(shards.clone());
+                    self.shards_verified = true;
+                    self.refresh_intent = RefreshIntent::Idle;
                     if let Some(cache) = &mut self.cache {
                         cache.shards = shards;
-                        self.shards_verified = true;
                         self.cache_hit = false;
                         self.write_cache_async();
                     }
@@ -595,16 +644,17 @@ impl Server {
                 }
                 Err(err) => {
                     self.shards_verified = false;
+                    if self.refresh_intent != RefreshIntent::AwaitingBuild {
+                        self.refresh_intent = RefreshIntent::Retry;
+                    }
                     tracing::warn!(%err, "could not reconcile shards; keeping the old index");
                 }
             }
         }
         if self.refresh_again {
             self.refresh_again = false;
-            if self.cache.is_some() {
-                self.schedule_reconcile(false);
-            } else if self.index_dir.is_some() {
-                self.schedule_reload(false);
+            if self.refresh_intent != RefreshIntent::AwaitingBuild {
+                self.schedule_index_refresh(false, self.index.is_none());
             }
         }
     }
@@ -780,6 +830,11 @@ impl Server {
         self.cache = None;
         self.cache_hit = false;
         self.shards_verified = false;
+        self.index_shards = None;
+        self.refresh_intent = RefreshIntent::Retry;
+        self.provenance = self.workspace_root.as_ref().and_then(|root| {
+            CacheKey::new(Path::new(root.as_str()), Path::new(dir.as_str()), &self.config).ok()
+        });
         self.index = Some(Arc::new(index));
         self.start_watching(Some(dir.as_str()));
         self.index_dir = Some(dir);
@@ -789,7 +844,11 @@ impl Server {
         self.refresh_revision = self.refresh_revision.wrapping_add(1);
         self.cache = discovered.cache;
         self.cache_hit = discovered.cache_hit;
-        self.shards_verified = false;
+        self.shards_verified = discovered.verified;
+        self.index_shards = Some(discovered.shards);
+        self.provenance = discovered.provenance;
+        self.refresh_intent =
+            if discovered.verified { RefreshIntent::Idle } else { RefreshIntent::Retry };
         self.index = Some(Arc::new(discovered.index));
         // Watching millions of bazel-bin entries recursively can itself stall
         // startup. Cached indexes reconcile in a worker instead.
@@ -797,7 +856,7 @@ impl Server {
         self.start_watching(watch_dir);
         self.index_dir = Some(discovered.dir);
         if self.cache_hit {
-            self.schedule_reconcile(false);
+            self.schedule_index_refresh(false, false);
         } else if self.cache.is_some() {
             self.write_cache_async();
         }
@@ -839,25 +898,19 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
         let path = std::path::Path::new(&params.path);
-        let shards = SymbolIndex::scan_shards(path).map_err(|err| {
-            guard_failed(&mut guard);
-            RequestError::new(
-                ErrorCode::InvalidParams,
-                format!("could not read `{}`: {err}", params.path),
-            )
-        })?;
-        let loaded = SymbolIndex::load_shards(path, &shards);
-        if !loaded.failed.is_empty() {
-            guard_failed(&mut guard);
-            return Err(RequestError::new(
-                ErrorCode::InternalError,
-                format!(
-                    "refusing to replace the index because {} SCIP shards could not be loaded",
-                    loaded.failed.len()
-                ),
-            ));
-        }
+        let root = self.workspace_root.as_ref().map(|root| PathBuf::from(root.as_str()));
+        let provenance =
+            root.as_deref().and_then(|root| CacheKey::new(root, path, &self.config).ok());
+        let loaded = load_validated_generation(path, provenance.as_ref(), root.as_deref())
+            .map_err(|err| {
+                guard_failed(&mut guard);
+                RequestError::new(
+                    ErrorCode::InvalidParams,
+                    format!("could not load a complete index from `{}`: {err}", params.path),
+                )
+            })?;
         let index = loaded.index;
+        let manifest = loaded.shards;
 
         let (shards, definitions) = (index.shard_count(), index.definition_count());
         guard.finish(if definitions == 0 {
@@ -872,7 +925,10 @@ impl Server {
         self.cache = None;
         self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.cache_hit = false;
-        self.shards_verified = false;
+        self.shards_verified = true;
+        self.index_shards = Some(manifest);
+        self.provenance = provenance;
+        self.refresh_intent = RefreshIntent::Idle;
         self.index_dir = Some(paths::Utf8PathBuf::from(params.path.clone()));
         self.start_watching(Some(&params.path));
         // The capability was not advertised at initialize, because there was
@@ -1463,8 +1519,12 @@ impl Server {
             watching: self.watcher.is_some(),
             index_cache_loaded: self.cache_hit,
             shards_verified: self.shards_verified,
-            shard_refresh_mode: if self.cache.is_some() {
+            shard_refresh_mode: if self.refresh_intent == RefreshIntent::AwaitingBuild {
+                "awaiting-build"
+            } else if self.cache.is_some() {
                 "periodic"
+            } else if self.refresh_intent == RefreshIntent::Retry {
+                "retry"
             } else if self.watcher.is_some() {
                 "watch"
             } else {
@@ -1597,6 +1657,66 @@ mod startup_cache_tests {
         server.schedule_refresh(true, || Ok(RefreshWork::Unchanged));
         assert_eq!(server.refresh_revision, 8);
         assert!(server.refresh_again);
+    }
+
+    #[test]
+    fn a_complete_uncached_index_is_not_reloaded_on_a_timer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = server();
+        server.index = Some(Arc::new(test_index()));
+        server.index_dir = Some(paths::Utf8PathBuf::from(temp.path().to_str().unwrap().to_owned()));
+        server.index_shards = Some(Vec::new());
+        server.shards_verified = true;
+        server.refresh_intent = RefreshIntent::Idle;
+
+        server.on_refresh_tick();
+
+        assert!(!server.refresh_running);
+        assert!(server.index.is_some());
+    }
+
+    #[test]
+    fn workspace_movement_waits_for_a_new_shard_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = server();
+        server.index = Some(Arc::new(test_index()));
+        server.index_dir = Some(paths::Utf8PathBuf::from(temp.path().to_str().unwrap().to_owned()));
+        server.index_shards = Some(Vec::new());
+        server.shards_verified = true;
+
+        server.on_file_change(Change::Workspace);
+        assert!(server.index.is_none());
+        assert_eq!(server.refresh_intent, RefreshIntent::AwaitingBuild);
+
+        server.on_refresh_tick();
+        assert!(!server.refresh_running, "a timer is not evidence of a new build");
+        server.on_file_change(Change::WatcherError);
+        assert!(!server.refresh_running, "watcher uncertainty is not evidence of a new build");
+        assert_eq!(server.refresh_intent, RefreshIntent::AwaitingBuild);
+
+        server.on_file_change(Change::Index);
+        assert!(server.refresh_running, "a shard event permits a validated reload");
+        assert_eq!(server.refresh_intent, RefreshIntent::Retry);
+    }
+
+    #[test]
+    fn a_watcher_error_validates_and_keeps_an_unchanged_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = server();
+        server.index = Some(Arc::new(test_index()));
+        server.index_dir = Some(paths::Utf8PathBuf::from(temp.path().to_str().unwrap().to_owned()));
+        server.index_shards = Some(Vec::new());
+        server.shards_verified = true;
+
+        server.on_file_change(Change::WatcherError);
+        assert!(server.index.is_some(), "uncertainty must not discard a healthy index");
+        assert!(!server.shards_verified);
+
+        let result = server.refresh_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_refresh_result(result);
+        assert!(server.index.is_some());
+        assert!(server.shards_verified);
+        assert_eq!(server.refresh_intent, RefreshIntent::Idle);
     }
 
     #[test]

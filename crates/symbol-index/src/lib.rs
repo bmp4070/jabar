@@ -25,7 +25,7 @@
 //! honestly, that test is what will notice.
 
 use std::collections::BinaryHeap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -219,17 +219,21 @@ pub struct ShardLoad {
     pub failed: Vec<PathBuf>,
 }
 
+/// One complete, internally consistent generation of SCIP shards.
+pub struct ValidatedIndex {
+    pub index: SymbolIndex,
+    pub shards: Vec<ShardMetadata>,
+}
+
 impl SymbolIndex {
     /// Reads aggregated `*.scip` shards under `dir`, recursively.
     /// Intermediate targetroot directories contain per-source shards already
     /// included in their sibling target shard, so they must be skipped.
     ///
-    /// Shards that fail to parse are logged and skipped rather than failing the
-    /// load: one corrupt shard should cost its own target's symbols, not the
-    /// whole index.
+    /// A corrupt, unreadable, or concurrently rewritten shard rejects the load
+    /// so a caller with an older complete index can keep serving it.
     pub fn from_dir(dir: &Path) -> std::io::Result<SymbolIndex> {
-        let shards = Self::scan_shards(dir)?;
-        Ok(Self::from_shards(dir, &shards))
+        Ok(Self::load_validated(dir)?.index)
     }
 
     /// Walks the tree without reading or decoding shard contents.
@@ -237,10 +241,11 @@ impl SymbolIndex {
         let mut shards = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
-            for entry in std::fs::read_dir(&current)?.flatten() {
+            for entry in std::fs::read_dir(&current)? {
+                let entry = entry?;
                 let path = entry.path();
                 // Do not follow directory symlinks into Bazel output loops.
-                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                let meta = std::fs::symlink_metadata(&path)?;
                 if meta.is_dir() {
                     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
                     if !name.ends_with(".scip-targetroot") && !name.ends_with(".semanticdb") {
@@ -249,23 +254,23 @@ impl SymbolIndex {
                 } else if path.extension().is_some_and(|e| e == "scip") {
                     // Follow file symlinks: the loader reads their targets, so
                     // the metadata must describe those same bytes.
-                    let Ok(meta) = std::fs::metadata(&path) else { continue };
+                    let meta = std::fs::metadata(&path)?;
                     if !meta.is_file() {
                         continue;
                     }
                     let modified_ns = meta
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
-                        .unwrap_or(0);
-                    if let Ok(relative) = path.strip_prefix(dir) {
-                        shards.push(ShardMetadata {
-                            path: relative.to_path_buf(),
-                            len: meta.len(),
-                            modified_ns,
-                        });
-                    }
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(io::Error::other)
+                        .and_then(|duration| {
+                            u64::try_from(duration.as_nanos()).map_err(io::Error::other)
+                        })?;
+                    let relative = path.strip_prefix(dir).map_err(io::Error::other)?;
+                    shards.push(ShardMetadata {
+                        path: relative.to_path_buf(),
+                        len: meta.len(),
+                        modified_ns,
+                    });
                 }
             }
         }
@@ -273,7 +278,52 @@ impl SymbolIndex {
         Ok(shards)
     }
 
+    /// Scans and decodes exactly one complete shard generation.
+    ///
+    /// The second scan detects a build rewriting the output tree while shards
+    /// are being decoded. Any scan, read, parse, or consistency failure rejects
+    /// the whole generation so callers can retain the previous index.
+    pub fn load_validated(dir: &Path) -> io::Result<ValidatedIndex> {
+        let shards = Self::scan_shards(dir)?;
+        Self::load_validated_shards(dir, shards)
+    }
+
+    /// Decodes a clean scan result and verifies that it did not change.
+    ///
+    /// Refresh workers use this after comparing the initial scan with their
+    /// previous generation, avoiding a redundant third walk of a large output
+    /// tree when a reload is required.
+    pub fn load_validated_shards(
+        dir: &Path,
+        shards: Vec<ShardMetadata>,
+    ) -> io::Result<ValidatedIndex> {
+        Self::load_validated_shards_with(dir, shards, || {})
+    }
+
+    fn load_validated_shards_with(
+        dir: &Path,
+        shards: Vec<ShardMetadata>,
+        after_decode: impl FnOnce(),
+    ) -> io::Result<ValidatedIndex> {
+        let loaded = Self::load_shards(dir, &shards);
+        if !loaded.failed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} SCIP shards could not be loaded", loaded.failed.len()),
+            ));
+        }
+        after_decode();
+        if Self::scan_shards(dir)? != shards {
+            return Err(io::Error::other("SCIP shards changed while they were being loaded"));
+        }
+        Ok(ValidatedIndex { index: loaded.index, shards })
+    }
+
     /// Reads a previously discovered shard list without walking the tree again.
+    ///
+    /// This low-level compatibility API may return a partial index. Server and
+    /// cache paths should use [`Self::load_validated`] or
+    /// [`Self::load_validated_shards`] instead.
     pub fn from_shards(dir: &Path, shards: &[ShardMetadata]) -> SymbolIndex {
         Self::load_shards(dir, shards).index
     }
@@ -819,7 +869,8 @@ mod tests {
 
     #[test]
     fn an_unparseable_shard_is_skipped_not_fatal() {
-        // One corrupt shard should cost its own target's symbols, not the index.
+        // The low-level decoder reports failure without retaining a malformed
+        // shard. Complete-generation callers reject the encompassing load.
         let mut index = SymbolIndex::default();
         assert!(!index.add_shard(b"this is not protobuf at all", "corrupt.scip"));
         assert!(index.is_empty());
@@ -841,6 +892,16 @@ mod tests {
         let loaded = SymbolIndex::load_shards(dir.path(), &shards);
         assert_eq!(loaded.index.shard_count(), 1);
         assert_eq!(loaded.failed, [PathBuf::from("bad.scip"), PathBuf::from("missing.scip")]);
+    }
+
+    #[test]
+    fn a_validated_generation_rejects_a_partial_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.scip"), Index::new().write_to_bytes().unwrap())
+            .unwrap();
+        std::fs::write(dir.path().join("bad.scip"), b"not protobuf").unwrap();
+
+        assert!(SymbolIndex::load_validated(dir.path()).is_err());
     }
 
     #[test]
@@ -874,6 +935,31 @@ mod tests {
         let after = SymbolIndex::scan_shards(dir.path()).unwrap();
         assert_eq!(after[0].len, 12);
         assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_shard_symlink_makes_the_scan_incomplete() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        symlink(dir.path().join("missing"), dir.path().join("broken.scip")).unwrap();
+
+        assert!(SymbolIndex::scan_shards(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_generation_changed_after_decode_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("target.scip");
+        std::fs::write(&shard, Index::new().write_to_bytes().unwrap()).unwrap();
+
+        let shards = SymbolIndex::scan_shards(dir.path()).unwrap();
+        let result = SymbolIndex::load_validated_shards_with(dir.path(), shards, || {
+            std::fs::write(&shard, b"a different generation").unwrap();
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]

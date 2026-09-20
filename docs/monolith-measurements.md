@@ -126,7 +126,8 @@ events and show the result with and without them.
 
 ## Refresh and responsiveness workloads
 
-Begin from a cache hit and run each scenario at least ten times:
+Run each scenario at least ten times. Begin scenarios 1–8 from a cache hit;
+scenario 9 explicitly uses a complete uncached/manual index:
 
 1. An unchanged periodic reconciliation.
 2. One modified shard with the same HEAD.
@@ -135,6 +136,12 @@ Begin from a cache hit and run each scenario at least ten times:
 5. A branch/HEAD change while reconciliation is running.
 6. Two shard notifications while a reload is already running.
 7. A corrupt shard and a corrupt cache generation.
+8. An injected watcher overflow/error with unchanged HEAD and shards; verify the
+   current index remains queryable while it moves from unverified back to
+   verified.
+9. A branch/HEAD change with an uncached index; wait through at least one
+   periodic interval and verify old shards are not reloaded until a subsequent
+   shard event supplies evidence of a new build.
 
 While each scenario runs, use an open-loop client to schedule a lightweight
 `jabar/status` request every 50ms, a fixed definition request every second, and a

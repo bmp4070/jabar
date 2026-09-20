@@ -59,6 +59,9 @@ pub enum Change {
     /// Coarse by design: it means everything may be stale, not that any
     /// particular file changed.
     Workspace,
+    /// The watcher may have dropped events, so existing state must be checked.
+    /// This is uncertainty, not evidence that the workspace actually moved.
+    WatcherError,
 }
 
 /// Watches the narrow set of paths that matter, and reports coalesced changes.
@@ -97,12 +100,10 @@ impl FileWatcher {
                     for error in errors {
                         tracing::warn!(%error, "file watch error; the index may go stale");
                     }
-                    // The backend cannot tell us which event was lost. Drop
-                    // provenance first and then request an index reload; the
-                    // server will keep serving only if it can re-establish a
-                    // current index.
-                    let _ = sink.send(Change::Workspace);
-                    let _ = sink.send(Change::Index);
+                    // The backend cannot tell us which event was lost. Ask the
+                    // server to validate provenance and shards while retaining
+                    // its last known-good index.
+                    let _ = sink.send(Change::WatcherError);
                 }
             })?;
 
@@ -177,6 +178,7 @@ fn dispatch<'a>(
         match classify(path, git_dir) {
             Some(Change::Index) => index = true,
             Some(Change::Workspace) => workspace = true,
+            Some(Change::WatcherError) => unreachable!("paths never represent watcher errors"),
             None => {}
         }
     }
