@@ -114,10 +114,13 @@ fn collect(
     let symbol_kind = match kind {
         "class_declaration" => Some(SymbolKind::Class),
         "interface_declaration" => Some(SymbolKind::Interface),
+        // Java annotations are interfaces with a distinct declaration syntax.
+        "annotation_type_declaration" => Some(SymbolKind::Interface),
         "enum_declaration" => Some(SymbolKind::Enum),
         // A record is a class as far as any client is concerned.
         "record_declaration" => Some(SymbolKind::Class),
         "method_declaration" => Some(SymbolKind::Method),
+        "annotation_type_element_declaration" => Some(SymbolKind::Method),
         "constructor_declaration" => Some(SymbolKind::Constructor),
         "enum_constant" => Some(SymbolKind::Field),
         _ => None,
@@ -234,6 +237,21 @@ mod tests {
         // An enum constant is a member, and a record is a class to any client.
         assert!(kinds.contains(&SymbolKind::Field));
         assert_eq!(*kinds.last().unwrap(), SymbolKind::Class);
+    }
+
+    #[test]
+    fn annotations_and_their_elements_are_declarations() {
+        let defs = parse(
+            "public @interface Marker {\n\
+               String value();\n\
+               int count() default 1;\n\
+             }\n",
+        );
+
+        assert_eq!(names(&defs), ["Marker", "value", "count"]);
+        assert_eq!(defs[0].kind, SymbolKind::Interface);
+        assert_eq!(defs[1].kind, SymbolKind::Method);
+        assert!(defs[1].symbol.ends_with("#Marker.value"));
     }
 
     #[test]
