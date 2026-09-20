@@ -98,6 +98,18 @@ impl BazelCli {
         &self.workspace_root
     }
 
+    /// The output directory Bazel reports for binary outputs.
+    ///
+    /// Asking the configured invocation matters when `output_base` is set: the
+    /// workspace `bazel-bin` convenience symlink may point at a different Bazel
+    /// server's output tree.
+    pub fn bazel_bin(&self) -> Result<AbsPathBuf, BazelError> {
+        let stdout = self.run(&["info", "bazel-bin", "--noshow_progress"])?;
+        let path = stdout.trim();
+        AbsPathBuf::try_from(path)
+            .map_err(|_| BazelError::InvalidOutputPath { path: path.to_owned() })
+    }
+
     /// The Bazel package containing `file`, as a workspace-relative path.
     ///
     /// Returns `None` when no ancestor up to the workspace root declares a
@@ -254,6 +266,10 @@ pub enum BazelError {
     },
     /// Bazel printed something that was not UTF-8.
     NonUtf8Output,
+    /// `bazel info` returned an empty or relative output path.
+    InvalidOutputPath {
+        path: String,
+    },
     BadLabel {
         label: String,
         source: crate::LabelError,
@@ -280,6 +296,9 @@ impl std::fmt::Display for BazelError {
                 write!(f, "`bazel {}` exited {code}: {stderr}", args.join(" "))
             }
             BazelError::NonUtf8Output => f.write_str("bazel produced non-UTF-8 output"),
+            BazelError::InvalidOutputPath { path } => {
+                write!(f, "bazel returned a non-absolute output path `{path}`")
+            }
             BazelError::BadLabel { label, source } => {
                 write!(f, "bazel returned an unparseable label `{label}`: {source}")
             }

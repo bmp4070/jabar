@@ -244,17 +244,14 @@ fn load_validated_generation_from(
 }
 
 fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
-    // `bazel-bin` is a symlink into the output base; `symlink_metadata` would
-    // see the link rather than the directory, so follow it deliberately.
-    let dir = root.join("bazel-bin");
-    if dir.as_utf8_path().is_dir() {
+    if let Some(dir) = bazel_index_dir(root, config) {
         let path = Path::new(dir.as_str());
         let key = CacheKey::new(Path::new(root.as_str()), path, config).ok();
         if let Some(key) = &key {
             match index_cache::load(Path::new(root.as_str()), key) {
                 Ok(Some(hit)) if !hit.index.is_empty() => {
                     return Some(Discovered {
-                        dir: dir.as_utf8_path().to_path_buf(),
+                        dir: dir.clone(),
                         index: hit.index,
                         shards: hit.shards.clone(),
                         provenance: Some(key.clone()),
@@ -283,7 +280,7 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                         shards: loaded.shards.clone(),
                     });
                     return Some(Discovered {
-                        dir: dir.into_utf8_path_buf(),
+                        dir,
                         index,
                         shards: loaded.shards,
                         provenance: key,
@@ -317,6 +314,43 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
         }
     }
     None
+}
+
+/// Resolves and pins the Bazel output tree used by this configuration.
+///
+/// With an explicit output base, the workspace convenience symlink is shared
+/// mutable state: any other Bazel invocation can repoint it. Querying the exact
+/// configured invocation avoids loading another server's outputs. The default
+/// path is canonicalized for the same reason, so later symlink changes cannot
+/// redirect refreshes or the watcher after startup.
+fn bazel_index_dir(root: &AbsPath, config: &Config) -> Option<paths::Utf8PathBuf> {
+    let candidate = if config.output_base.is_some() {
+        let bazel = BazelCli::new(root.to_path_buf())
+            .with_program(config.bazel.clone().unwrap_or_else(|| "bazel".to_owned()))
+            .with_output_base(config.output_base.clone());
+        match bazel.bazel_bin() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::debug!(%err, "could not resolve the configured bazel-bin");
+                return None;
+            }
+        }
+    } else {
+        root.join("bazel-bin")
+    };
+
+    match std::fs::canonicalize(candidate.as_str()).and_then(|path| {
+        paths::Utf8PathBuf::from_path_buf(path).map_err(|path| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, path.display().to_string())
+        })
+    }) {
+        Ok(dir) if dir.is_dir() => Some(dir),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::debug!(path = %candidate, %err, "bazel output directory is unavailable");
+            None
+        }
+    }
 }
 
 pub struct Server {
@@ -1670,6 +1704,7 @@ pub struct Status {
 #[cfg(test)]
 mod startup_cache_tests {
     use super::*;
+    use protobuf::Message as _;
     use symbol_index::{Definition, PositionEncoding as IndexEncoding, Range, SymbolKind};
 
     fn test_index() -> SymbolIndex {
@@ -1698,6 +1733,90 @@ mod startup_cache_tests {
         let (connection, _client) = Connection::memory();
         let root = AbsPathBuf::try_from(root.to_str().expect("UTF-8 test path")).unwrap();
         Server::new(connection.sender, PositionEncoding::Utf16, Some(root))
+    }
+
+    fn write_class_shard(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let symbol = format!("semanticdb maven . . example/{name}#");
+
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 6, 6 + i32::try_from(name.len()).unwrap()];
+        occurrence.symbol = symbol.clone();
+        occurrence.symbol_roles = scip::types::SymbolRole::Definition as i32;
+
+        let mut information = scip::types::SymbolInformation::new();
+        information.symbol = symbol;
+        information.display_name = name.to_owned();
+        information.kind = scip::types::symbol_information::Kind::Class.into();
+
+        let mut document = scip::types::Document::new();
+        document.language = "java".to_owned();
+        document.relative_path = format!("src/{name}.java");
+        document.occurrences.push(occurrence);
+        document.symbols.push(information);
+
+        let mut index = scip::types::Index::new();
+        index.documents.push(document);
+        std::fs::write(dir.join("target.scip"), index.write_to_bytes().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_output_base_ignores_a_misleading_workspace_symlink() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let configured_base = temp.path().join("configured-base");
+        let configured_bin = configured_base.join("execroot/main/bazel-out/fastbuild/bin");
+        let other_bin = temp.path().join("other-base/execroot/main/bazel-out/fastbuild/bin");
+        std::fs::create_dir(&root).unwrap();
+        write_class_shard(&configured_bin, "ConfiguredSymbol");
+        write_class_shard(&other_bin, "WrongSymbol");
+        symlink(&other_bin, root.join("bazel-bin")).unwrap();
+
+        let fake_bazel = temp.path().join("bazel");
+        std::fs::write(
+            &fake_bazel,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = '--output_base={}' ] || exit 41\n\
+                 [ \"$2\" = 'info' ] || exit 42\n\
+                 [ \"$3\" = 'bazel-bin' ] || exit 43\n\
+                 printf '%s\\n' '{}'\n",
+                configured_base.display(),
+                configured_bin.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_bazel).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_bazel, permissions).unwrap();
+
+        let config = Config {
+            output_base: Some(paths::Utf8PathBuf::from_path_buf(configured_base.clone()).unwrap()),
+            bazel: Some(fake_bazel.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let root = AbsPath::try_new(paths::Utf8Path::from_path(&root).unwrap()).unwrap();
+
+        let discovered = discover_index(root, &config).expect("configured index");
+
+        assert_eq!(discovered.index.search("ConfiguredSymbol").len(), 1);
+        assert!(discovered.index.search("WrongSymbol").is_empty());
+        assert_eq!(
+            Path::new(discovered.dir.as_str()),
+            std::fs::canonicalize(configured_bin).unwrap()
+        );
+
+        std::fs::remove_file(
+            configured_base.join("execroot/main/bazel-out/fastbuild/bin/target.scip"),
+        )
+        .unwrap();
+        assert!(
+            discover_index(root, &config).is_none(),
+            "shards in the other base must not suppress indexing the configured base"
+        );
     }
 
     #[test]

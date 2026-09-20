@@ -43,6 +43,13 @@ fn which_bazel() -> Option<()> {
     std::env::split_paths(&path).find_map(|dir| dir.join("bazel").is_file().then_some(()))
 }
 
+#[test]
+fn reports_bazel_bin_as_an_absolute_directory() {
+    let Some(cli) = fixture_cli() else { return };
+    let dir = cli.bazel_bin().expect("bazel info should report bazel-bin");
+    assert!(dir.as_utf8_path().is_dir(), "reported output directory should exist: {dir}");
+}
+
 fn fixture_file(cli: &BazelCli, relative: &str) -> AbsPathBuf {
     cli.workspace_root().join(relative)
 }

@@ -35,9 +35,11 @@ separate base removes that.
 The cost is real: a second analysis universe and a second set of outputs.
 Gerrit's is several GB, and the first build against it is a full cold analysis.
 
-Bazel repoints `bazel-bin` at the selected output base during the build. The
-current upstream aspect writes inside Bazel's execroot, so a prior build is not
-required to establish that symlink.
+For a configured base, Jabar asks that exact Bazel invocation for its
+`bazel-bin` directory and pins the physical path. It does not follow the
+workspace `bazel-bin` symlink, because another Bazel invocation may have
+repointed that symlink at a different output base. Discovery, cache validation,
+and watching all use the pinned directory.
 
 ## `index.auto` — off by default
 
