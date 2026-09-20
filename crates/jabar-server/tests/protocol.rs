@@ -216,6 +216,8 @@ fn text_sync_reaches_the_vfs() {
     assert_eq!(after["openDocuments"], json!(1));
     assert_eq!(after["vfsFiles"], json!(1));
     assert_eq!(after["vfsRevision"], json!(1), "the open should have advanced the revision");
+    assert_eq!(after["pendingChanges"], json!(false), "unused VFS payloads are drained");
+    assert_eq!(after["staleDocuments"], json!(1));
     harness.shutdown();
 }
 
@@ -237,6 +239,8 @@ fn incremental_edits_are_applied_in_order() {
     );
     let status = harness.status();
     assert_eq!(status["vfsRevision"], json!(2), "the edit changed the content");
+    assert_eq!(status["pendingChanges"], json!(false));
+    assert_eq!(status["staleDocuments"], json!(1));
     harness.shutdown();
 }
 

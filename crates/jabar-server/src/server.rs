@@ -20,6 +20,7 @@ use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response
 use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
 use paths::{AbsPath, AbsPathBuf};
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use telemetry::Telemetry;
 use vfs::{Vfs, VfsPath};
@@ -326,6 +327,11 @@ pub struct Server {
     build: Option<BazelCli>,
     vfs: Vfs,
     documents: Documents,
+    /// Files whose current source has not been incorporated into `index`.
+    ///
+    /// This survives save and close. Disk and editor agreement only means the
+    /// save completed; it does not mean the SCIP aspect rebuilt the file.
+    stale_documents: FxHashSet<VfsPath>,
     /// What the client asked for at startup.
     config: Config,
     /// Parses open files the index cannot see yet.
@@ -380,6 +386,7 @@ impl Server {
             build,
             vfs: Vfs::default(),
             documents: Documents::default(),
+            stale_documents: FxHashSet::default(),
             index: None,
             index_shards: None,
             provenance: None,
@@ -630,6 +637,7 @@ impl Server {
                     let definitions = index.definition_count();
                     tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
                     self.index = Some(Arc::from(index));
+                    self.refresh_document_freshness();
                     self.index_shards = Some(shards.clone());
                     self.shards_verified = true;
                     self.refresh_intent = RefreshIntent::Idle;
@@ -836,6 +844,7 @@ impl Server {
             CacheKey::new(Path::new(root.as_str()), Path::new(dir.as_str()), &self.config).ok()
         });
         self.index = Some(Arc::new(index));
+        self.refresh_document_freshness();
         self.start_watching(Some(dir.as_str()));
         self.index_dir = Some(dir);
     }
@@ -850,6 +859,7 @@ impl Server {
         self.refresh_intent =
             if discovered.verified { RefreshIntent::Idle } else { RefreshIntent::Retry };
         self.index = Some(Arc::new(discovered.index));
+        self.refresh_document_freshness();
         // Watching millions of bazel-bin entries recursively can itself stall
         // startup. Cached indexes reconcile in a worker instead.
         let watch_dir = self.cache.is_none().then_some(discovered.dir.as_str());
@@ -922,6 +932,7 @@ impl Server {
         tracing::info!(shards, definitions, path = %params.path, "index loaded");
         self.refresh_revision = self.refresh_revision.wrapping_add(1);
         self.index = Some(Arc::new(index));
+        self.refresh_document_freshness();
         self.cache = None;
         self.cache_epoch.fetch_add(1, Ordering::SeqCst);
         self.cache_hit = false;
@@ -961,21 +972,42 @@ impl Server {
         }
         let root = self.workspace_root.clone().expect("just checked");
 
-        // Parse every open file that differs from disk, so a symbol written
-        // seconds ago is findable. Bounded by what the client has open, which
-        // is a handful of files, not the repo.
-        let dirty: Vec<(String, String)> = self
-            .documents
-            .iter()
-            .filter_map(|(path, doc)| {
-                let abs = path.as_real()?;
+        // Parse every open file and every saved file known to be newer than the
+        // index, so a symbol written seconds ago is findable. This stays bounded
+        // by files edited during the session rather than the size of the repo.
+        let mut shadowed_set = FxHashSet::default();
+        let mut current_sources: Vec<(String, String)> = Vec::new();
+        for (path, document) in self.documents.iter() {
+            let Some(relative) = path
+                .as_real()
+                .and_then(|abs| abs.strip_prefix(&root))
+                .map(|path| path.as_str().to_owned())
+            else {
+                continue;
+            };
+            shadowed_set.insert(relative.clone());
+            current_sources.push((relative, document.text.clone()));
+        }
+        // Saved and closed files can still be newer than the index. Parse their
+        // disk contents rather than reviving stale indexed declarations.
+        for path in &self.stale_documents {
+            let Some((relative, abs)) = path.as_real().and_then(|abs| {
                 let relative = abs.strip_prefix(&root)?.as_str().to_owned();
-                Some((relative, doc.text.clone()))
-            })
+                Some((relative, abs))
+            }) else {
+                continue;
+            };
+            if shadowed_set.insert(relative.clone())
+                && let Ok(text) = std::fs::read_to_string(abs.as_str())
+            {
+                current_sources.push((relative, text));
+            }
+        }
+        let live: Vec<symbol_index::Definition> = current_sources
+            .iter()
+            .flat_map(|(path, text)| self.overlay.parse(path, text))
             .collect();
-        let live: Vec<symbol_index::Definition> =
-            dirty.iter().flat_map(|(relative, text)| self.overlay.parse(relative, text)).collect();
-        let shadowed: Vec<String> = dirty.into_iter().map(|(relative, _)| relative).collect();
+        let shadowed: Vec<String> = shadowed_set.into_iter().collect();
 
         let index = self.index.as_ref().expect("resolve_query established there is one");
         let read = file_reader(&self.documents, &root);
@@ -1003,12 +1035,12 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::GoToDefinition);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
             let err = self.refuse(&mut guard, &doc.text_document.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         let position =
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
@@ -1022,10 +1054,9 @@ impl Server {
             None => {
                 // Nothing at that position, or a symbol this index does not
                 // define -- a JDK or third-party type in a jar no shard covers.
-                // Both are an honest "no match" *unless* the file has been
-                // edited since the last build, in which case the truthful
-                // answer is that the index predates what the client wrote.
-                guard.finish(empty_reason(self.is_dirty(&relative, root)));
+                // Dirty documents were refused before lookup, so this is a
+                // truthful absence in the generation being queried.
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
                 Ok(serde_json::Value::Null)
             }
         }
@@ -1042,12 +1073,12 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::FindReferences);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
             let err = self.refuse(&mut guard, &doc.text_document.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         let position =
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
@@ -1074,7 +1105,7 @@ impl Server {
                 ReferenceReply::new(&results.symbol, results.locations, results.total)?
             }
             None => {
-                guard.finish(empty_reason(self.is_dirty(&relative, root)));
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
                 ReferenceReply::new("", Vec::new(), 0)?
             }
         };
@@ -1088,12 +1119,12 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::Hover);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
             let err = self.refuse(&mut guard, &doc.text_document.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         let position =
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
@@ -1104,7 +1135,7 @@ impl Server {
                 Ok(serde_json::to_value(hover)?)
             }
             None => {
-                guard.finish(empty_reason(self.is_dirty(&relative, root)));
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
                 Ok(serde_json::Value::Null)
             }
         }
@@ -1121,12 +1152,12 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::GoToImplementation);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
             let err = self.refuse(&mut guard, &doc.text_document.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         let position =
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
@@ -1155,7 +1186,6 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::DocumentSymbol);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         // Resolve to owned values first: parsing needs `&mut self`, and a
         // borrow of the index would still be alive otherwise.
@@ -1171,9 +1201,21 @@ impl Server {
         // describes the tree as of the last build. Parsing what the client
         // holds is both more current and the only way to see a file that was
         // never built.
-        let live_text =
-            self.documents.get(&VfsPath::Real(root.join(&relative))).map(|doc| doc.text.clone());
-        let live = live_text.map(|text| self.overlay.parse(&relative, &text));
+        let path = VfsPath::Real(root.join(&relative));
+        let live_text = self.documents.get(&path).map(|doc| doc.text.clone());
+        let live = if let Some(text) = live_text {
+            Some(self.overlay.parse(&relative, &text))
+        } else if self.stale_documents.contains(&path) {
+            // A saved, closed file remains newer than the index. Failure to
+            // read it still shadows old declarations rather than reviving them.
+            Some(
+                std::fs::read_to_string(root.join(&relative).as_str())
+                    .map(|text| self.overlay.parse(&relative, &text))
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
 
         let index = self.index.as_ref().expect("resolve_query established there is one");
         let read = file_reader(&self.documents, &root);
@@ -1199,22 +1241,44 @@ impl Server {
         Ok(serde_json::to_value(lsp_types::DocumentSymbolResponse::Nested(symbols))?)
     }
 
-    /// Whether an open file has content the index cannot have seen.
-    ///
-    /// Used to distinguish "no such symbol" from "the index predates what you
-    /// just wrote", which are the same empty answer on the wire and very
-    /// different claims.
-    fn is_dirty(&self, relative: &str, root: &AbsPathBuf) -> bool {
+    /// Refuses a positional query when its coordinates refer to newer source.
+    fn require_current_document(
+        &self,
+        guard: &mut telemetry::InFlight<'_>,
+        relative: &str,
+        root: &AbsPathBuf,
+    ) -> Result<(), RequestError> {
         let path = VfsPath::Real(root.join(relative));
-        let Some(doc) = self.documents.get(&path) else { return false };
-        // Cheap and sufficient: if the buffer differs from disk, the index --
-        // built from disk -- cannot describe it. Equal content may still be
-        // newer than the last build, which `Change::Index` handles separately.
-        match std::fs::read_to_string(root.join(relative).as_str()) {
-            Ok(on_disk) => on_disk != doc.text,
-            // Never written, so certainly not built.
-            Err(_) => true,
+        if !self.stale_documents.contains(&path) {
+            return Ok(());
         }
+
+        guard.mark_stale(true);
+        guard.mark_failed(telemetry::Failure::IndexUnavailable);
+        Err(RequestError::new(
+            ErrorCode::ContentModified,
+            format!(
+                "`{relative}` changed after the symbol index was built; rebuild the index before running a positional query"
+            ),
+        ))
+    }
+
+    /// Re-establishes per-file correspondence after installing a generation.
+    ///
+    /// Closed files now match the build by construction. Open buffers remain
+    /// stale when they differ from disk, since the build could not have seen
+    /// those unsaved bytes.
+    fn refresh_document_freshness(&mut self) {
+        self.stale_documents = self
+            .documents
+            .iter()
+            .filter_map(|(path, document)| {
+                let abs = path.as_real()?;
+                let matches_disk =
+                    std::fs::read_to_string(abs.as_str()).is_ok_and(|disk| disk == document.text);
+                (!matches_disk).then(|| path.clone())
+            })
+            .collect();
     }
 
     fn prepare_call_hierarchy(
@@ -1227,12 +1291,12 @@ impl Server {
 
         let mut guard = self.telemetry.start(telemetry::Op::PrepareCallHierarchy);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
         let Some((index, root, relative)) = self.resolve_query(&doc.text_document.uri) else {
             let err = self.refuse(&mut guard, &doc.text_document.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         let position =
             crate::line_index::LinePosition::new(doc.position.line, doc.position.character);
         let read = file_reader(&self.documents, root);
@@ -1253,7 +1317,7 @@ impl Server {
                 // Not on a callable, or on one the index does not define. LSP
                 // wants null rather than an empty array to mean "no hierarchy
                 // starts here".
-                guard.finish(empty_reason(self.is_dirty(&relative, root)));
+                guard.finish(telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch });
                 Ok(serde_json::Value::Null)
             }
         }
@@ -1278,12 +1342,12 @@ impl Server {
         };
         let mut guard = self.telemetry.start(op);
         guard.at_revision(self.vfs.revision().as_u64());
-        guard.mark_stale(self.vfs.has_pending_changes());
 
-        let Some((index, root, _)) = self.resolve_query(&params.item.uri) else {
+        let Some((index, root, relative)) = self.resolve_query(&params.item.uri) else {
             let err = self.refuse(&mut guard, &params.item.uri);
             return Err(err);
         };
+        self.require_current_document(&mut guard, &relative, root)?;
         // The symbol was stashed at prepare time. A client that fabricates an
         // item, or replays one from a previous session, will not have it.
         let Some(symbol) = handlers::call_item_symbol(&params.item) else {
@@ -1410,14 +1474,10 @@ impl Server {
                     .extract(notification, |this, p: lsp_types::DidCloseTextDocumentParams| {
                         this.did_close(p)
                     }),
-                DidSaveTextDocument::METHOD => {
-                    self.extract(notification, |_this, p: lsp_types::DidSaveTextDocumentParams| {
-                        // Disk and the in-memory copy now agree, so there is
-                        // nothing to reconcile -- the client keeps the document
-                        // open and its text is unchanged by the save.
-                        tracing::debug!(uri = %p.text_document.uri, "saved");
-                    })
-                }
+                DidSaveTextDocument::METHOD => self
+                    .extract(notification, |this, p: lsp_types::DidSaveTextDocumentParams| {
+                        this.did_save(p)
+                    }),
                 // Notifications get no response, so an unknown one is only worth
                 // a log line -- but it is worth one, since a silently ignored
                 // `didChange` looks exactly like a client that stopped typing.
@@ -1447,10 +1507,18 @@ impl Server {
         let doc = params.text_document;
         let Some(path) = self.resolve(&doc.uri) else { return };
 
+        let differs_from_disk = path
+            .as_real()
+            .and_then(|abs| std::fs::read_to_string(abs.as_str()).ok())
+            .is_none_or(|disk| disk != doc.text);
+        if differs_from_disk {
+            self.stale_documents.insert(path.clone());
+        }
+
         if self.documents.open(path.clone(), doc.version, doc.text.clone()).is_some() {
             tracing::warn!(uri = %doc.uri, "didOpen for an already-open document");
         }
-        self.vfs.set_file_contents(path, Some(doc.text.into_bytes()));
+        self.record_vfs_contents(path, Some(doc.text.into_bytes()));
         // At info, because "did the server even see my file" is the first
         // question anyone asks, and a debug-level answer means turning the log
         // up and reproducing.
@@ -1473,7 +1541,16 @@ impl Server {
             return;
         };
         let bytes = text.as_bytes().to_vec();
-        self.vfs.set_file_contents(path, Some(bytes));
+        if self.record_vfs_contents(path.clone(), Some(bytes)) {
+            self.stale_documents.insert(path);
+        }
+    }
+
+    fn did_save(&mut self, params: lsp_types::DidSaveTextDocumentParams) {
+        // A save makes disk and the buffer agree. The built index still
+        // describes the previous build and remains stale until a validated
+        // shard generation is installed.
+        tracing::debug!(uri = %params.text_document.uri, "saved; awaiting index rebuild");
     }
 
     fn did_close(&mut self, params: lsp_types::DidCloseTextDocumentParams) {
@@ -1486,7 +1563,7 @@ impl Server {
         // The client's copy is gone, so disk is authoritative again. Leaving the
         // in-memory text in the VFS would keep serving edits the user discarded.
         let on_disk = path.as_real().and_then(|abs| std::fs::read(abs.as_str()).ok());
-        self.vfs.set_file_contents(path, on_disk);
+        self.record_vfs_contents(path, on_disk);
         // Logged at the same level as `opened`, because without it the open
         // count appears to fall between two consecutive opens.
         tracing::info!(
@@ -1505,6 +1582,17 @@ impl Server {
                 None
             }
         }
+    }
+
+    /// Updates VFS identity/revision while releasing the unused change payload.
+    ///
+    /// No database consumes these batches yet. Retaining them kept one complete
+    /// byte buffer for every file visited during the session. Freshness is
+    /// tracked explicitly in `stale_documents` instead.
+    fn record_vfs_contents(&mut self, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
+        let changed = self.vfs.set_file_contents(path, contents);
+        drop(self.vfs.take_changes());
+        changed
     }
 
     fn status(&self) -> Status {
@@ -1534,6 +1622,7 @@ impl Server {
             index_targets: self.config.index.targets.clone(),
             indexed_definitions: self.index.as_ref().map(|i| i.definition_count()).unwrap_or(0),
             open_documents: self.documents.len(),
+            stale_documents: self.stale_documents.len(),
             vfs_files: self.vfs.len(),
             vfs_revision: self.vfs.revision().as_u64(),
             pending_changes: self.vfs.has_pending_changes(),
@@ -1569,10 +1658,11 @@ pub struct Status {
     pub index_targets: Vec<String>,
     pub indexed_definitions: usize,
     pub open_documents: usize,
+    pub stale_documents: usize,
     pub vfs_files: usize,
     pub vfs_revision: u64,
-    /// True when writes are waiting to reach the database, which is the
-    /// read-after-write signal from `docs/phase-1.md` (F3).
+    /// True when an unconsumed VFS payload remains. The server currently drains
+    /// these after every edit because no database consumes them yet.
     pub pending_changes: bool,
     pub health: telemetry::Health,
 }
@@ -1602,6 +1692,12 @@ mod startup_cache_tests {
     fn server() -> Server {
         let (connection, _client) = Connection::memory();
         Server::new(connection.sender, PositionEncoding::Utf16, None)
+    }
+
+    fn server_at(root: &Path) -> Server {
+        let (connection, _client) = Connection::memory();
+        let root = AbsPathBuf::try_from(root.to_str().expect("UTF-8 test path")).unwrap();
+        Server::new(connection.sender, PositionEncoding::Utf16, Some(root))
     }
 
     #[test]
@@ -1720,6 +1816,118 @@ mod startup_cache_tests {
     }
 
     #[test]
+    fn positional_queries_refuse_source_newer_than_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut server = server_at(temp.path());
+        server.index = Some(Arc::new(test_index()));
+        let root = server.workspace_root.as_ref().unwrap();
+        let abs = root.join("src/Foo.java");
+        server.stale_documents.insert(VfsPath::Real(abs.clone()));
+        let uri = lsp_types::Url::from_file_path(abs.as_str()).unwrap();
+
+        let position = || {
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 }
+            })
+        };
+        let assert_stale = |error: RequestError| {
+            assert!(matches!(error.code, ErrorCode::ContentModified));
+            assert!(error.message.contains("rebuild the index"));
+        };
+
+        assert_stale(server.goto_definition(position()).unwrap_err());
+        assert_stale(
+            server
+                .find_references(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 0, "character": 0 },
+                    "context": { "includeDeclaration": true }
+                }))
+                .err()
+                .expect("stale reference query must fail"),
+        );
+        assert_stale(server.hover(position()).unwrap_err());
+        assert_stale(server.goto_implementation(position()).unwrap_err());
+        assert_stale(server.prepare_call_hierarchy(position()).unwrap_err());
+
+        let item = || {
+            serde_json::json!({
+                "item": {
+                    "name": "Foo",
+                    "kind": 12,
+                    "uri": uri,
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 3 }
+                    },
+                    "selectionRange": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 3 }
+                    },
+                    "data": { "symbol": "java Foo#" }
+                }
+            })
+        };
+        assert_stale(server.call_hierarchy(item(), CallDirection::Incoming).unwrap_err());
+        assert_stale(server.call_hierarchy(item(), CallDirection::Outgoing).unwrap_err());
+    }
+
+    #[test]
+    fn freshness_survives_save_and_close_while_vfs_payloads_are_drained() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("A.java");
+        std::fs::write(&file, "class A {}\n").unwrap();
+        let uri = lsp_types::Url::from_file_path(&file).unwrap();
+        let path = uri::vfs_path(&uri).unwrap();
+        let mut server = server_at(temp.path());
+
+        server.did_open(
+            serde_json::from_value(serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class A {}\n"
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(!server.stale_documents.contains(&path));
+        assert!(!server.vfs.has_pending_changes());
+
+        server.did_change(
+            serde_json::from_value(serde_json::json!({
+                "textDocument": { "uri": uri, "version": 2 },
+                "contentChanges": [{ "text": "class Bee {}\n" }]
+            }))
+            .unwrap(),
+        );
+        assert!(server.stale_documents.contains(&path));
+        assert!(!server.vfs.has_pending_changes());
+
+        std::fs::write(&file, "class Bee {}\n").unwrap();
+        server.did_save(
+            serde_json::from_value(serde_json::json!({
+                "textDocument": { "uri": uri }
+            }))
+            .unwrap(),
+        );
+        server.did_close(
+            serde_json::from_value(serde_json::json!({
+                "textDocument": { "uri": uri }
+            }))
+            .unwrap(),
+        );
+        assert!(server.stale_documents.contains(&path), "saving is not an index rebuild");
+        assert!(!server.vfs.has_pending_changes());
+
+        // Installing a generation built from disk makes the closed file current.
+        server.refresh_document_freshness();
+        assert!(!server.stale_documents.contains(&path));
+    }
+
+    #[test]
     fn a_queued_reload_runs_after_invalidation() {
         let temp = tempfile::tempdir().unwrap();
         let mut server = server();
@@ -1779,18 +1987,6 @@ fn count_outcome(count: usize) -> telemetry::Outcome {
     } else {
         telemetry::Outcome::answered(count)
     }
-}
-
-/// Why a query came back empty.
-///
-/// The distinction the telemetry crate exists for: `NoMatch` means the server
-/// looked and there is nothing, which is a true answer. `IndexStale` means the
-/// file has changed since the index was built, so the server cannot know — and
-/// an agent that reads the first as the second deletes live code.
-fn empty_reason(dirty: bool) -> telemetry::Outcome {
-    let reason =
-        if dirty { telemetry::EmptyReason::IndexStale } else { telemetry::EmptyReason::NoMatch };
-    telemetry::Outcome::Empty { reason }
 }
 
 /// Reads a workspace-relative file, preferring the client's open copy.
