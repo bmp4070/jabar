@@ -24,6 +24,7 @@
 //! and a test pins that. If a future scip-java starts populating the field
 //! honestly, that test is what will notice.
 
+use std::collections::BinaryHeap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -454,16 +455,65 @@ impl SymbolIndex {
             return Vec::new();
         }
         let needle = query.to_lowercase();
-        let mut hits: Vec<&Definition> =
-            self.definitions.iter().filter(|d| d.name.to_lowercase().contains(&needle)).collect();
-        hits.sort_by(|a, b| {
-            rank(a, &needle)
-                .cmp(&rank(b, &needle))
-                .then_with(|| a.name.len().cmp(&b.name.len()))
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        hits
+        let mut hits: Vec<RankedDefinition<'_>> = self
+            .by_name
+            .iter()
+            .filter(|(name, _)| name.contains(&needle))
+            .flat_map(|(name, indices)| {
+                indices.iter().map(|&idx| RankedDefinition {
+                    rank: rank(name, &needle),
+                    definition: &self.definitions[idx],
+                })
+            })
+            .collect();
+        hits.sort_unstable();
+        hits.into_iter().map(|hit| hit.definition).collect()
+    }
+
+    /// The best `limit` search results and the total number of matches.
+    ///
+    /// This scans the lowercased name table without allocating a lowercased
+    /// string per definition. It keeps only the best `limit` definitions in
+    /// memory, which bounds broad-query memory use for large workspaces.
+    pub fn search_limited(
+        &self,
+        query: &str,
+        limit: usize,
+        mut include: impl FnMut(&Definition) -> bool,
+    ) -> (Vec<&Definition>, usize) {
+        if query.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let needle = query.to_lowercase();
+        let mut best = BinaryHeap::with_capacity(limit.min(self.definitions.len()));
+        let mut total = 0;
+
+        for (name, indices) in &self.by_name {
+            if !name.contains(&needle) {
+                continue;
+            }
+            let rank = rank(name, &needle);
+            for &idx in indices {
+                let definition = &self.definitions[idx];
+                if !include(definition) {
+                    continue;
+                }
+                total += 1;
+                if limit == 0 {
+                    continue;
+                }
+                let candidate = RankedDefinition { rank, definition };
+                if best.len() < limit {
+                    best.push(candidate);
+                } else if best.peek().is_some_and(|worst| candidate < *worst) {
+                    best.pop();
+                    best.push(candidate);
+                }
+            }
+        }
+
+        let results = best.into_sorted_vec().into_iter().map(|hit| hit.definition).collect();
+        (results, total)
     }
 
     /// The symbol whose occurrence covers `(line, col)` in `path`.
@@ -648,14 +698,46 @@ fn span_len(range: &Range) -> u64 {
 }
 
 /// 0 for an exact match, 1 for a prefix match, 2 otherwise.
-fn rank(def: &Definition, needle: &str) -> u8 {
-    let name = def.name.to_lowercase();
+fn rank(name: &str, needle: &str) -> u8 {
     if name == needle {
         0
     } else if name.starts_with(needle) {
         1
     } else {
         2
+    }
+}
+
+/// One search candidate, ordered from best to worst. A [`BinaryHeap`] keeps
+/// the worst retained candidate at its head so a better one can replace it.
+#[derive(Copy, Clone)]
+struct RankedDefinition<'a> {
+    rank: u8,
+    definition: &'a Definition,
+}
+
+impl PartialEq for RankedDefinition<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedDefinition<'_> {}
+
+impl PartialOrd for RankedDefinition<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedDefinition<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.definition.name.len().cmp(&other.definition.name.len()))
+            .then_with(|| self.definition.name.cmp(&other.definition.name))
+            .then_with(|| self.definition.path.cmp(&other.definition.path))
+            .then_with(|| self.definition.symbol.cmp(&other.definition.symbol))
     }
 }
 
@@ -839,6 +921,35 @@ mod tests {
         }
         let names: Vec<_> = index.search("retrypolicy").iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["RetryPolicy", "RetryPolicyFactory", "AbstractRetryPolicyBase"]);
+    }
+
+    #[test]
+    fn limited_search_keeps_the_best_results_and_counts_all_matches() {
+        let mut index = SymbolIndex::default();
+        for (symbol, name) in [
+            ("com/acme/AbstractRetryPolicyBase#", "AbstractRetryPolicyBase"),
+            ("com/acme/RetryPolicy#", "RetryPolicy"),
+            ("com/acme/RetryPolicyFactory#", "RetryPolicyFactory"),
+        ] {
+            index.insert(def(symbol, name));
+        }
+
+        let (hits, total) = index.search_limited("retrypolicy", 2, |_| true);
+        let names: Vec<_> = hits.iter().map(|def| def.name.as_str()).collect();
+        assert_eq!(names, ["RetryPolicy", "RetryPolicyFactory"]);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn limited_search_counts_only_included_matches_even_at_a_zero_limit() {
+        let mut index = SymbolIndex::default();
+        index.insert(def("com/acme/RetryPolicy#", "RetryPolicy"));
+        index.insert(def("com/acme/RetryPolicyFactory#", "RetryPolicyFactory"));
+
+        let (hits, total) =
+            index.search_limited("retry", 0, |definition| definition.name != "RetryPolicy");
+        assert!(hits.is_empty());
+        assert_eq!(total, 1);
     }
 
     #[test]

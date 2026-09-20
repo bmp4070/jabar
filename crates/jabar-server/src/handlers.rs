@@ -63,7 +63,8 @@ pub fn workspace_symbol(
 /// `live` comes from the overlay. Its entries win over indexed ones for the same
 /// file, because a file the client is editing is described better by what the
 /// client holds than by what was built — including symbols that exist only in
-/// the buffer, which is the case the overlay exists for.
+/// the buffer, which is the case the overlay exists for. `shadowed_paths`
+/// includes every open file, including files whose current text has no symbols.
 pub fn workspace_symbol_with(
     index: &SymbolIndex,
     live: &[Definition],
@@ -82,16 +83,17 @@ pub fn workspace_symbol_with(
     // Files the overlay covers are represented entirely by it, so an indexed
     // symbol for such a file is a stale duplicate rather than an extra result.
     let shadowed: FxHashSet<&str> = shadowed_paths.iter().map(String::as_str).collect();
-    let indexed =
-        index.search(query).into_iter().filter(|def| !shadowed.contains(def.path.as_str()));
+    let indexed_limit = SEARCH_LIMIT.saturating_sub(live_matches.len());
+    let (indexed, indexed_total) =
+        index.search_limited(query, indexed_limit, |def| !shadowed.contains(def.path.as_str()));
 
     // Live first: a symbol the client just wrote is what it is most likely
     // asking about.
-    let all: Vec<&Definition> = live_matches.into_iter().chain(indexed).collect();
-    let total = all.len();
+    let total = live_matches.len() + indexed_total;
 
-    let symbols = all
+    let symbols = live_matches
         .into_iter()
+        .chain(indexed)
         .take(SEARCH_LIMIT)
         .filter_map(|def| to_symbol_information(def, workspace_root, client_encoding, &read_file))
         .collect();
