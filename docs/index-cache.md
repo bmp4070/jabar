@@ -24,11 +24,12 @@ Store cache files below `.jabar/index/cache/`, leaving the existing
 ignored by the target workspace. Each complete generation contains:
 
 - `index.bin`: a versioned built-index snapshot with a magic header and checksum.
-- `manifest.json`: schema version, generation ID, canonical workspace path,
-  Bazel output base and configuration identity, target patterns, aspect and
-  scip-java versions, git HEAD at build time, completion time, and the exact
-  shard paths and fingerprints included in the snapshot. Include build outcome
-  and indexed/failed/skipped/unknown target counts when coverage reporting lands.
+- `manifest.json`: currently stores schema version, canonical workspace and
+  output-tree paths, Bazel/configuration identity, target patterns, scip-java
+  path, git HEAD, snapshot bytes/checksum, and shard paths with size/mtime
+  fingerprints. Extend it with aspect/scip-java versions, build completion time,
+  build outcome, and indexed/failed/skipped/unknown target counts when coverage
+  reporting lands.
 
 The cache root also contains `CURRENT`, an atomically replaced pointer to the
 published generation.
@@ -61,20 +62,21 @@ current.
    against a defined warm-start budget. A cache miss retains the existing shard
    discovery path until a separate cold-start design is implemented; it may
    still block `initialize` for minutes on a large workspace.
-2. Replace the recursive `bazel-bin` watch with a watch on the small published
-   manifest or generation pointer. An external build that does not publish it
-   needs an explicit refresh trigger or a bounded periodic reconciliation. A
-   watcher overflow/error marks the index unverified and schedules a scan.
-3. Run shard scans, protobuf parsing, snapshot loading, and any Bazel build on
-   workers. Send completed results to the server's event loop. `adopt_index`
-   and `reload_index` are currently synchronous; moving only the initial read
-   to a thread would leave the loop blocked during later reloads. Apply a result
-   only if its workspace, configuration, HEAD, and generation still match.
-4. Coalesce rapid changes, rate-limit failed refreshes, and report progress and
-   errors. Keep the prior index while refreshing when its provenance still
-   matches; report its unverified age. Measure peak RSS while old and new
-   snapshots coexist. A refresh that fails or never runs does not impose a
-   bound on staleness.
+2. Cached sessions now avoid the recursive `bazel-bin` watch and use bounded
+   periodic reconciliation. Add a watch on a small build-published manifest or
+   generation pointer, or an explicit refresh trigger, to reduce detection
+   latency for external builds. A watcher overflow/error must mark the index
+   unverified and schedule a scan.
+3. Shard scans, protobuf parsing during reload, and cache writes now run on
+   workers and completed results return to the server event loop. Cache decode
+   and cold shard loading still occur before `initialize`; any Bazel build is
+   also synchronous when `index.auto` is needed at startup. Continue rejecting
+   worker results whose workspace, configuration, or HEAD no longer matches.
+4. Rapid refresh changes are coalesced and progress/errors are reported. Add
+   rate limiting for repeated failures and expose cache age. Keep the prior
+   index while refreshing when its provenance still matches. Measure peak RSS
+   while old and new snapshots coexist. A refresh that fails or never runs does
+   not impose a bound on staleness.
 
 ## Serialization decision
 
@@ -94,13 +96,13 @@ branch switches, and a refresh finishing after a newer generation.
 
 ## Completion criteria
 
-Publish a repeatable benchmark for `initialize` p50/p95, time to first usable
-query (including watcher setup), cache validation, deserialization, cold miss,
-reload pause, peak RSS, and disk size on both the fixture and a representative
-monolith. Set latency and memory budgets from the
-baseline, then accept the cache only when the warm path meets them and produces
-the same answers as a fresh shard load. `docs/monolith-roadmap.md` tracks the
-other requirements for large repositories.
+Run the protocol in
+[`docs/monolith-measurements.md`](monolith-measurements.md), including its
+cache-state definitions, phase timings, peak/steady RSS collection, response
+probes during reload, correctness parity, raw artifacts, and acceptance gates.
+Accept the cache only when the warm path meets those gates and produces the same
+answers as a fresh shard load. `docs/monolith-roadmap.md` tracks the other
+requirements for large repositories.
 
 **Status:** the first implementation persists the complete built index with a
 versioned MessagePack snapshot, checksum, configuration/HEAD key, exact shard

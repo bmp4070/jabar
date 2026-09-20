@@ -4,7 +4,8 @@ Jabar can answer its nine LSP operations from SCIP shards, but its current
 startup, refresh, and coverage behavior has not been validated for a workspace
 with millions of build outputs. This is an implementation plan, not a claim
 that those workloads already work. `docs/phase-1.md` records the earlier
-milestones; `docs/index-cache.md` details the proposed cache.
+milestones; `docs/index-cache.md` details the cache and
+`docs/monolith-measurements.md` defines the benchmark protocol.
 
 ## 1. Establish a repeatable baseline
 
@@ -14,22 +15,21 @@ patterns, host memory/CPU/storage, number and total bytes of shards, build
 outcome, and indexed target count. If a proprietary workspace cannot publish
 paths or symbols, publish the measurement method and aggregate numbers.
 
-Measure cold and warm runs separately, at least ten process starts each. Split
-`initialize` into index discovery, shard reads, protobuf decode, map build,
-and response time. Measure time to first usable query including watcher setup,
-no-op and changed-shard reloads, event-loop pauses, disk I/O, peak and steady
-RSS, and cache artifact size. For
-query latency, use representative exact/prefix/substring symbol searches,
-definition, high-fan-out references, and call hierarchy requests. Report p50
-and p95 with result counts; include an unopened edited file and a generated
-source in the correctness corpus.
+Follow [`docs/monolith-measurements.md`](monolith-measurements.md) for cache
+states, phase instrumentation, sample counts, responsiveness probes, OS memory
+counters, correctness comparisons, result artifacts, and acceptance gates.
+Include an unopened edited file and a generated source in the correctness
+corpus.
 
 Provisional acceptance budgets for the representative monolith are warm
-`initialize` p95 under 10s, event-loop pauses during reload p95 under 100ms,
-and ordinary symbol/definition queries p95 under 250ms. Set separate budgets
+`initialize` p95 under 10s and benchmark-heartbeat scheduling lateness during
+reload p95 under 100ms, and ordinary symbol/definition queries p95 under 250ms.
+Set separate budgets
 for broad search and high-fan-out references after the baseline, along with a
-peak RSS and disk budget tied to the target host. Do not present these as
-achieved until measured. Preserve answer parity with a fresh shard-built index.
+peak RSS and disk budget tied to the target host. The measurement plan supplies
+provisional relative and host-memory gates; pre-register final GiB limits before
+counted runs. Do not present these as achieved until measured. Preserve answer
+parity with a fresh shard-built index.
 
 ## 2. Make indexing coverage observable
 
