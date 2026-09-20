@@ -137,16 +137,25 @@ Begin from a cache hit and run each scenario at least ten times:
 7. A corrupt shard and a corrupt cache generation.
 
 While each scenario runs, use an open-loop client to schedule a lightweight
-`jabar/status` request every 50ms and a fixed definition or symbol request every
-second. Record intended and actual send time, receive time, outstanding-request
-count, timeout, errors, stale/unverified state transitions, refresh duration,
-and time until the new generation becomes queryable. Continue sending on the
-original schedule when a response is late, and count every timeout, so a stall
-cannot hide requests through coordinated omission. Request latency measures the
-client-visible effect; the benchmark heartbeat measures event-loop scheduling
-lateness and supplies the pause metric. Bound retained request payloads to keep
-the harness from exhausting memory during a long stall; every scheduled request
-that cannot be sent because of that bound is still recorded as a timeout.
+`jabar/status` request every 50ms, a fixed definition request every second, and a
+fixed symbol request every second. Begin probes at least five seconds before the
+change and continue through refresh completion (or timeout) and 30 seconds of
+quiescence. Record intended and actual send time, receive time,
+outstanding-request count, timeout, errors, stale/unverified state transitions,
+refresh duration, and time until the new generation becomes queryable. Continue
+sending on the original schedule when a response is late, and count every
+timeout, so a stall cannot hide requests through coordinated omission. Request
+latency measures the client-visible effect; the benchmark heartbeat measures
+event-loop scheduling lateness and supplies the pause metric. Bound retained
+request payloads to keep the harness from exhausting memory during a long stall;
+every scheduled request that cannot be sent because of that bound is still
+recorded as a timeout.
+
+Calculate status, definition, and symbol latency distributions separately for
+each run and each scenario. Report the per-run summaries and the aggregate for
+each method within a scenario. Do not pool methods, scenarios, or runs when
+deciding whether a gate passes: the higher status request rate and a long fast
+run must not hide slow real queries or a slow refresh run.
 
 ## Peak and steady memory
 
@@ -222,7 +231,8 @@ they do not replace the original pass/fail result:
 - direct Jabar steady RSS is at most 25% and refresh peak RSS at most 40% of
   effective memory (the lower of host physical RAM and a cgroup/container
   limit), with no swap growth or OOM events;
-- LSP response p95 during reconciliation/reload is under 250ms,
+- in every refresh scenario and counted run, the separate `jabar/status`,
+  definition, and symbol response-latency p95 values are each under 250ms;
   `event_loop.heartbeat` scheduling-lateness p95 is under 100ms, and no
   heartbeat is more than 250ms late;
 - responsiveness probes have no timeout or protocol error;

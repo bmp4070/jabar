@@ -23,8 +23,8 @@ corpus.
 
 Provisional acceptance budgets for the representative monolith are warm
 `initialize` p95 under 10s and benchmark-heartbeat scheduling lateness during
-reload p95 under 100ms, and ordinary symbol/definition queries p95 under 250ms.
-Set separate budgets
+reload p95 under 100ms, and separate status, symbol, and definition query p95
+under 250ms for every refresh scenario and counted run. Set separate budgets
 for broad search and high-fan-out references after the baseline, along with a
 peak RSS and disk budget tied to the target host. The measurement plan supplies
 provisional relative and host-memory gates; pre-register final GiB limits before
