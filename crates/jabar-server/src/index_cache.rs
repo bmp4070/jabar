@@ -132,6 +132,9 @@ pub fn store(
     index: &SymbolIndex,
     is_current: impl Fn() -> bool,
 ) -> io::Result<()> {
+    if !is_current() {
+        return Err(io::Error::other("cache generation was superseded before serialization"));
+    }
     let cache = cache_dir(root);
     fs::create_dir_all(&cache)?;
     let generation = format!(
@@ -147,7 +150,13 @@ pub fn store(
         let mut writer = DigestWriter::new(BufWriter::new(file));
         writer.write_all(MAGIC)?;
         writer.write_all(&VERSION.to_le_bytes())?;
-        index.write_snapshot(&mut writer)?;
+        {
+            let mut checked = CurrentWriter::new(&mut writer, &is_current);
+            index.write_snapshot(&mut checked)?;
+        }
+        if !is_current() {
+            return Err(io::Error::other("cache generation was superseded while serializing"));
+        }
         writer.flush()?;
         writer.inner.get_ref().sync_all()?;
         let checksum = writer.checksum();
@@ -203,6 +212,39 @@ pub fn store(
         let _ = fs::remove_dir_all(cache.join(&generation));
     }
     result
+}
+
+/// Checks cancellation periodically while a large snapshot is serialized.
+struct CurrentWriter<'a, W, F> {
+    inner: &'a mut W,
+    is_current: &'a F,
+    until_check: usize,
+}
+
+impl<'a, W, F> CurrentWriter<'a, W, F> {
+    fn new(inner: &'a mut W, is_current: &'a F) -> Self {
+        Self { inner, is_current, until_check: 0 }
+    }
+}
+
+impl<W: Write, F: Fn() -> bool> Write for CurrentWriter<'_, W, F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        const CHECK_BYTES: usize = 1024 * 1024;
+        if self.until_check == 0 {
+            if !(self.is_current)() {
+                return Err(io::Error::other("cache generation was superseded while serializing"));
+            }
+            self.until_check = CHECK_BYTES;
+        }
+        let chunk = &buf[..buf.len().min(self.until_check)];
+        let written = self.inner.write(chunk)?;
+        self.until_check = self.until_check.saturating_sub(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn cleanup(cache: &Path) {
@@ -365,5 +407,22 @@ mod tests {
             .filter(|entry| entry.file_type().unwrap().is_dir())
             .count();
         assert!(generations <= 2, "old cache generations should be bounded");
+    }
+
+    #[test]
+    fn a_superseded_writer_stops_during_serialization() {
+        let (temp, dir, key, index) = fixture();
+        let checks = std::cell::Cell::new(0);
+
+        let error = store(temp.path(), &dir, &key, &[], &index, || {
+            let check = checks.get();
+            checks.set(check + 1);
+            check == 0
+        })
+        .expect_err("the second cancellation check should stop serialization");
+
+        assert!(!error.to_string().is_empty());
+        assert!(checks.get() >= 2, "serialization performed a cancellation check");
+        assert!(!cache_dir(temp.path()).join("CURRENT").exists());
     }
 }
