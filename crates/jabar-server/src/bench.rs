@@ -150,6 +150,8 @@ pub struct Fields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_paths: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrences: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,

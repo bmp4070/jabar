@@ -272,7 +272,7 @@ pub fn find_references(
         hits.push((def.path.as_str(), def.range, def.encoding));
     }
     for reference in index.references(&symbol) {
-        hits.push((reference.path.as_str(), reference.range, reference.encoding));
+        hits.push((reference.path, reference.range, reference.encoding));
     }
 
     // Same file first, then same directory, then everything else. A caller
@@ -587,11 +587,11 @@ pub fn incoming_calls(
     let mut caller_ids: FxHashMap<&str, usize> = FxHashMap::default();
 
     for reference in index.references(symbol) {
-        let Some(caller) = index.enclosing_callable(&reference.path, reference.range) else {
+        let Some(caller) = index.enclosing_callable(reference.path, reference.range) else {
             continue;
         };
         let range = convert_span(
-            &reference.path,
+            reference.path,
             reference.range,
             reference.encoding,
             client_encoding,

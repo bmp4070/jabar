@@ -35,9 +35,49 @@ This is the reported-scale monolith the protocol was written for.
 | Built index cache (`index.bin`) | **10.14 GiB** (10,892,558,559 B) + 949 KB manifest |
 | In-memory index (steady-state resident) | ≈16.7 GiB |
 
+These cache size, startup, and memory numbers describe the version 1 snapshot.
+The later version 2 format interns reference paths and removes the duplicated
+symbol and path strings from each reference row. Its counted results are in
+[Version 2 snapshot](#version-2-snapshot--counted-results-2026-09-22) below; the
+version 1 values here are retained as the comparison baseline.
+
 Counts are identical across the cache-miss and cache-hit runs (3,130,763
 definitions both times) — a first, if narrow, **correctness-parity** signal
 between a freshly-decoded index and one restored from cache.
+
+## Version 2 snapshot — counted results (2026-09-22)
+
+The version 2 format was then measured against the same core checkout on this
+host (jabar `perf/warm-start-memory` @ `8d06862`, `--release`, `index.auto=false`).
+The version 1 cache was version-rejected, so the process decoded the shards once
+and published a fresh v2 generation; a subsequent `startup` then hit it. Counts
+match the v1 run exactly — 3,130,763 defs / 39,434,571 refs / 42,567,085
+occurrences, across 165,165 distinct reference paths — and the `cache.read` hit
+self-reports the snapshot byte count, so this is **correctness parity** between
+the decoded index and the v2 snapshot on both counts and bytes.
+
+| Metric | v1 | v2 | Change |
+| --- | --- | --- | --- |
+| `index.bin` | 10.14 GiB (10,892,558,559 B) | **3.74 GiB** (4,017,239,476 B) | **2.71× smaller** (−63%) |
+| Warm start (`cache.read` → first `workspace/symbol`) | ~57 s | **~22 s** (21.8 / 22.1 s) | **2.6× faster** |
+| Warm peak RSS | 62.0 GiB | **24.6 GiB** | **2.5× lower** |
+| Steady-state resident | ≈16.7 GiB | **≈7.3 GiB** | **2.3× lower** |
+| Cache-miss decode-path peak RSS | 66.9 GiB | 29.7 GiB | 2.25× lower |
+| `cache.write` (miss) | 80.7 s | 58.7 s | 1.37× faster |
+| `workspace/symbol` p50 / p95 (probe) | 167 / 290 ms | 145 / 152 ms | now inside the 250 ms gate |
+
+Both warm samples agree (`cache.read` 21.73 s / 22.03 s). `shards.decode` is
+unchanged (~100 s here) — v2 touches only the persisted layout, not the
+synchronous shard decode, so cold start and its event-loop block (finding 1)
+remain open.
+
+**What moved:** removing the owned `symbol` and `path` strings from every one of
+the 39.4M reference rows — the symbol is now the map key, paths intern into a
+165,165-entry table, and each row is a 24-byte `StoredReference` — shrinks the
+snapshot by 6.4 GiB, roughly halves warm-start deserialization, and cuts resident
+and peak memory by ~2.3–2.5×. It is still streaming MessagePack, so the
+mmap/zero-copy and lazy-section options in recommendation 2 remain available for a
+further cut; this is the incremental step ahead of that decision.
 
 ## Startup
 
@@ -107,9 +147,12 @@ so no beats are serviced (see finding 1).
    `jabar/status` stays sub-millisecond.
 
 4. **Peak RSS (~62–67 GiB) is ~3.7× the resident index (~17 GiB).** Both the
-   decode and the cache-load paths spike memory well above the steady-state
-   footprint (raw shard protobufs during decode; transient buffers during
-   deserialize). Sizing must budget for the peak, not the resident set.
+   decode and cache-load paths spike memory well above the steady-state
+   footprint. The first run did not collect allocation or stage-specific RSS
+   evidence, so it does not establish how much came from one-shard protobuf
+   decoding, collection growth, duplicated reference strings, cache writing,
+   or generation overlap. Sizing must use the observed peak until a fresh
+   process and stage-specific rerun separates those causes.
 
 5. **Harness gap — the `startup` workload cut off the async `cache.write`.**
    It shuts down immediately after the first query, killing the server
@@ -131,12 +174,13 @@ In priority order, mapped to the findings above. Product/engineering changes
    a ~2-minute stall. This is the single biggest responsiveness win — it removes
    the event-loop block regardless of cold/warm.
 
-2. **Cut warm-start deserialization (finding 2).** The 10.14 GiB MessagePack
-   snapshot takes ~57 s to deserialize. Options, roughly in order of payoff:
-   an mmap-friendly / zero-copy on-disk layout (e.g. `rkyv`) so the index is
-   usable without a full parse; lazy, section-on-demand loading so `initialize`
-   returns before the whole snapshot is materialized; splitting the snapshot so
-   hot structures (definitions, name index) load first. Target: seconds, not ~1 min.
+2. **Cut warm-start deserialization (finding 2).** The 10.14 GiB version 1
+   MessagePack snapshot takes ~57 s to deserialize. Version 2 first compacts the
+   39.4M reference rows: the containing map supplies their symbol and one path
+   table replaces per-row path strings. It keeps streaming deserialization and
+   rejects version 1 before loading, avoiding an old-plus-new conversion peak.
+   Measure that change before choosing an mmap-friendly layout, lazy sections,
+   or a split hot index. Target: seconds, not ~1 min.
 
 3. **Add a persisted name index for `workspace/symbol` (finding 3).** p95 ~290 ms
    over 3.1M definitions suggests a scan. Precompute and persist a prefix/trigram
@@ -144,10 +188,11 @@ In priority order, mapped to the findings above. Product/engineering changes
    results. Target: p95 < 250 ms.
 
 4. **Reduce peak memory on both paths (finding 4).** Peak ~67 GiB vs ~17 GiB
-   resident. On decode, fold-and-drop each shard's protobuf as it is merged
-   rather than holding all 6,876 in memory at once; on cache load, deserialize
-   into the final layout without large transient buffers (ties to #2). Lowers the
-   host sizing floor from ~67 GiB toward the ~17 GiB working set.
+   resident. The loader already handles shards one at a time and streams cache
+   input into the final index. Version 2 reduces the final reference rows from
+   roughly 72 to 24 bytes before string payload and allocator savings. Rerun
+   cache load in a fresh process and add stage-specific memory evidence before
+   selecting the next allocation target.
 
 5. **Make `startup` wait for cache publication (finding 5).** Add a
    `--hold-secs`/quiesce step so the workload polls `jabar/status` (or waits)

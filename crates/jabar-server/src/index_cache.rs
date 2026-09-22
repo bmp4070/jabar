@@ -17,7 +17,7 @@ use symbol_index::{ShardMetadata, SymbolIndex};
 
 use crate::config::Config;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAGIC: &[u8; 8] = b"JABARIDX";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -69,6 +69,7 @@ struct Manifest {
 pub struct CacheHit {
     pub index: SymbolIndex,
     pub shards: Vec<ShardMetadata>,
+    pub bytes: u64,
 }
 
 fn cache_dir(root: &Path) -> PathBuf {
@@ -107,7 +108,9 @@ pub fn load(root: &Path, key: &CacheKey) -> io::Result<Option<CacheHit>> {
     if file.metadata()?.len() != manifest.bytes {
         return Ok(None);
     }
-    let mut reader = DigestReader::new(BufReader::new(file));
+    // Buffer outside the digest wrapper so MessagePack's many small reads do
+    // not run the checksum loop one field at a time.
+    let mut reader = BufReader::new(DigestReader::new(file));
     let mut header = [0; 12];
     reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC || u32::from_le_bytes(header[8..].try_into().unwrap()) != VERSION {
@@ -115,10 +118,10 @@ pub fn load(root: &Path, key: &CacheKey) -> io::Result<Option<CacheHit>> {
     }
     let index = SymbolIndex::read_snapshot(&mut reader)?;
     let mut trailing = [0];
-    if reader.read(&mut trailing)? != 0 || reader.checksum() != manifest.checksum {
+    if reader.read(&mut trailing)? != 0 || reader.get_ref().checksum() != manifest.checksum {
         return Ok(None);
     }
-    Ok(Some(CacheHit { index, shards: manifest.shards }))
+    Ok(Some(CacheHit { index, shards: manifest.shards, bytes: manifest.bytes }))
 }
 
 /// Publishes a generation only when the shard list still matches the index.
@@ -147,7 +150,8 @@ pub fn store(
     fs::create_dir(&staging)?;
     let result = (|| {
         let file = File::create(staging.join("index.bin"))?;
-        let mut writer = DigestWriter::new(BufWriter::new(file));
+        // Buffer outside the digest wrapper for the same reason as the reader.
+        let mut writer = BufWriter::new(DigestWriter::new(file));
         writer.write_all(MAGIC)?;
         writer.write_all(&VERSION.to_le_bytes())?;
         {
@@ -158,8 +162,8 @@ pub fn store(
             return Err(io::Error::other("cache generation was superseded while serializing"));
         }
         writer.flush()?;
-        writer.inner.get_ref().sync_all()?;
-        let checksum = writer.checksum();
+        writer.get_ref().inner.sync_all()?;
+        let checksum = writer.get_ref().checksum();
         let bytes = fs::metadata(staging.join("index.bin"))?.len();
 
         // A build that rewrote shards while we serialized must not publish
@@ -370,6 +374,90 @@ mod tests {
         let mut changed = key.clone();
         changed.targets = vec!["//other/...".into()];
         assert!(load(temp.path(), &changed).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_format_is_rejected_before_its_body_is_decoded() {
+        let (temp, dir, key, index) = fixture();
+        store(temp.path(), &dir, &key, &[], &index, || true).unwrap();
+        let cache = cache_dir(temp.path());
+        let current = fs::read_to_string(cache.join("CURRENT")).unwrap();
+        let generation = cache.join(current);
+        let manifest_path = generation.join("manifest.json");
+        let body = b"legacy body is deliberately unreadable";
+        fs::write(generation.join("index.bin"), body).unwrap();
+        let mut manifest: Manifest =
+            serde_json::from_reader(File::open(&manifest_path).unwrap()).unwrap();
+        manifest.version = VERSION - 1;
+        manifest.bytes = body.len() as u64;
+        serde_json::to_writer(File::create(manifest_path).unwrap(), &manifest).unwrap();
+
+        assert!(load(temp.path(), &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn checksum_rejects_a_same_length_body_mutation() {
+        let (temp, dir, key, index) = fixture();
+        store(temp.path(), &dir, &key, &[], &index, || true).unwrap();
+        let cache = cache_dir(temp.path());
+        let current = fs::read_to_string(cache.join("CURRENT")).unwrap();
+        let body = cache.join(current).join("index.bin");
+        let mut bytes = fs::read(&body).unwrap();
+        let offset = bytes
+            .windows(3)
+            .position(|window| window == b"Foo")
+            .expect("fixture symbol is present in the snapshot");
+        bytes[offset] = b'G';
+        fs::write(body, bytes).unwrap();
+
+        assert!(load(temp.path(), &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn trailing_snapshot_data_is_rejected() {
+        let (temp, dir, key, index) = fixture();
+        store(temp.path(), &dir, &key, &[], &index, || true).unwrap();
+        let cache = cache_dir(temp.path());
+        let current = fs::read_to_string(cache.join("CURRENT")).unwrap();
+        let generation = cache.join(current);
+        let body = generation.join("index.bin");
+        OpenOptions::new().append(true).open(&body).unwrap().write_all(b"trailing").unwrap();
+
+        let manifest_path = generation.join("manifest.json");
+        let mut manifest: Manifest =
+            serde_json::from_reader(File::open(&manifest_path).unwrap()).unwrap();
+        let bytes = fs::read(body).unwrap();
+        manifest.bytes = bytes.len() as u64;
+        manifest.checksum = FNV_OFFSET;
+        update_checksum(&mut manifest.checksum, &bytes);
+        serde_json::to_writer(File::create(manifest_path).unwrap(), &manifest).unwrap();
+
+        assert!(load(temp.path(), &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_round_trip_crosses_buffer_boundaries() {
+        let (temp, dir, key, mut index) = fixture();
+        for number in 0..1_000 {
+            let name = format!("Type{number}");
+            index.insert(Definition {
+                symbol: format!("java {name}#"),
+                name,
+                kind: SymbolKind::Class,
+                path: format!("src/Type{number}.java"),
+                range: Range { start_line: 0, start_col: 6, end_line: 0, end_col: 10 },
+                encoding: PositionEncoding::Utf16,
+                implements: Vec::new(),
+                documentation: Vec::new(),
+                signature: String::new(),
+                enclosing: None,
+            });
+        }
+        store(temp.path(), &dir, &key, &[], &index, || true).unwrap();
+
+        let hit = load(temp.path(), &key).unwrap().unwrap();
+        assert!(hit.bytes > 8 * 1024);
+        assert_eq!(hit.index.definition_count(), 1_001);
     }
 
     #[test]

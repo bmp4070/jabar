@@ -409,6 +409,22 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                         Ok(Some(hit)) => Some(hit.index.definition_count()),
                         _ => None,
                     },
+                    references: match &loaded {
+                        Ok(Some(hit)) => Some(hit.index.reference_count()),
+                        _ => None,
+                    },
+                    reference_paths: match &loaded {
+                        Ok(Some(hit)) => Some(hit.index.reference_path_count()),
+                        _ => None,
+                    },
+                    occurrences: match &loaded {
+                        Ok(Some(hit)) => Some(hit.index.occurrence_count()),
+                        _ => None,
+                    },
+                    bytes: match &loaded {
+                        Ok(Some(hit)) => Some(hit.bytes),
+                        _ => None,
+                    },
                     outcome: Some(match &loaded {
                         Ok(Some(_)) => "hit",
                         Ok(None) => "miss",
@@ -450,6 +466,7 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                     shards: Some(loaded.shards.len()),
                     definitions: Some(loaded.index.definition_count()),
                     references: Some(loaded.index.reference_count()),
+                    reference_paths: Some(loaded.index.reference_path_count()),
                     occurrences: Some(loaded.index.occurrence_count()),
                     outcome: Some(if loaded.index.is_empty() { "empty" } else { "ok" }),
                     ..Default::default()
