@@ -490,6 +490,15 @@ impl SymbolIndex {
         self.definitions.len()
     }
 
+    /// Total references across every symbol, for benchmark parity checks.
+    ///
+    /// Sums the per-symbol reference lists rather than counting distinct
+    /// symbols, so a cache-loaded index and a shard-built one can be compared
+    /// on the same count the measurement protocol requires.
+    pub fn reference_count(&self) -> usize {
+        self.references.values().map(Vec::len).sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty()
     }

@@ -1,0 +1,18 @@
+[package]
+name = "gen-shard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "jabar-gen-shard"
+path = "src/main.rs"
+
+[dependencies]
+protobuf.workspace = true
+scip.workspace = true
+
+[lints]
+workspace = true
