@@ -1,3 +1,5 @@
 /target
 # Bazel symlinks created inside the fixture workspace
 /fixtures/megarepo/bazel-*
+# scip-java bootstrapped by shell.nix on first entry
+/.cache/

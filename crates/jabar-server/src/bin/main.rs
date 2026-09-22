@@ -4,6 +4,9 @@ use lsp_server::Connection;
 
 fn main() -> anyhow::Result<()> {
     jabar_server::init_tracing();
+    // Before anything else, so `t_ns` and startup durations count from process
+    // entry. A no-op unless `JABAR_BENCH_LOG` is set.
+    jabar_server::bench::init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "jabar starting");
 
     // stdio is the transport every client uses; stdout therefore carries the

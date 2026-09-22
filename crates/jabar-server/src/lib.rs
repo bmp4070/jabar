@@ -5,6 +5,7 @@
 //! structure rather than an async runtime — salsa cancellation wants one
 //! synchronous writer and many snapshot readers.
 
+pub mod bench;
 pub mod capabilities;
 pub mod config;
 pub mod documents;

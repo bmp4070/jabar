@@ -63,6 +63,9 @@ pub const LOAD_INDEX_REQUEST: &str = "jabar/loadIndex";
 /// Performs the `initialize` handshake and runs until the client disconnects.
 pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start().context("initialize handshake failed")?;
+    // `initialize.total` spans request-received to response-sent; index
+    // discovery, the expensive part, happens in between and is included.
+    let init_timer = crate::bench::start();
     let params: lsp_types::InitializeParams =
         serde_json::from_value(params).context("client sent malformed InitializeParams")?;
 
@@ -124,6 +127,17 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     connection
         .initialize_finish(id, serde_json::to_value(result)?)
         .context("initialize handshake failed")?;
+    crate::bench::finish(
+        "initialize.total",
+        init_timer,
+        crate::bench::Fields {
+            cache_hit: discovered.as_ref().map(|d| d.cache_hit),
+            shards: discovered.as_ref().map(|d| d.index.shard_count()),
+            definitions: discovered.as_ref().map(|d| d.index.definition_count()),
+            outcome: Some(if discovered.is_some() { "ok" } else { "no-index" }),
+            ..Default::default()
+        },
+    );
 
     let mut server = Server::new(connection.sender.clone(), encoding, root);
     server.supports_progress = supports_progress;
@@ -153,7 +167,17 @@ fn build_index(root: &AbsPath, config: &Config) -> Result<(), String> {
     let aspect = AspectConfig { targets: config.index.targets.clone(), scip_java, java_home };
 
     let started = std::time::Instant::now();
-    runner.run(&aspect).map_err(|err| err.to_string())?;
+    let bench = crate::bench::start();
+    let outcome = runner.run(&aspect).map_err(|err| err.to_string());
+    crate::bench::finish(
+        "index.build",
+        bench,
+        crate::bench::Fields {
+            outcome: Some(if outcome.is_ok() { "ok" } else { "error" }),
+            ..Default::default()
+        },
+    );
+    outcome?;
     tracing::info!(elapsed = ?started.elapsed(), "indexed");
     Ok(())
 }
@@ -246,9 +270,37 @@ fn load_validated_generation_from(
 fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
     if let Some(dir) = bazel_index_dir(root, config) {
         let path = Path::new(dir.as_str());
+        let key_timer = crate::bench::start();
         let key = CacheKey::new(Path::new(root.as_str()), path, config).ok();
+        crate::bench::finish(
+            "cache.key",
+            key_timer,
+            crate::bench::Fields {
+                outcome: Some(if key.is_some() { "ok" } else { "error" }),
+                ..Default::default()
+            },
+        );
         if let Some(key) = &key {
-            match index_cache::load(Path::new(root.as_str()), key) {
+            let read_timer = crate::bench::start();
+            let loaded = index_cache::load(Path::new(root.as_str()), key);
+            crate::bench::finish(
+                "cache.read",
+                read_timer,
+                crate::bench::Fields {
+                    cache_hit: Some(matches!(&loaded, Ok(Some(hit)) if !hit.index.is_empty())),
+                    definitions: match &loaded {
+                        Ok(Some(hit)) => Some(hit.index.definition_count()),
+                        _ => None,
+                    },
+                    outcome: Some(match &loaded {
+                        Ok(Some(_)) => "hit",
+                        Ok(None) => "miss",
+                        Err(_) => "error",
+                    }),
+                    ..Default::default()
+                },
+            );
+            match loaded {
                 Ok(Some(hit)) if !hit.index.is_empty() => {
                     return Some(Discovered {
                         dir: dir.clone(),
@@ -269,7 +321,26 @@ fn discover_index(root: &AbsPath, config: &Config) -> Option<Discovered> {
                 Err(err) => tracing::warn!(%err, "index cache unreadable; loading shards"),
             }
         }
-        match load_validated_generation(path, key.as_ref(), Some(Path::new(root.as_str()))) {
+        let decode_timer = crate::bench::start();
+        let generation =
+            load_validated_generation(path, key.as_ref(), Some(Path::new(root.as_str())));
+        crate::bench::finish(
+            "shards.decode",
+            decode_timer,
+            match &generation {
+                Ok(loaded) => crate::bench::Fields {
+                    cache_hit: Some(false),
+                    shards: Some(loaded.shards.len()),
+                    definitions: Some(loaded.index.definition_count()),
+                    references: Some(loaded.index.reference_count()),
+                    occurrences: Some(loaded.index.occurrence_count()),
+                    outcome: Some(if loaded.index.is_empty() { "empty" } else { "ok" }),
+                    ..Default::default()
+                },
+                Err(_) => crate::bench::Fields { outcome: Some("error"), ..Default::default() },
+            },
+        );
+        match generation {
             Ok(loaded) => {
                 let index = loaded.index;
                 if !index.is_empty() {
@@ -455,6 +526,15 @@ impl Server {
     /// flight when the user quits should get an error, not a dead socket.
     fn run(mut self, connection: &Connection) -> anyhow::Result<()> {
         let refresh_tick = crossbeam_channel::tick(Duration::from_secs(300));
+        // The heartbeat measures event-loop scheduling lateness for the
+        // benchmark protocol. Armed only under `JABAR_BENCH_LOG`, so a
+        // production session never wakes the loop every 20ms.
+        let heartbeat = if crate::bench::enabled() {
+            crossbeam_channel::tick(Duration::from_millis(20))
+        } else {
+            crossbeam_channel::never()
+        };
+        let mut last_beat = std::time::Instant::now();
         loop {
             // The watcher channel is swapped in as the index is loaded, so it is
             // re-read each turn rather than captured once. `never()` parks the
@@ -487,6 +567,24 @@ impl Server {
                 },
                 recv(refresh_tick) -> _ => {
                     self.on_refresh_tick();
+                    continue;
+                },
+                recv(heartbeat) -> _ => {
+                    // Gap beyond the 20ms interval since the previous serviced
+                    // beat is the loop's stall. crossbeam coalesces missed ticks,
+                    // so a long stall surfaces as one large gap; the analysis in
+                    // the runbook expands it across the missed deadlines.
+                    let now = std::time::Instant::now();
+                    let gap = now.saturating_duration_since(last_beat);
+                    last_beat = now;
+                    let lateness = gap.saturating_sub(Duration::from_millis(20));
+                    crate::bench::mark(
+                        "event_loop.heartbeat",
+                        crate::bench::Fields {
+                            lateness_ns: Some(lateness.as_nanos()),
+                            ..Default::default()
+                        },
+                    );
                     continue;
                 },
             };
@@ -596,15 +694,38 @@ impl Server {
             if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
                 return Err(std::io::Error::other("workspace moved before index reload"));
             }
+            let scan_timer = crate::bench::start();
             let shards = SymbolIndex::scan_shards(&dir)?;
+            crate::bench::finish(
+                "reconcile.scan",
+                scan_timer,
+                crate::bench::Fields {
+                    shards: Some(shards.len()),
+                    outcome: Some("ok"),
+                    ..Default::default()
+                },
+            );
             if !force && previous.as_ref().is_some_and(|previous| *previous == shards) {
                 if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
                     return Err(std::io::Error::other("workspace moved during index validation"));
                 }
                 return Ok(RefreshWork::Unchanged);
             }
+            let build_timer = crate::bench::start();
             let loaded =
                 load_validated_generation_from(&dir, shards, provenance.as_ref(), root.as_deref())?;
+            crate::bench::finish(
+                "reload.build",
+                build_timer,
+                crate::bench::Fields {
+                    shards: Some(loaded.shards.len()),
+                    definitions: Some(loaded.index.definition_count()),
+                    references: Some(loaded.index.reference_count()),
+                    occurrences: Some(loaded.index.occurrence_count()),
+                    outcome: Some(if loaded.index.is_empty() { "empty" } else { "ok" }),
+                    ..Default::default()
+                },
+            );
             if loaded.shards.is_empty() {
                 return Ok(RefreshWork::Empty(loaded.shards));
             }
@@ -667,9 +788,11 @@ impl Server {
                     self.notify_index_stale();
                 }
                 Ok(RefreshWork::Loaded(index, shards)) => {
+                    let swap_timer = crate::bench::start();
                     let was_unavailable = self.index.is_none();
                     let definitions = index.definition_count();
-                    tracing::info!(shards = index.shard_count(), definitions, "index reloaded");
+                    let shard_count = index.shard_count();
+                    tracing::info!(shards = shard_count, definitions, "index reloaded");
                     self.index = Some(Arc::from(index));
                     self.refresh_document_freshness();
                     self.index_shards = Some(shards.clone());
@@ -683,6 +806,16 @@ impl Server {
                     if was_unavailable {
                         self.register_workspace_symbol();
                     }
+                    crate::bench::finish(
+                        "reload.swap",
+                        swap_timer,
+                        crate::bench::Fields {
+                            shards: Some(shard_count),
+                            definitions: Some(definitions),
+                            outcome: Some("ok"),
+                            ..Default::default()
+                        },
+                    );
                 }
                 Err(err) => {
                     self.shards_verified = false;
@@ -913,14 +1046,26 @@ impl Server {
         let epoch = Arc::clone(&self.cache_epoch);
         let ticket = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         std::thread::spawn(move || {
-            match index_cache::store(
+            let timer = crate::bench::start();
+            let stored = index_cache::store(
                 &cache.root,
                 &cache.dir,
                 &cache.key,
                 &cache.shards,
                 &index,
                 || epoch.load(Ordering::SeqCst) == ticket,
-            ) {
+            );
+            crate::bench::finish(
+                "cache.write",
+                timer,
+                crate::bench::Fields {
+                    shards: Some(cache.shards.len()),
+                    definitions: Some(index.definition_count()),
+                    outcome: Some(if stored.is_ok() { "ok" } else { "error" }),
+                    ..Default::default()
+                },
+            );
+            match stored {
                 Ok(()) => tracing::info!("built index cache published"),
                 Err(err) => tracing::warn!(%err, "could not publish index cache"),
             }
@@ -1447,7 +1592,17 @@ impl Server {
     /// not an error.
     fn start_watching(&mut self, index_dir: Option<&str>) {
         let index_dir = index_dir.map(paths::Utf8Path::new).and_then(paths::AbsPath::try_new);
-        match FileWatcher::spawn(index_dir, self.workspace_root.as_deref()) {
+        let timer = crate::bench::start();
+        let spawned = FileWatcher::spawn(index_dir, self.workspace_root.as_deref());
+        crate::bench::finish(
+            "watcher.start",
+            timer,
+            crate::bench::Fields {
+                outcome: Some(if spawned.is_ok() { "ok" } else { "error" }),
+                ..Default::default()
+            },
+        );
+        match spawned {
             Ok(watcher) => {
                 tracing::debug!(?index_dir, "watching for index changes");
                 self.watcher = Some(watcher);
