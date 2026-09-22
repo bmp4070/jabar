@@ -155,17 +155,78 @@ pub struct Definition {
     pub enclosing: Option<Range>,
 }
 
-/// One use of a symbol somewhere other than its definition.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Reference {
-    pub symbol: String,
-    pub path: String,
+/// One borrowed use of a symbol somewhere other than its definition.
+///
+/// References are stored compactly inside [`SymbolIndex`]. This view preserves
+/// the public query fields without allocating a symbol or path for every row.
+#[derive(Copy, Clone, Debug)]
+pub struct Reference<'a> {
+    pub symbol: &'a str,
+    pub path: &'a str,
     pub range: Range,
     pub encoding: PositionEncoding,
     /// True when the occurrence is an `import`, which a call-graph query wants
     /// to skip and a rename does not.
     pub is_import: bool,
 }
+
+/// The compact representation persisted in the index snapshot.
+///
+/// The containing map supplies the symbol and `reference_paths` supplies the
+/// path. At monolith scale this avoids two owned strings per reference.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredReference {
+    path: u32,
+    range: Range,
+    encoding: PositionEncoding,
+    is_import: bool,
+}
+
+/// Allocation-free borrowed references for one symbol.
+#[derive(Clone)]
+pub struct References<'a> {
+    symbol: &'a str,
+    paths: &'a [String],
+    inner: std::slice::Iter<'a, StoredReference>,
+}
+
+impl<'a> References<'a> {
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
+    pub fn iter(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl<'a> Iterator for References<'a> {
+    type Item = Reference<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let stored = self.inner.next()?;
+        // Constructed indexes check this conversion when interning. Snapshot
+        // indexes validate every id before they are returned from the reader.
+        let path = &self.paths[stored.path as usize];
+        Some(Reference {
+            symbol: self.symbol,
+            path,
+            range: stored.range,
+            encoding: stored.encoding,
+            is_import: stored.is_import,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for References<'_> {}
 
 /// One symbol occurrence in a file, for position lookup.
 ///
@@ -186,8 +247,14 @@ pub struct SymbolIndex {
     by_name: FxHashMap<String, Vec<usize>>,
     /// Symbol string to definition index.
     by_symbol: FxHashMap<String, usize>,
-    /// Symbol string to every reference to it.
-    references: FxHashMap<String, Vec<Reference>>,
+    /// Symbol string to every compact reference to it.
+    references: FxHashMap<String, Vec<StoredReference>>,
+    /// Interned paths used by `references`.
+    reference_paths: Vec<String>,
+    /// Construction-only reverse lookup for `reference_paths`. Cache reads do
+    /// not rebuild it because loaded indexes are immutable query snapshots.
+    #[serde(skip)]
+    reference_path_ids: FxHashMap<String, u32>,
     /// Supertype symbol to the symbols implementing it.
     implementors: FxHashMap<String, Vec<usize>>,
     /// File path to the definitions it contains.
@@ -355,7 +422,9 @@ impl SymbolIndex {
     }
 
     pub fn read_snapshot(reader: impl Read) -> std::io::Result<SymbolIndex> {
-        rmp_serde::from_read(reader).map_err(std::io::Error::other)
+        let index: SymbolIndex = rmp_serde::from_read(reader).map_err(std::io::Error::other)?;
+        index.validate_snapshot()?;
+        Ok(index)
     }
 
     /// Adds one shard's contents. `origin` is used only for diagnostics.
@@ -372,6 +441,7 @@ impl SymbolIndex {
         for doc in &index.documents {
             let encoding = PositionEncoding::of(doc);
             let path = doc.relative_path.clone();
+            let mut reference_path_id = None;
 
             // `symbols` carries the metadata (kind, docs, relationships);
             // `occurrences` carries the positions. Join them by symbol string.
@@ -432,9 +502,22 @@ impl SymbolIndex {
                         enclosing: Range::from_scip(&occ.enclosing_range),
                     });
                 } else {
-                    self.references.entry(occ.symbol.clone()).or_default().push(Reference {
-                        symbol: occ.symbol.clone(),
-                        path: path.clone(),
+                    let path_id = match reference_path_id {
+                        Some(path_id) => path_id,
+                        None => {
+                            let Some(path_id) = self.intern_reference_path(&path) else {
+                                tracing::warn!(
+                                    origin,
+                                    "too many distinct reference paths; rejecting shard"
+                                );
+                                return false;
+                            };
+                            reference_path_id = Some(path_id);
+                            path_id
+                        }
+                    };
+                    self.references.entry(occ.symbol.clone()).or_default().push(StoredReference {
+                        path: path_id,
                         range,
                         encoding,
                         is_import: roles & SymbolRole::Import as i32 != 0,
@@ -459,6 +542,36 @@ impl SymbolIndex {
         self.symbol_names.push(symbol.to_owned());
         self.symbol_ids.insert(symbol.to_owned(), id);
         id
+    }
+
+    fn intern_reference_path(&mut self, path: &str) -> Option<u32> {
+        // Snapshot reads skip the construction-only reverse map. Rebuild it
+        // only if a caller later chooses to append another shard.
+        if self.reference_path_ids.is_empty() && !self.reference_paths.is_empty() {
+            for (id, existing) in self.reference_paths.iter().enumerate() {
+                let id = u32::try_from(id).ok()?;
+                self.reference_path_ids.insert(existing.clone(), id);
+            }
+        }
+        if let Some(&id) = self.reference_path_ids.get(path) {
+            return Some(id);
+        }
+        let id = u32::try_from(self.reference_paths.len()).ok()?;
+        self.reference_paths.push(path.to_owned());
+        self.reference_path_ids.insert(path.to_owned(), id);
+        Some(id)
+    }
+
+    fn validate_snapshot(&self) -> io::Result<()> {
+        let path_count = self.reference_paths.len();
+        if self.references.values().flatten().any(|reference| reference.path as usize >= path_count)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot contains an invalid reference path id",
+            ));
+        }
+        Ok(())
     }
 
     /// Adds a definition directly, for callers that build an index from
@@ -497,6 +610,11 @@ impl SymbolIndex {
     /// on the same count the measurement protocol requires.
     pub fn reference_count(&self) -> usize {
         self.references.values().map(Vec::len).sum()
+    }
+
+    /// Number of distinct paths retained for reference rows.
+    pub fn reference_path_count(&self) -> usize {
+        self.reference_paths.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -713,8 +831,13 @@ impl SymbolIndex {
     }
 
     /// Every reference to `symbol`, definitions excluded.
-    pub fn references(&self, symbol: &str) -> &[Reference] {
-        self.references.get(symbol).map(Vec::as_slice).unwrap_or(&[])
+    pub fn references<'a>(&'a self, symbol: &str) -> References<'a> {
+        let (symbol, references) = self
+            .references
+            .get_key_value(symbol)
+            .map(|(symbol, references)| (symbol.as_str(), references.as_slice()))
+            .unwrap_or(("", &[]));
+        References { symbol, paths: &self.reference_paths, inner: references.iter() }
     }
 
     /// Definitions declaring `symbol` as a supertype.
@@ -874,6 +997,93 @@ mod tests {
         );
         assert_eq!(Range::from_scip(&[1, 2]), None, "too short to be a range");
         assert_eq!(Range::from_scip(&[]), None);
+    }
+
+    #[test]
+    fn references_intern_paths_and_round_trip_without_allocating_views() {
+        let symbol = "semanticdb maven example lib example/Library#call().";
+        let mut shard = Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = "src/Caller.java".to_owned();
+        document.position_encoding =
+            scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into();
+        for (line, roles) in [(3, 0), (7, SymbolRole::Import as i32)] {
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = vec![line, 4, 8];
+            occurrence.symbol = symbol.to_owned();
+            occurrence.symbol_roles = roles;
+            document.occurrences.push(occurrence);
+        }
+        shard.documents.push(document);
+
+        let mut index = SymbolIndex::default();
+        assert!(index.add_shard(&shard.write_to_bytes().unwrap(), "references.scip"));
+        assert_eq!(index.reference_count(), 2);
+        assert_eq!(index.reference_path_count(), 1);
+        assert!(std::mem::size_of::<StoredReference>() <= 24);
+
+        let before: Vec<_> = index
+            .references(symbol)
+            .map(|reference| {
+                (
+                    reference.symbol.to_owned(),
+                    reference.path.to_owned(),
+                    reference.range,
+                    reference.encoding,
+                    reference.is_import,
+                )
+            })
+            .collect();
+        assert_eq!(before[0].1, "src/Caller.java");
+        assert!(!before[0].4);
+        assert!(before[1].4);
+
+        let mut snapshot = Vec::new();
+        index.write_snapshot(&mut snapshot).unwrap();
+        let restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
+        let mut restored = restored;
+        let after: Vec<_> = restored
+            .references(symbol)
+            .map(|reference| {
+                (
+                    reference.symbol.to_owned(),
+                    reference.path.to_owned(),
+                    reference.range,
+                    reference.encoding,
+                    reference.is_import,
+                )
+            })
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(restored.reference_path_count(), 1);
+
+        // A loaded index remains safely appendable without duplicating an
+        // already-interned path when the skipped reverse map is rebuilt.
+        assert!(restored.add_shard(&shard.write_to_bytes().unwrap(), "again.scip"));
+        assert_eq!(restored.reference_path_count(), 1);
+        assert_eq!(restored.reference_count(), 4);
+    }
+
+    #[test]
+    fn snapshot_rejects_an_invalid_reference_path_id() {
+        let mut index = SymbolIndex::default();
+        index.references.insert(
+            "external symbol".to_owned(),
+            vec![StoredReference {
+                path: 1,
+                range: Range { start_line: 0, start_col: 0, end_line: 0, end_col: 1 },
+                encoding: PositionEncoding::Utf16,
+                is_import: false,
+            }],
+        );
+
+        let mut snapshot = Vec::new();
+        index.write_snapshot(&mut snapshot).unwrap();
+        let error = match SymbolIndex::read_snapshot(snapshot.as_slice()) {
+            Ok(_) => panic!("invalid path id should reject the snapshot"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

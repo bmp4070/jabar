@@ -110,6 +110,15 @@ metadata, atomic generation pointer, and bounded old-generation cleanup. A hit
 loads before scanning `bazel-bin`; reconciliation and reload run on worker
 threads, cached sessions avoid a recursive output-tree watcher, and
 `jabar/status` distinguishes a cache hit from verified shard metadata. Cache
-misses still scan and decode synchronously, and the representative-monolith
-benchmarks, source-build freshness, indexing coverage, and CI distribution
-work remain open.
+format version 2 stores each reference as a compact row and interns its file
+path instead of serializing an owned symbol and path for every reference. The
+surrounding map supplies the symbol. Cache reads validate the path ids before
+publishing the index, and version 1 snapshots fall back to shard loading rather
+than being converted in memory. Benchmark events record snapshot bytes,
+reference/occurrence counts, and distinct reference paths on cache hits.
+
+The version 2 layout still uses streaming MessagePack. It is an incremental
+reduction in bytes, allocations, and resident state ahead of any mmap or lazy
+format decision. Cache misses still scan and decode synchronously, and the
+representative-monolith version 2 measurements, source-build freshness,
+indexing coverage, and CI distribution work remain open.

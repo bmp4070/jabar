@@ -84,7 +84,7 @@ fn check_not_null_has_thirty_references_across_fifteen_files() {
     let references = index.references(&def.symbol);
     assert_eq!(references.len(), 30, "EXPECTATIONS.md records 30 call sites");
 
-    let mut files: Vec<_> = references.iter().map(|r| r.path.as_str()).collect();
+    let mut files: Vec<_> = references.iter().map(|r| r.path).collect();
     files.sort_unstable();
     files.dedup();
     assert_eq!(files.len(), 15, "across 15 files");
@@ -312,7 +312,7 @@ fn a_reference_attributes_to_its_enclosing_method() {
     let callers: Vec<String> = index
         .references(&next_delay.symbol)
         .iter()
-        .filter_map(|r| index.enclosing_callable(&r.path, r.range))
+        .filter_map(|r| index.enclosing_callable(r.path, r.range))
         .map(|d| d.name.clone())
         .collect();
 
