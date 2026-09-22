@@ -27,17 +27,17 @@ This is the reported-scale monolith (6,876 shards) the protocol was written for.
 
 ## Toolchain locations on this host
 
-`cargo`, `scip-java`, and coursier are not on `PATH` by default here. Pin them:
+The reproducible way is `nix-shell` from the repo root — [`shell.nix`](../shell.nix)
+pins the Rust 1.97.1 toolchain (rustc/cargo/**clippy**/**rustfmt**/rust-analyzer),
+`jdk21`, and `coursier`, and bootstraps scip-java 0.12.3 on first entry. Both
+`cargo fmt` and `cargo clippy -D warnings` run there (clippy is clean on the
+harness crates). If you must pin by hand instead:
 
 ```sh
 export PATH="/nix/store/cavxgwfb7l7akyvvqvnl39d6nw0wckgh-cargo-1.97.1/bin:$PATH"
 export JAVA_HOME="/nix/store/v7ngs49whjqv3jhdsdmip7scajb14yz2-onejdk21-21.0.9.0.101+148"
 export PATH="$JAVA_HOME/bin:$PATH"
 ```
-
-`rustfmt` and `clippy` are **not** installed in this nix environment (only
-`cargo`/`rustc`). Run `cargo fmt`/`cargo clippy` on a host that has them before
-committing; new code here was hand-matched to `rustfmt.toml` (max width 100).
 
 ### scip-java (for auto-indexing / fresh-build parity)
 
@@ -228,5 +228,23 @@ pass/fail with evidence.
 - [ ] Decide cold-storage handling (deferred here) and record it.
 - [ ] `probe` is single-in-flight; add true concurrent open-loop sending + bounded
       retained payloads if a scenario needs overlapping requests.
-- [ ] Run `cargo fmt` + `cargo clippy -D warnings` on a host that has them.
+- [x] Run `cargo fmt` + `cargo clippy -D warnings` — now available via `shell.nix`; clippy is clean on the harness crates.
 - [ ] Pre-register host GiB caps / effective cgroup limit before the first counted run.
+
+### Follow-ups from the first counted run
+
+The first counted run against core ([results](monolith-measurement-results.md))
+surfaced these, in rough priority order:
+
+- [ ] **Async index build** — the ~118 s cold decode runs synchronously in
+      `initialize` and blocks the event loop; move it off the loop thread and
+      serve `initialize` immediately, reporting readiness via `jabar/status`.
+- [ ] **Faster warm start** — cache-hit is still ~57 s, deserialize-bound on the
+      10 GiB snapshot; consider an mmap/zero-copy format or lazy section loading.
+- [ ] **`workspace/symbol` perf** — p95 ~290 ms over 3.1M defs, above the 250 ms
+      gate; add a persisted name index (prefix/trigram/fst) instead of scanning.
+- [ ] **Peak memory** — ~67 GiB peak vs ~17 GiB resident; stream/drop raw shards
+      during decode and avoid large transient buffers on the cache-load path.
+- [ ] **`startup` cache publication** — add `--hold-secs`/quiesce so the workload
+      waits for `cache.write` to publish `CURRENT` before shutdown, making
+      cache-miss → publish → cache-hit a single workload.
