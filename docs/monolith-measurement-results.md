@@ -37,12 +37,47 @@ This is the reported-scale monolith the protocol was written for.
 
 These cache size, startup, and memory numbers describe the version 1 snapshot.
 The later version 2 format interns reference paths and removes the duplicated
-symbol and path strings from each reference row. It requires a new counted run;
-the values below are retained as the comparison baseline.
+symbol and path strings from each reference row. Its counted results are in
+[Version 2 snapshot](#version-2-snapshot--counted-results-2026-09-22) below; the
+version 1 values here are retained as the comparison baseline.
 
 Counts are identical across the cache-miss and cache-hit runs (3,130,763
 definitions both times) — a first, if narrow, **correctness-parity** signal
 between a freshly-decoded index and one restored from cache.
+
+## Version 2 snapshot — counted results (2026-09-22)
+
+The version 2 format was then measured against the same core checkout on this
+host (jabar `perf/warm-start-memory` @ `8d06862`, `--release`, `index.auto=false`).
+The version 1 cache was version-rejected, so the process decoded the shards once
+and published a fresh v2 generation; a subsequent `startup` then hit it. Counts
+match the v1 run exactly — 3,130,763 defs / 39,434,571 refs / 42,567,085
+occurrences, across 165,165 distinct reference paths — and the `cache.read` hit
+self-reports the snapshot byte count, so this is **correctness parity** between
+the decoded index and the v2 snapshot on both counts and bytes.
+
+| Metric | v1 | v2 | Change |
+| --- | --- | --- | --- |
+| `index.bin` | 10.14 GiB (10,892,558,559 B) | **3.74 GiB** (4,017,239,476 B) | **2.71× smaller** (−63%) |
+| Warm start (`cache.read` → first `workspace/symbol`) | ~57 s | **~22 s** (21.8 / 22.1 s) | **2.6× faster** |
+| Warm peak RSS | 62.0 GiB | **24.6 GiB** | **2.5× lower** |
+| Steady-state resident | ≈16.7 GiB | **≈7.3 GiB** | **2.3× lower** |
+| Cache-miss decode-path peak RSS | 66.9 GiB | 29.7 GiB | 2.25× lower |
+| `cache.write` (miss) | 80.7 s | 58.7 s | 1.37× faster |
+| `workspace/symbol` p50 / p95 (probe) | 167 / 290 ms | 145 / 152 ms | now inside the 250 ms gate |
+
+Both warm samples agree (`cache.read` 21.73 s / 22.03 s). `shards.decode` is
+unchanged (~100 s here) — v2 touches only the persisted layout, not the
+synchronous shard decode, so cold start and its event-loop block (finding 1)
+remain open.
+
+**What moved:** removing the owned `symbol` and `path` strings from every one of
+the 39.4M reference rows — the symbol is now the map key, paths intern into a
+165,165-entry table, and each row is a 24-byte `StoredReference` — shrinks the
+snapshot by 6.4 GiB, roughly halves warm-start deserialization, and cuts resident
+and peak memory by ~2.3–2.5×. It is still streaming MessagePack, so the
+mmap/zero-copy and lazy-section options in recommendation 2 remain available for a
+further cut; this is the incremental step ahead of that decision.
 
 ## Startup
 
