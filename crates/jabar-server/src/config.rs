@@ -10,7 +10,7 @@ use paths::Utf8PathBuf;
 use serde::Deserialize;
 
 /// Client-supplied settings.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
     /// Where bazel should keep its state.
@@ -33,7 +33,7 @@ pub struct Config {
     pub index: IndexConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct IndexConfig {
     /// Run the aspect at startup when no index is found.

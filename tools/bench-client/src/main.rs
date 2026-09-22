@@ -61,7 +61,8 @@ struct Args {
 impl Args {
     fn parse() -> Result<Args> {
         let mut raw = std::env::args().skip(1);
-        let command = raw.next().context("usage: jabar-bench <startup|probe> [--flag value ...]")?;
+        let command =
+            raw.next().context("usage: jabar-bench <startup|probe> [--flag value ...]")?;
         let mut opts = BTreeMap::new();
         while let Some(flag) = raw.next() {
             let key =
@@ -113,8 +114,7 @@ fn workload_startup(args: &Args) -> Result<Value> {
     let status = client.request("jabar/status", json!({}))?;
     let t_first_status = spawned.elapsed();
     let index_loaded = status.get("indexLoaded").and_then(Value::as_bool).unwrap_or(false);
-    let indexed_definitions =
-        status.get("indexedDefinitions").and_then(Value::as_u64).unwrap_or(0);
+    let indexed_definitions = status.get("indexedDefinitions").and_then(Value::as_u64).unwrap_or(0);
 
     let symbols = client.request("workspace/symbol", json!({ "query": query }))?;
     let t_first_symbol = spawned.elapsed();

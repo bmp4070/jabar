@@ -80,6 +80,9 @@ Events wired so far, mapped to the protocol's boundary table:
 | `reconcile.scan` | `reconcile.scan` | refresh worker |
 | `reload.build` | `reload.build` | refresh worker |
 | `reload.swap` | `reload.swap` | `on_refresh_result` |
+| `explicit_load.build` | `explicit_load.build` | explicit-load generation worker |
+| `index.reclaim` | `index.reclaim` | index reclamation worker |
+| `cache.queue` | `cache.queue` | cache job queued → started/superseded |
 | `cache.write` | `cache.write` | `write_cache_async` worker |
 | `watcher.start` | `watcher.start` | `start_watching` |
 | `event_loop.heartbeat` | `event_loop.heartbeat` (`lateness_ns`) | main loop, 20ms, **armed only under bench** |
@@ -176,8 +179,8 @@ cache publication, and 30s quiescence per the protocol before recording peak RSS
 
 ### Phase 3 — refresh & responsiveness
 
-Drive the 9 refresh scenarios by mutating shards under `bazel-bin` / switching
-HEAD while a `probe` run is in flight, e.g.:
+Drive the 12 refresh and lifecycle scenarios by mutating shards under
+`bazel-bin` or switching HEAD while a `probe` run is in flight, e.g.:
 
 ```sh
 target/release/jabar-bench probe \

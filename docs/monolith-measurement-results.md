@@ -44,7 +44,7 @@ between a freshly-decoded index and one restored from cache.
 Median of the runs below; each is a single sample (not yet the ≥10/≥30 the
 protocol asks for — see caveats).
 
-| Boundary | Cache miss (cold) | Cache hit (warm) |
+| Boundary | Cache miss (storage warm) | Cache hit (storage warm) |
 | --- | --- | --- |
 | `cache.key` | 2.2 ms | 2.4 ms |
 | `cache.read` | 0.02 ms (miss) | **57.41 s** (hit) |
@@ -171,8 +171,9 @@ hit) before publishing any number as a gate result.
 
 - Startup repeated to the protocol's sample counts (≥10 miss / ≥30 hit) with
   p50/range.
-- The 9 refresh scenarios (shard mutation, incremental build, branch switch,
-  watcher-error → unverified) and their reload/heartbeat behaviour.
+- The 12 refresh and lifecycle scenarios (shard mutation, incremental build,
+  branch switch, watcher-error → unverified, explicit reload, reclamation, and
+  superseded cache writes) and their reload/heartbeat behaviour.
 - Auto-indexing: the scip-java aspect build (`index.build`), and fresh-build vs
   cache-hit correctness parity beyond raw counts.
 - Cold-storage (page-cache-dropped) startup.

@@ -11,12 +11,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use build_model::{AspectConfig, AspectRunner, BazelCli};
-use crossbeam_channel::{Receiver, Sender};
-use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
 use paths::{AbsPath, AbsPathBuf};
@@ -214,9 +214,126 @@ struct RefreshResult {
 }
 
 enum RefreshWork {
-    Unchanged,
-    Loaded(Box<SymbolIndex>, Vec<ShardMetadata>),
-    Empty(Vec<ShardMetadata>),
+    Unchanged { provenance: Option<CacheKey> },
+    Loaded { index: Box<SymbolIndex>, shards: Vec<ShardMetadata>, provenance: Option<CacheKey> },
+    Empty { shards: Vec<ShardMetadata>, provenance: Option<CacheKey> },
+}
+
+struct ExplicitLoadResult {
+    request_id: RequestId,
+    revision: u64,
+    result: Result<ExplicitGeneration, RequestError>,
+}
+
+struct PendingExplicitLoad {
+    request_id: RequestId,
+    started: Instant,
+}
+
+struct ExplicitGeneration {
+    path: paths::Utf8PathBuf,
+    index: Box<SymbolIndex>,
+    shards: Vec<ShardMetadata>,
+    provenance: Option<CacheKey>,
+    watcher: Result<FileWatcher, String>,
+}
+
+struct CacheWriteJob {
+    cache: CacheState,
+    index: Arc<SymbolIndex>,
+    epoch: Arc<AtomicU64>,
+    ticket: u64,
+    queued: Option<Instant>,
+}
+
+impl CacheWriteJob {
+    fn run(self) {
+        self.finish_queue("started");
+        let timer = crate::bench::start();
+        let stored = index_cache::store(
+            &self.cache.root,
+            &self.cache.dir,
+            &self.cache.key,
+            &self.cache.shards,
+            &self.index,
+            || self.epoch.load(Ordering::SeqCst) == self.ticket,
+        );
+        crate::bench::finish(
+            "cache.write",
+            timer,
+            crate::bench::Fields {
+                generation: Some(self.ticket),
+                shards: Some(self.cache.shards.len()),
+                definitions: Some(self.index.definition_count()),
+                outcome: Some(if stored.is_ok() {
+                    "ok"
+                } else if !self.is_current() {
+                    "superseded"
+                } else {
+                    "error"
+                }),
+                ..Default::default()
+            },
+        );
+        match stored {
+            Ok(()) => tracing::info!("built index cache published"),
+            Err(err) if !self.is_current() => {
+                tracing::debug!(%err, "superseded index cache write stopped")
+            }
+            Err(err) => tracing::warn!(%err, "could not publish index cache"),
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.ticket
+    }
+
+    fn finish_queue(&self, outcome: &'static str) {
+        crate::bench::finish(
+            "cache.queue",
+            self.queued,
+            crate::bench::Fields {
+                generation: Some(self.ticket),
+                shards: Some(self.cache.shards.len()),
+                definitions: Some(self.index.definition_count()),
+                outcome: Some(outcome),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn supersede(self, outcome: &'static str) -> Arc<SymbolIndex> {
+        self.finish_queue(outcome);
+        self.index
+    }
+}
+
+struct RetiredIndex {
+    index: Arc<SymbolIndex>,
+    queued: Option<Instant>,
+}
+
+/// Sends `value`, replacing the one queued value when the consumer is busy.
+fn send_latest<T>(
+    sender: &Sender<T>,
+    receiver: &Receiver<T>,
+    mut value: T,
+    mut supersede: impl FnMut(T),
+) -> Result<(), T> {
+    loop {
+        match sender.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Disconnected(returned)) => return Err(returned),
+            Err(TrySendError::Full(returned)) => {
+                value = returned;
+                match receiver.try_recv() {
+                    Ok(old) => supersede(old),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => return Err(value),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -461,10 +578,16 @@ pub struct Server {
     index_shards: Option<Vec<ShardMetadata>>,
     /// Workspace and output-tree identity captured for the loaded generation.
     provenance: Option<CacheKey>,
+    /// A branch movement requires the next generation worker to capture a new
+    /// HEAD and output-tree identity before it can install anything.
+    provenance_stale: bool,
     cache: Option<CacheState>,
     cache_hit: bool,
     shards_verified: bool,
     cache_epoch: Arc<AtomicU64>,
+    cache_write_tx: Sender<CacheWriteJob>,
+    cache_write_rx: Receiver<CacheWriteJob>,
+    retire_tx: Sender<RetiredIndex>,
     refresh_tx: Sender<RefreshResult>,
     refresh_rx: Receiver<RefreshResult>,
     refresh_revision: u64,
@@ -472,6 +595,11 @@ pub struct Server {
     refresh_again: bool,
     refresh_intent: RefreshIntent,
     refresh_progress: Option<String>,
+    explicit_load_running: bool,
+    explicit_load: Option<PendingExplicitLoad>,
+    explicit_load_tx: Sender<ExplicitLoadResult>,
+    explicit_load_rx: Receiver<ExplicitLoadResult>,
+    explicit_load_progress: Option<String>,
     telemetry: Telemetry,
     shutdown_requested: bool,
 }
@@ -484,6 +612,33 @@ impl Server {
     ) -> Server {
         let build = workspace_root.clone().map(BazelCli::new);
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
+        let (explicit_load_tx, explicit_load_rx) = crossbeam_channel::unbounded();
+        let (retire_tx, retire_rx): (Sender<RetiredIndex>, Receiver<RetiredIndex>) =
+            crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            while let Ok(retired) = retire_rx.recv() {
+                let definitions = retired.index.definition_count();
+                let outcome =
+                    if Arc::strong_count(&retired.index) == 1 { "reclaimed" } else { "released" };
+                drop(retired.index);
+                crate::bench::finish(
+                    "index.reclaim",
+                    retired.queued,
+                    crate::bench::Fields {
+                        definitions: Some(definitions),
+                        outcome: Some(outcome),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+        let (cache_write_tx, cache_write_rx) = crossbeam_channel::bounded(1);
+        let cache_worker_rx = cache_write_rx.clone();
+        std::thread::spawn(move || {
+            while let Ok(job) = cache_worker_rx.recv() {
+                CacheWriteJob::run(job);
+            }
+        });
         Server {
             sender,
             encoding,
@@ -495,10 +650,14 @@ impl Server {
             index: None,
             index_shards: None,
             provenance: None,
+            provenance_stale: false,
             cache: None,
             cache_hit: false,
             shards_verified: false,
             cache_epoch: Arc::new(AtomicU64::new(0)),
+            cache_write_tx,
+            cache_write_rx,
+            retire_tx,
             refresh_tx,
             refresh_rx,
             refresh_revision: 0,
@@ -506,6 +665,11 @@ impl Server {
             refresh_again: false,
             refresh_intent: RefreshIntent::Idle,
             refresh_progress: None,
+            explicit_load_running: false,
+            explicit_load: None,
+            explicit_load_tx,
+            explicit_load_rx,
+            explicit_load_progress: None,
             config: Config::default(),
             overlay: Overlay::new(),
             supports_progress: false,
@@ -565,6 +729,12 @@ impl Server {
                     }
                     continue;
                 },
+                recv(self.explicit_load_rx) -> result => {
+                    if let Ok(result) = result {
+                        self.on_explicit_load_result(result);
+                    }
+                    continue;
+                },
                 recv(refresh_tick) -> _ => {
                     self.on_refresh_tick();
                     continue;
@@ -592,6 +762,7 @@ impl Server {
                 Message::Request(request) => {
                     if request.method == lsp_types::request::Shutdown::METHOD {
                         tracing::info!("client requested shutdown");
+                        self.cancel_explicit_load("server is shutting down");
                         self.shutdown_requested = true;
                         self.send(Response::new_ok(request.id, ()).into());
                         continue;
@@ -649,26 +820,15 @@ impl Server {
                 // tree. Nothing can be reloaded that would be right, so the
                 // honest move is to drop the index and say so.
                 tracing::info!("the workspace moved; dropping the index as stale");
-                self.index = None;
+                self.retire_current_index();
+                self.cancel_explicit_load("workspace moved while the index was loading");
                 self.cache_hit = false;
                 self.shards_verified = false;
                 self.refresh_intent = RefreshIntent::AwaitingBuild;
+                self.provenance_stale = true;
                 self.refresh_again = false;
                 self.refresh_revision = self.refresh_revision.wrapping_add(1);
                 self.cache_epoch.fetch_add(1, Ordering::SeqCst);
-                if let Some(cache) = &mut self.cache
-                    && let Ok(key) = CacheKey::new(&cache.root, &cache.dir, &self.config)
-                {
-                    cache.key = key.clone();
-                    self.provenance = Some(key);
-                } else if let (Some(root), Some(dir)) = (&self.workspace_root, &self.index_dir) {
-                    self.provenance = CacheKey::new(
-                        Path::new(root.as_str()),
-                        Path::new(dir.as_str()),
-                        &self.config,
-                    )
-                    .ok();
-                }
                 self.notify_index_stale();
             }
             Change::WatcherError => {
@@ -689,51 +849,63 @@ impl Server {
         };
         let previous = self.index_shards.clone();
         let provenance = self.provenance.clone();
+        let provenance_stale = self.provenance_stale;
         let root = self.workspace_root.as_ref().map(|root| PathBuf::from(root.as_str()));
+        let config = self.config.clone();
         self.schedule_refresh(changed, move || {
+            let provenance = if provenance_stale {
+                root.as_deref().map(|root| CacheKey::new(root, &dir, &config)).transpose()?
+            } else {
+                provenance
+            };
             if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
                 return Err(std::io::Error::other("workspace moved before index reload"));
             }
             let scan_timer = crate::bench::start();
-            let shards = SymbolIndex::scan_shards(&dir)?;
+            let scanned = SymbolIndex::scan_shards(&dir);
             crate::bench::finish(
                 "reconcile.scan",
                 scan_timer,
                 crate::bench::Fields {
-                    shards: Some(shards.len()),
-                    outcome: Some("ok"),
+                    shards: scanned.as_ref().ok().map(Vec::len),
+                    outcome: Some(if scanned.is_ok() { "ok" } else { "error" }),
                     ..Default::default()
                 },
             );
+            let shards = scanned?;
             if !force && previous.as_ref().is_some_and(|previous| *previous == shards) {
                 if !provenance_is_current(provenance.as_ref(), root.as_deref(), &dir) {
                     return Err(std::io::Error::other("workspace moved during index validation"));
                 }
-                return Ok(RefreshWork::Unchanged);
+                return Ok(RefreshWork::Unchanged { provenance });
             }
             let build_timer = crate::bench::start();
             let loaded =
-                load_validated_generation_from(&dir, shards, provenance.as_ref(), root.as_deref())?;
+                load_validated_generation_from(&dir, shards, provenance.as_ref(), root.as_deref());
             crate::bench::finish(
                 "reload.build",
                 build_timer,
-                crate::bench::Fields {
-                    shards: Some(loaded.shards.len()),
-                    definitions: Some(loaded.index.definition_count()),
-                    references: Some(loaded.index.reference_count()),
-                    occurrences: Some(loaded.index.occurrence_count()),
-                    outcome: Some(if loaded.index.is_empty() { "empty" } else { "ok" }),
-                    ..Default::default()
+                match &loaded {
+                    Ok(loaded) => crate::bench::Fields {
+                        shards: Some(loaded.shards.len()),
+                        definitions: Some(loaded.index.definition_count()),
+                        references: Some(loaded.index.reference_count()),
+                        occurrences: Some(loaded.index.occurrence_count()),
+                        outcome: Some(if loaded.index.is_empty() { "empty" } else { "ok" }),
+                        ..Default::default()
+                    },
+                    Err(_) => crate::bench::Fields { outcome: Some("error"), ..Default::default() },
                 },
             );
+            let loaded = loaded?;
             if loaded.shards.is_empty() {
-                return Ok(RefreshWork::Empty(loaded.shards));
+                return Ok(RefreshWork::Empty { shards: loaded.shards, provenance });
             }
             let index = loaded.index;
             if index.is_empty() {
                 return Err(std::io::Error::other("no usable SCIP shards after reload"));
             }
-            Ok(RefreshWork::Loaded(Box::new(index), loaded.shards))
+            Ok(RefreshWork::Loaded { index: Box::new(index), shards: loaded.shards, provenance })
         });
     }
 
@@ -742,6 +914,12 @@ impl Server {
         changed: bool,
         work: impl FnOnce() -> std::io::Result<RefreshWork> + Send + 'static,
     ) {
+        if self.explicit_load_running {
+            if changed {
+                self.refresh_again = true;
+            }
+            return;
+        }
         if self.refresh_running {
             if changed {
                 self.refresh_revision = self.refresh_revision.wrapping_add(1);
@@ -765,18 +943,21 @@ impl Server {
         self.end_progress(progress);
         if result.revision == self.refresh_revision {
             match result.result {
-                Ok(RefreshWork::Unchanged) if self.index.is_some() => {
+                Ok(RefreshWork::Unchanged { provenance }) if self.index.is_some() => {
+                    self.update_provenance(provenance);
                     self.shards_verified = true;
                     self.refresh_intent = RefreshIntent::Idle;
                 }
-                Ok(RefreshWork::Unchanged) => {
+                Ok(RefreshWork::Unchanged { provenance }) => {
+                    self.update_provenance(provenance);
                     self.shards_verified = false;
                     self.refresh_intent = RefreshIntent::Retry;
                 }
-                Ok(RefreshWork::Empty(shards)) => {
+                Ok(RefreshWork::Empty { shards, provenance }) => {
                     tracing::info!("all indexed shards were removed; clearing the index");
-                    self.index = None;
+                    self.retire_current_index();
                     self.index_shards = Some(shards.clone());
+                    self.update_provenance(provenance);
                     if let Some(cache) = &mut self.cache {
                         cache.shards = shards;
                         index_cache::invalidate(&cache.root);
@@ -787,15 +968,16 @@ impl Server {
                     self.cache_epoch.fetch_add(1, Ordering::SeqCst);
                     self.notify_index_stale();
                 }
-                Ok(RefreshWork::Loaded(index, shards)) => {
+                Ok(RefreshWork::Loaded { index, shards, provenance }) => {
                     let swap_timer = crate::bench::start();
                     let was_unavailable = self.index.is_none();
                     let definitions = index.definition_count();
                     let shard_count = index.shard_count();
                     tracing::info!(shards = shard_count, definitions, "index reloaded");
-                    self.index = Some(Arc::from(index));
+                    self.replace_index(Arc::from(index));
                     self.refresh_document_freshness();
                     self.index_shards = Some(shards.clone());
+                    self.update_provenance(provenance);
                     self.shards_verified = true;
                     self.refresh_intent = RefreshIntent::Idle;
                     if let Some(cache) = &mut self.cache {
@@ -825,13 +1007,10 @@ impl Server {
                     tracing::warn!(%err, "could not reconcile shards; keeping the old index");
                 }
             }
+        } else {
+            self.retire_refresh_result(result.result);
         }
-        if self.refresh_again {
-            self.refresh_again = false;
-            if self.refresh_intent != RefreshIntent::AwaitingBuild {
-                self.schedule_index_refresh(false, self.index.is_none());
-            }
-        }
+        self.schedule_queued_refresh();
     }
 
     /// Tells the client that something slow has started, if it can show that.
@@ -918,6 +1097,42 @@ impl Server {
     fn on_request(&mut self, request: Request) {
         let id = request.id.clone();
 
+        if request.method == LOAD_INDEX_REQUEST {
+            if self.shutdown_requested {
+                self.send(
+                    Response::new_err(
+                        id,
+                        ErrorCode::InvalidRequest as i32,
+                        "server is shutting down".to_owned(),
+                    )
+                    .into(),
+                );
+                return;
+            }
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.load_index(id.clone(), request.params)
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "request failed");
+                    self.send(Response::new_err(id, err.code as i32, err.message).into());
+                }
+                Err(_) => {
+                    tracing::error!(?id, "handler panicked");
+                    self.send(
+                        Response::new_err(
+                            id,
+                            ErrorCode::InternalError as i32,
+                            "internal error; the server has logged it".to_owned(),
+                        )
+                        .into(),
+                    );
+                }
+            }
+            return;
+        }
+
         // A handler that unwinds must not take the session with it, and the
         // client is still owed a response.
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| self.dispatch(request)));
@@ -951,7 +1166,6 @@ impl Server {
 
         match request.method.as_str() {
             STATUS_REQUEST => Ok(serde_json::to_value(self.status())?),
-            LOAD_INDEX_REQUEST => self.load_index(request.params),
             lsp_types::request::WorkspaceSymbolRequest::METHOD => {
                 self.workspace_symbol(request.params)
             }
@@ -1010,7 +1224,8 @@ impl Server {
         self.provenance = self.workspace_root.as_ref().and_then(|root| {
             CacheKey::new(Path::new(root.as_str()), Path::new(dir.as_str()), &self.config).ok()
         });
-        self.index = Some(Arc::new(index));
+        self.provenance_stale = false;
+        self.replace_index(Arc::new(index));
         self.refresh_document_freshness();
         self.start_watching(Some(dir.as_str()));
         self.index_dir = Some(dir);
@@ -1023,9 +1238,10 @@ impl Server {
         self.shards_verified = discovered.verified;
         self.index_shards = Some(discovered.shards);
         self.provenance = discovered.provenance;
+        self.provenance_stale = false;
         self.refresh_intent =
             if discovered.verified { RefreshIntent::Idle } else { RefreshIntent::Retry };
-        self.index = Some(Arc::new(discovered.index));
+        self.replace_index(Arc::new(discovered.index));
         self.refresh_document_freshness();
         // Watching millions of bazel-bin entries recursively can itself stall
         // startup. Cached indexes reconcile in a worker instead.
@@ -1039,44 +1255,67 @@ impl Server {
         }
     }
 
-    fn write_cache_async(&self) {
+    fn replace_index(&mut self, index: Arc<SymbolIndex>) {
+        if let Some(retired) = self.index.replace(index) {
+            self.retire_index(retired);
+        }
+    }
+
+    fn retire_current_index(&mut self) {
+        if let Some(retired) = self.index.take() {
+            self.retire_index(retired);
+        }
+    }
+
+    fn retire_index(&self, index: Arc<SymbolIndex>) {
+        let retired = RetiredIndex { index, queued: crate::bench::start() };
+        if self.retire_tx.send(retired).is_err() {
+            tracing::error!("index reclamation worker stopped");
+        }
+    }
+
+    fn retire_refresh_result(&self, result: std::io::Result<RefreshWork>) {
+        if let Ok(RefreshWork::Loaded { index, .. }) = result {
+            self.retire_index(Arc::from(index));
+        }
+    }
+
+    fn update_provenance(&mut self, provenance: Option<CacheKey>) {
+        if let (Some(cache), Some(key)) = (&mut self.cache, &provenance) {
+            cache.key = key.clone();
+        }
+        self.provenance = provenance;
+        self.provenance_stale = false;
+    }
+
+    fn write_cache_async(&mut self) {
         let (Some(cache), Some(index)) = (self.cache.clone(), self.index.clone()) else {
             return;
         };
         let epoch = Arc::clone(&self.cache_epoch);
         let ticket = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-        std::thread::spawn(move || {
-            let timer = crate::bench::start();
-            let stored = index_cache::store(
-                &cache.root,
-                &cache.dir,
-                &cache.key,
-                &cache.shards,
-                &index,
-                || epoch.load(Ordering::SeqCst) == ticket,
-            );
-            crate::bench::finish(
-                "cache.write",
-                timer,
-                crate::bench::Fields {
-                    shards: Some(cache.shards.len()),
-                    definitions: Some(index.definition_count()),
-                    outcome: Some(if stored.is_ok() { "ok" } else { "error" }),
-                    ..Default::default()
-                },
-            );
-            match stored {
-                Ok(()) => tracing::info!("built index cache published"),
-                Err(err) => tracing::warn!(%err, "could not publish index cache"),
-            }
-        });
+        let job = CacheWriteJob { cache, index, epoch, ticket, queued: crate::bench::start() };
+        let sender = self.cache_write_tx.clone();
+        let receiver = self.cache_write_rx.clone();
+        let mut superseded = Vec::new();
+        if let Err(disconnected) =
+            send_latest(&sender, &receiver, job, |old| superseded.push(old.supersede("superseded")))
+        {
+            superseded.push(disconnected.supersede("error"));
+            tracing::error!("index cache worker stopped");
+        }
+        for index in superseded {
+            self.retire_index(index);
+        }
     }
 
-    /// Loads a directory of SCIP shards into the global index.
-    ///
-    /// Explicit rather than automatic because the index is a build output: the
-    /// aspect has to have run. Wiring jabar to run it is M4 (see F17).
-    fn load_index(&mut self, params: serde_json::Value) -> Result<serde_json::Value, RequestError> {
+    /// Starts an explicit load and keeps its request open until the worker
+    /// returns. At most one generation worker runs at a time.
+    fn load_index(
+        &mut self,
+        request_id: RequestId,
+        params: serde_json::Value,
+    ) -> Result<(), RequestError> {
         #[derive(serde::Deserialize)]
         struct Params {
             path: String,
@@ -1084,48 +1323,232 @@ impl Server {
         let params: Params = serde_json::from_value(params).map_err(|err| {
             RequestError::new(ErrorCode::InvalidParams, format!("expected {{path}}: {err}"))
         })?;
-
-        let mut guard = self.telemetry.start(telemetry::Op::IndexBuild);
-        let path = std::path::Path::new(&params.path);
-        let root = self.workspace_root.as_ref().map(|root| PathBuf::from(root.as_str()));
-        let provenance =
-            root.as_deref().and_then(|root| CacheKey::new(root, path, &self.config).ok());
-        let loaded = load_validated_generation(path, provenance.as_ref(), root.as_deref())
-            .map_err(|err| {
-                guard_failed(&mut guard);
+        let requested = PathBuf::from(&params.path);
+        let root = self.workspace_root.clone();
+        let config = self.config.clone();
+        self.schedule_explicit_load(request_id, move || {
+            let canonical = std::fs::canonicalize(&requested).map_err(|err| {
                 RequestError::new(
                     ErrorCode::InvalidParams,
-                    format!("could not load a complete index from `{}`: {err}", params.path),
+                    format!("could not resolve index directory `{}`: {err}", requested.display()),
                 )
             })?;
-        let index = loaded.index;
-        let manifest = loaded.shards;
+            let path = AbsPathBuf::try_from_std(canonical).map_err(|path| {
+                RequestError::new(
+                    ErrorCode::InvalidParams,
+                    format!("index directory is not an absolute UTF-8 path: `{}`", path.display()),
+                )
+            })?;
+            let disk_path = Path::new(path.as_str());
+            let root_path = root.as_ref().map(|root| Path::new(root.as_str()));
+            let provenance =
+                root_path.and_then(|root| CacheKey::new(root, disk_path, &config).ok());
+            let loaded = load_validated_generation(disk_path, provenance.as_ref(), root_path)
+                .map_err(|err| {
+                    RequestError::new(
+                        ErrorCode::InvalidParams,
+                        format!("could not load a complete index from `{}`: {err}", path.as_str()),
+                    )
+                })?;
+            let watcher_timer = crate::bench::start();
+            let watcher = FileWatcher::spawn(Some(path.as_path()), root.as_deref())
+                .map_err(|err| err.to_string());
+            crate::bench::finish(
+                "watcher.start",
+                watcher_timer,
+                crate::bench::Fields {
+                    outcome: Some(if watcher.is_ok() { "ok" } else { "error" }),
+                    ..Default::default()
+                },
+            );
+            Ok(ExplicitGeneration {
+                path: path.into_utf8_path_buf(),
+                index: Box::new(loaded.index),
+                shards: loaded.shards,
+                provenance,
+                watcher,
+            })
+        })
+    }
 
-        let (shards, definitions) = (index.shard_count(), index.definition_count());
-        guard.finish(if definitions == 0 {
-            telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch }
-        } else {
-            telemetry::Outcome::answered(definitions)
-        });
+    fn schedule_explicit_load(
+        &mut self,
+        request_id: RequestId,
+        work: impl FnOnce() -> Result<ExplicitGeneration, RequestError> + Send + 'static,
+    ) -> Result<(), RequestError> {
+        if self.refresh_running || self.explicit_load_running {
+            return Err(RequestError::new(
+                ErrorCode::RequestFailed,
+                "another index generation is already loading; retry when it completes".to_owned(),
+            ));
+        }
 
-        tracing::info!(shards, definitions, path = %params.path, "index loaded");
         self.refresh_revision = self.refresh_revision.wrapping_add(1);
-        self.index = Some(Arc::new(index));
-        self.refresh_document_freshness();
-        self.cache = None;
-        self.cache_epoch.fetch_add(1, Ordering::SeqCst);
-        self.cache_hit = false;
-        self.shards_verified = true;
-        self.index_shards = Some(manifest);
-        self.provenance = provenance;
-        self.refresh_intent = RefreshIntent::Idle;
-        self.index_dir = Some(paths::Utf8PathBuf::from(params.path.clone()));
-        self.start_watching(Some(&params.path));
-        // The capability was not advertised at initialize, because there was
-        // nothing behind it. Tell the client it exists now.
-        self.register_workspace_symbol();
+        let revision = self.refresh_revision;
+        self.explicit_load_running = true;
+        self.explicit_load =
+            Some(PendingExplicitLoad { request_id: request_id.clone(), started: Instant::now() });
+        self.explicit_load_progress =
+            self.begin_progress("jabar", "loading the requested symbol index");
+        let tx = self.explicit_load_tx.clone();
+        let timer = crate::bench::start();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
+                Err(RequestError::new(
+                    ErrorCode::InternalError,
+                    "index loading worker panicked".to_owned(),
+                ))
+            });
+            let fields = match &result {
+                Ok(generation) => crate::bench::Fields {
+                    generation: Some(revision),
+                    shards: Some(generation.index.shard_count()),
+                    definitions: Some(generation.index.definition_count()),
+                    references: Some(generation.index.reference_count()),
+                    occurrences: Some(generation.index.occurrence_count()),
+                    outcome: Some("ok"),
+                    ..Default::default()
+                },
+                Err(_) => crate::bench::Fields {
+                    generation: Some(revision),
+                    outcome: Some("error"),
+                    ..Default::default()
+                },
+            };
+            crate::bench::finish("explicit_load.build", timer, fields);
+            let _ = tx.send(ExplicitLoadResult { request_id, revision, result });
+        });
+        Ok(())
+    }
 
-        Ok(serde_json::json!({ "shards": shards, "definitions": definitions }))
+    fn on_explicit_load_result(&mut self, result: ExplicitLoadResult) {
+        self.explicit_load_running = false;
+        let Some(pending) = self.explicit_load.as_ref() else {
+            self.retire_explicit_result(result.result);
+            self.schedule_queued_refresh();
+            return;
+        };
+        if pending.request_id != result.request_id {
+            self.retire_explicit_result(result.result);
+            self.schedule_queued_refresh();
+            return;
+        }
+        let pending = self.explicit_load.take().expect("matched pending load");
+        let progress = self.explicit_load_progress.take();
+        self.end_progress(progress);
+
+        if result.revision != self.refresh_revision {
+            self.retire_explicit_result(result.result);
+            self.telemetry.record(telemetry::QueryRecord::new(
+                telemetry::Op::IndexBuild,
+                telemetry::Outcome::Cancelled,
+                pending.started.elapsed(),
+            ));
+            self.send(
+                Response::new_err(
+                    pending.request_id,
+                    ErrorCode::ContentModified as i32,
+                    "workspace changed while the index was loading; retry the request".to_owned(),
+                )
+                .into(),
+            );
+            self.schedule_queued_refresh();
+            return;
+        }
+
+        match result.result {
+            Ok(generation) => {
+                let ExplicitGeneration { path, index, shards, provenance, watcher } = generation;
+                let was_unavailable = self.index.is_none();
+                let shard_count = index.shard_count();
+                let definitions = index.definition_count();
+                self.replace_index(Arc::from(index));
+                self.refresh_document_freshness();
+                self.cache = None;
+                self.cache_epoch.fetch_add(1, Ordering::SeqCst);
+                self.cache_hit = false;
+                self.shards_verified = true;
+                self.index_shards = Some(shards);
+                self.update_provenance(provenance);
+                self.refresh_intent = RefreshIntent::Idle;
+                self.index_dir = Some(path.clone());
+                match watcher {
+                    Ok(watcher) => self.watcher = Some(watcher),
+                    Err(err) => {
+                        self.watcher = None;
+                        tracing::warn!(%err, "not watching for changes; reloads must be manual");
+                    }
+                }
+                if was_unavailable {
+                    self.register_workspace_symbol();
+                }
+                tracing::info!(shards = shard_count, definitions, path = %path, "index loaded");
+                let outcome = if definitions == 0 {
+                    telemetry::Outcome::Empty { reason: telemetry::EmptyReason::NoMatch }
+                } else {
+                    telemetry::Outcome::answered(definitions)
+                };
+                self.telemetry.record(telemetry::QueryRecord::new(
+                    telemetry::Op::IndexBuild,
+                    outcome,
+                    pending.started.elapsed(),
+                ));
+                self.send(
+                    Response::new_ok(
+                        pending.request_id,
+                        serde_json::json!({ "shards": shard_count, "definitions": definitions }),
+                    )
+                    .into(),
+                );
+            }
+            Err(err) => {
+                self.telemetry.record(telemetry::QueryRecord::new(
+                    telemetry::Op::IndexBuild,
+                    telemetry::Outcome::Failed { failure: telemetry::Failure::Io },
+                    pending.started.elapsed(),
+                ));
+                tracing::warn!(%err, "request failed");
+                self.send(
+                    Response::new_err(pending.request_id, err.code as i32, err.message).into(),
+                );
+            }
+        }
+        self.schedule_queued_refresh();
+    }
+
+    fn retire_explicit_result(&self, result: Result<ExplicitGeneration, RequestError>) {
+        if let Ok(generation) = result {
+            self.retire_index(Arc::from(generation.index));
+        }
+    }
+
+    fn cancel_explicit_load(&mut self, message: &str) {
+        let Some(pending) = self.explicit_load.take() else { return };
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        let progress = self.explicit_load_progress.take();
+        self.end_progress(progress);
+        self.telemetry.record(telemetry::QueryRecord::new(
+            telemetry::Op::IndexBuild,
+            telemetry::Outcome::Cancelled,
+            pending.started.elapsed(),
+        ));
+        self.send(
+            Response::new_err(
+                pending.request_id,
+                ErrorCode::RequestCanceled as i32,
+                message.to_owned(),
+            )
+            .into(),
+        );
+    }
+
+    fn schedule_queued_refresh(&mut self) {
+        if self.refresh_again {
+            self.refresh_again = false;
+            if self.refresh_intent != RefreshIntent::AwaitingBuild {
+                self.schedule_index_refresh(false, self.index.is_none());
+            }
+        }
     }
 
     fn workspace_symbol(
@@ -1793,6 +2216,7 @@ impl Server {
                 PositionEncoding::Utf16 => "utf-16",
             },
             index_loaded: self.index.is_some(),
+            index_loading: self.refresh_running || self.explicit_load_running,
             watching: self.watcher.is_some(),
             index_cache_loaded: self.cache_hit,
             shards_verified: self.shards_verified,
@@ -1827,6 +2251,20 @@ impl Server {
     }
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        while let Ok(result) = self.refresh_rx.try_recv() {
+            self.retire_refresh_result(result.result);
+        }
+        while let Ok(result) = self.explicit_load_rx.try_recv() {
+            self.retire_explicit_result(result.result);
+        }
+        if let Some(index) = self.index.take() {
+            self.retire_index(index);
+        }
+    }
+}
+
 /// The payload of [`STATUS_REQUEST`].
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1835,6 +2273,7 @@ pub struct Status {
     pub build_graph_available: bool,
     pub position_encoding: &'static str,
     pub index_loaded: bool,
+    pub index_loading: bool,
     pub watching: bool,
     /// True when startup loaded the persisted built-index snapshot.
     pub index_cache_loaded: bool,
@@ -1888,6 +2327,54 @@ mod startup_cache_tests {
         let (connection, _client) = Connection::memory();
         let root = AbsPathBuf::try_from(root.to_str().expect("UTF-8 test path")).unwrap();
         Server::new(connection.sender, PositionEncoding::Utf16, Some(root))
+    }
+
+    #[test]
+    fn latest_queue_replaces_only_the_pending_value() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut superseded = Vec::new();
+
+        send_latest(&tx, &rx, 1, |old| superseded.push(old)).unwrap();
+        send_latest(&tx, &rx, 2, |old| superseded.push(old)).unwrap();
+
+        assert_eq!(superseded, [1]);
+        assert_eq!(rx.try_recv().unwrap(), 2);
+    }
+
+    #[test]
+    fn explicit_load_runs_off_loop_and_bounds_generation_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = paths::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+        let mut server = server();
+
+        server
+            .schedule_explicit_load(RequestId::from(1), move || {
+                release_rx.recv().unwrap();
+                Ok(ExplicitGeneration {
+                    path,
+                    index: Box::new(test_index()),
+                    shards: Vec::new(),
+                    provenance: None,
+                    watcher: Err("disabled in test".to_owned()),
+                })
+            })
+            .unwrap();
+
+        assert!(server.status().index_loading, "the worker is still blocked");
+        let busy = server
+            .schedule_explicit_load(RequestId::from(2), || {
+                unreachable!("a second generation worker must not start")
+            })
+            .unwrap_err();
+        assert!(matches!(busy.code, ErrorCode::RequestFailed));
+
+        release_tx.send(()).unwrap();
+        let result = server.explicit_load_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_explicit_load_result(result);
+
+        assert!(!server.status().index_loading);
+        assert_eq!(server.index.as_ref().unwrap().definition_count(), 1);
     }
 
     fn write_class_shard(dir: &Path, name: &str) {
@@ -1995,10 +2482,11 @@ mod startup_cache_tests {
         let mut server = server();
         server.on_refresh_result(RefreshResult {
             revision: 0,
-            result: Ok(RefreshWork::Loaded(
-                Box::new(test_index()),
-                vec![ShardMetadata { path: "foo.scip".into(), len: 1, modified_ns: 1 }],
-            )),
+            result: Ok(RefreshWork::Loaded {
+                index: Box::new(test_index()),
+                shards: vec![ShardMetadata { path: "foo.scip".into(), len: 1, modified_ns: 1 }],
+                provenance: None,
+            }),
         });
         assert_eq!(server.index.as_ref().unwrap().search("Foo").len(), 1);
     }
@@ -2009,7 +2497,7 @@ mod startup_cache_tests {
         server.index = Some(Arc::new(test_index()));
         server.on_refresh_result(RefreshResult {
             revision: 0,
-            result: Ok(RefreshWork::Empty(Vec::new())),
+            result: Ok(RefreshWork::Empty { shards: Vec::new(), provenance: None }),
         });
         assert!(server.index.is_none());
         assert!(server.shards_verified);
@@ -2020,11 +2508,11 @@ mod startup_cache_tests {
         let mut server = server();
         server.refresh_running = true;
         server.refresh_revision = 7;
-        server.schedule_refresh(false, || Ok(RefreshWork::Unchanged));
+        server.schedule_refresh(false, || Ok(RefreshWork::Unchanged { provenance: None }));
         assert_eq!(server.refresh_revision, 7);
         assert!(!server.refresh_again);
 
-        server.schedule_refresh(true, || Ok(RefreshWork::Unchanged));
+        server.schedule_refresh(true, || Ok(RefreshWork::Unchanged { provenance: None }));
         assert_eq!(server.refresh_revision, 8);
         assert!(server.refresh_again);
     }
@@ -2048,7 +2536,7 @@ mod startup_cache_tests {
     #[test]
     fn workspace_movement_waits_for_a_new_shard_event() {
         let temp = tempfile::tempdir().unwrap();
-        let mut server = server();
+        let mut server = server_at(temp.path());
         server.index = Some(Arc::new(test_index()));
         server.index_dir = Some(paths::Utf8PathBuf::from(temp.path().to_str().unwrap().to_owned()));
         server.index_shards = Some(Vec::new());
@@ -2067,6 +2555,10 @@ mod startup_cache_tests {
         server.on_file_change(Change::Index);
         assert!(server.refresh_running, "a shard event permits a validated reload");
         assert_eq!(server.refresh_intent, RefreshIntent::Retry);
+
+        let result = server.refresh_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_refresh_result(result);
+        assert!(!server.provenance_stale, "provenance was refreshed by the worker");
     }
 
     #[test]
@@ -2213,7 +2705,10 @@ mod startup_cache_tests {
         // Revision 1 is the first worker, made obsolete by a second shard
         // notification. Its completion must launch the queued worker even
         // though workspace invalidation already cleared the index.
-        server.on_refresh_result(RefreshResult { revision: 1, result: Ok(RefreshWork::Unchanged) });
+        server.on_refresh_result(RefreshResult {
+            revision: 1,
+            result: Ok(RefreshWork::Unchanged { provenance: None }),
+        });
         assert!(server.refresh_running);
         assert!(!server.refresh_again);
         assert_eq!(server.refresh_revision, 3);
@@ -2279,11 +2774,6 @@ fn file_reader<'a>(
             .map(|doc| doc.text.clone())
             .or_else(|| std::fs::read_to_string(abs.as_str()).ok())
     }
-}
-
-/// Records a failure on an in-flight guard that is about to be dropped.
-fn guard_failed(guard: &mut telemetry::InFlight<'_>) {
-    guard.mark_failed(telemetry::Failure::Io);
 }
 
 #[derive(Debug)]

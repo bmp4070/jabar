@@ -337,6 +337,7 @@ fn the_workspace_root_is_picked_up() {
 fn status_reports_a_healthy_server() {
     let mut harness = Harness::start(None, utf8_client());
     let status = harness.status();
+    assert_eq!(status["indexLoading"], json!(false));
     assert_eq!(status["health"]["concerns"], json!([]), "nothing should have tripped a threshold");
     assert!(status["health"]["ops"].is_array());
     harness.shutdown();

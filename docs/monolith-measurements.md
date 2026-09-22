@@ -20,8 +20,11 @@ memory claim.
 3. What are steady and peak resident memory for a cache hit, a cache miss, cache
    publication, an unchanged reconciliation, and a changed-shard reload?
 4. During a reload, how much memory is consumed while the old and new indexes
-   coexist, and how long does the LSP event loop stop answering?
-5. Does a cache-loaded index return the same answers and counts as a freshly
+   coexist, how quickly is the retired index reclaimed, and how long does the
+   LSP event loop stop answering?
+5. Do explicit `jabar/loadIndex` requests and cache publication remain
+   responsive and memory-bounded when work is superseded?
+6. Does a cache-loaded index return the same answers and counts as a freshly
    built index?
 
 ## Benchmark inputs
@@ -67,6 +70,9 @@ monolith results:
 | `reconcile.scan` | background scan begins | metadata comparison completes |
 | `reload.build` | changed shards begin loading | replacement index ready |
 | `reload.swap` | result reaches the event loop | replacement becomes queryable |
+| `explicit_load.build` | `jabar/loadIndex` is accepted | index and watcher are ready or the request fails |
+| `index.reclaim` | an index is retired or rejected | its destructor completes on the reclamation worker |
+| `cache.queue` | a generation is offered for publication | its write starts or it is superseded |
 | `event_loop.heartbeat` | scheduled benchmark heartbeat | event loop handles it |
 
 Each event records a run ID, monotonic duration, outcome, cache hit/miss,
@@ -126,8 +132,8 @@ events and show the result with and without them.
 
 ## Refresh and responsiveness workloads
 
-Run each scenario at least ten times. Begin scenarios 1–8 from a cache hit;
-scenario 9 explicitly uses a complete uncached/manual index:
+Run each scenario at least ten times. Begin scenarios 1–8 and 10–12 from a
+cache hit; scenario 9 explicitly uses a complete uncached/manual index:
 
 1. An unchanged periodic reconciliation.
 2. One modified shard with the same HEAD.
@@ -142,6 +148,16 @@ scenario 9 explicitly uses a complete uncached/manual index:
 9. A branch/HEAD change with an uncached index; wait through at least one
    periodic interval and verify old shards are not reloaded until a subsequent
    shard event supplies evidence of a new build.
+10. An explicit `jabar/loadIndex` of a complete manual index while probes
+    continue; verify the request remains pending until the replacement and its
+    watcher are ready, then verify the replacement is queryable.
+11. An explicit or watcher-triggered full generation that becomes stale before
+    completion; verify the old index remains queryable, the stale generation is
+    rejected, and reclamation does not pause the event loop.
+12. At least three successive changed generations while cache output is
+    deliberately throttled; verify there is at most one active cache write and
+    one latest pending write, superseded serialization stops promptly, and the
+    final published cache matches the queryable generation.
 
 While each scenario runs, use an open-loop client to schedule a lightweight
 `jabar/status` request every 50ms, a fixed definition request every second, and a
@@ -197,6 +213,10 @@ For each workload report:
 - peak RSS during cache serialization;
 - pre-reload steady RSS, peak while old and new indexes coexist, and RSS 30
   seconds after the swap;
+- peak and post-reclamation RSS for successful swaps and rejected stale
+  generations;
+- peak RSS during a burst of superseded cache writes, including active and
+  pending generation counts;
 - swap activity, OOM/cgroup events, and major page faults;
 - bytes per definition and per occurrence, using both steady and peak RSS;
 - snapshot bytes divided by aggregate SCIP bytes.
