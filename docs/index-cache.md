@@ -2,10 +2,10 @@
 
 ## Current path and observed cost
 
-Startup discovery now runs on a worker after LSP `initialize` replies. The
-loader may stat the tree, read every `.scip` shard, decode protobuf, and build
-lookup maps before the first correct query. On Salesforce core, the reported input is a
-2.68M-file tree with 6,876 shards and 3.13M definitions. The reported walk is
+`discover_index` calls `SymbolIndex::from_dir(bazel-bin)` before answering LSP
+`initialize`. The loader stats the tree, reads every `.scip` shard, decodes
+protobuf, and builds lookup maps. On the Monolith, the reported input is a
+tree of a couple of million files with 6,876 shards and 3.13M definitions. The reported walk is
 ~46s and total initialization ~5 minutes. These are observations from one
 workspace, not repeatable benchmarks yet; record the commands, hardware, cache
 state, shard bytes, and timing breakdown before committing to a format.

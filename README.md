@@ -107,7 +107,7 @@ client-specific — but VS Code needs an extension to spawn a custom binary at a
 
 ### Large repository startup and indexing
 
-On Salesforce core, a reported 2.68M-file `bazel-bin` walk takes ~46s, and
+On the Monolith, a reported `bazel-bin` walk over a couple of million files takes ~46s, and
 loading 6,876 SCIP shards takes several more minutes before `initialize`
 returns. These measurements need a repeatable baseline. The proposed fast path
 persists a built symbol index and a build-produced shard manifest, then checks
