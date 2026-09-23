@@ -6,10 +6,12 @@
 //! the properties that are painful to retrofit and easy to break.
 
 use std::thread;
+use std::time::{Duration, Instant};
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::request::Request as _;
+use protobuf::Message as _;
 use serde_json::{Value, json};
 
 /// A client talking to a server running on its own thread.
@@ -27,6 +29,14 @@ impl Harness {
     /// `client_capabilities` is passed through verbatim so tests can control
     /// encoding negotiation.
     fn start(root: Option<&str>, client_capabilities: Value) -> Harness {
+        Self::start_with_options(root, client_capabilities, json!({}))
+    }
+
+    fn start_with_options(
+        root: Option<&str>,
+        client_capabilities: Value,
+        options: Value,
+    ) -> Harness {
         let (server_conn, client_conn) = Connection::memory();
         let server = thread::spawn(move || jabar_server::run_server(server_conn));
 
@@ -42,6 +52,7 @@ impl Harness {
             "clientInfo": { "name": "harness", "version": "1.0" },
             "capabilities": client_capabilities,
             "workspaceFolders": root.map(|r| json!([{ "uri": r, "name": "root" }])),
+            "initializationOptions": options,
         });
         let id = harness.send_request(lsp_types::request::Initialize::METHOD, params);
         let result = harness.expect_ok(id);
@@ -114,6 +125,76 @@ impl Harness {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn initialize_and_status_respond_while_bazel_discovery_is_slow() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bazel = temp.path().join("slow-bazel");
+    std::fs::write(&bazel, "#!/bin/sh\nsleep 2\nexit 1\n").unwrap();
+    let mut permissions = std::fs::metadata(&bazel).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bazel, permissions).unwrap();
+    let uri = format!("file://{}", temp.path().display());
+    let started = Instant::now();
+    let mut harness = Harness::start_with_options(
+        Some(&uri),
+        default_client(),
+        json!({ "bazel": bazel, "outputBase": temp.path().join("output-base") }),
+    );
+    assert!(started.elapsed() < Duration::from_secs(1), "initialize waited for Bazel");
+    let status = harness.status();
+    assert_eq!(status["indexLoading"], json!(true));
+    assert_eq!(status["startupState"], json!("loading"));
+    let id = harness.send_request("workspace/symbol", json!({ "query": "Foo" }));
+    let error = harness.expect_err(id);
+    assert_eq!(error.code, lsp_server::ErrorCode::RequestFailed as i32);
+    assert!(error.message.contains("IndexNotReady"));
+    harness.shutdown();
+}
+
+#[test]
+fn startup_eventually_publishes_a_complete_shard_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join(".jabar/index");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut occurrence = scip::types::Occurrence::new();
+    occurrence.range = vec![0, 6, 9];
+    occurrence.symbol = "semanticdb maven . . example/Foo#".to_owned();
+    occurrence.symbol_roles = scip::types::SymbolRole::Definition as i32;
+    let mut info = scip::types::SymbolInformation::new();
+    info.symbol = occurrence.symbol.clone();
+    info.display_name = "Foo".to_owned();
+    info.kind = scip::types::symbol_information::Kind::Class.into();
+    let mut document = scip::types::Document::new();
+    document.language = "java".to_owned();
+    document.relative_path = "src/Foo.java".to_owned();
+    document.occurrences.push(occurrence);
+    document.symbols.push(info);
+    let mut shard = scip::types::Index::new();
+    shard.documents.push(document);
+    std::fs::write(dir.join("foo.scip"), shard.write_to_bytes().unwrap()).unwrap();
+
+    let uri = format!("file://{}", temp.path().display());
+    let mut harness = Harness::start(Some(&uri), default_client());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = harness.status();
+        if status["indexLoaded"] == json!(true) {
+            assert_eq!(status["startupState"], json!("ready"));
+            assert_eq!(status["indexedDefinitions"], json!(1));
+            break;
+        }
+        assert!(Instant::now() < deadline, "startup did not publish: {status}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let id = harness.send_request("workspace/symbol", json!({ "query": "Foo" }));
+    let symbols = harness.expect_ok(id);
+    assert_eq!(symbols.as_array().unwrap().len(), 1);
+    harness.shutdown();
+}
+
 fn utf8_client() -> Value {
     json!({ "general": { "positionEncodings": ["utf-8", "utf-16"] } })
 }
@@ -152,12 +233,10 @@ fn falls_back_to_utf16_when_the_client_is_silent() {
 }
 
 #[test]
-fn advertises_only_what_is_implemented() {
-    // An advertised capability that returns nothing tells the client "there are
-    // none", which it cannot distinguish from the truth.
+fn advertises_implemented_operations_before_the_index_is_ready() {
     let harness = Harness::start(None, utf8_client());
     let caps = harness.capabilities();
-    for unimplemented in [
+    for implemented in [
         "documentSymbolProvider",
         "workspaceSymbolProvider",
         "definitionProvider",
@@ -165,10 +244,10 @@ fn advertises_only_what_is_implemented() {
         "hoverProvider",
         "implementationProvider",
         "callHierarchyProvider",
-        "completionProvider",
     ] {
-        assert!(caps.get(unimplemented).is_none(), "{unimplemented} should not be advertised yet");
+        assert!(caps.get(implemented).is_some(), "{implemented} should be advertised");
     }
+    assert!(caps.get("completionProvider").is_none());
     assert!(caps.get("textDocumentSync").is_some(), "text sync is implemented");
     harness.shutdown();
 }
@@ -199,8 +278,8 @@ fn an_implemented_query_without_an_index_refuses_rather_than_returning_null() {
         }),
     );
     let error = harness.expect_err(id);
-    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
-    assert!(error.message.contains("index"), "message: {}", error.message);
+    assert_eq!(error.code, lsp_server::ErrorCode::RequestFailed as i32);
+    assert!(error.message.contains("IndexNotReady"), "message: {}", error.message);
     harness.shutdown();
 }
 
@@ -316,11 +395,11 @@ fn the_custom_references_method_reports_what_the_standard_one_hides() {
     // empty answer. The shapes are still distinguishable.
     let id = harness.send_request("jabar/references", params.clone());
     let error = harness.expect_err(id);
-    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
+    assert_eq!(error.code, lsp_server::ErrorCode::RequestFailed as i32);
 
     let id = harness.send_request(lsp_types::request::References::METHOD, params);
     let error = harness.expect_err(id);
-    assert_eq!(error.code, lsp_server::ErrorCode::ServerNotInitialized as i32);
+    assert_eq!(error.code, lsp_server::ErrorCode::RequestFailed as i32);
     harness.shutdown();
 }
 

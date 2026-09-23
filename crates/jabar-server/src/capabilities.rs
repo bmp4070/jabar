@@ -1,14 +1,7 @@
 //! What the server tells the client it can do.
 //!
-//! The guiding rule here is to advertise nothing that is not implemented. LSP
-//! gives no way to say "I support `documentSymbol` but not yet", so a capability
-//! declared early means clients call it and receive an empty list — and per the
-//! `telemetry` crate's central point, an empty list is indistinguishable from
-//! "there are no symbols in this file". Declaring the capability only when it
-//! works keeps the client from ever having to guess.
-//!
-//! Right now that means text synchronisation and a status request. The nine
-//! client-facing operations arrive as the machinery behind them does.
+//! Advertise implemented operations consistently. While the index loads, their
+//! handlers return an explicit retryable error rather than an empty answer.
 
 use lsp_types::{
     OneOf, PositionEncodingKind, SaveOptions, ServerCapabilities, TextDocumentSyncCapability,
@@ -44,27 +37,21 @@ impl PositionEncoding {
 
 /// What the server advertises at `initialize`.
 ///
-/// `has_index` is the whole point of the parameter. LSP has no way to say
-/// "supported, but not yet", so a provider advertised without an index behind it
-/// means clients call it and receive nothing — which reads as "no such symbol".
-/// Advertising only what is currently serveable keeps that from happening, and
-/// the providers are registered dynamically later if an index arrives after
-/// startup.
-pub fn server_capabilities(encoding: PositionEncoding, has_index: bool) -> ServerCapabilities {
+/// Readiness is reported by `jabar/status`. Queries before readiness fail
+/// explicitly, so clients can retry without treating an empty result as truth.
+pub fn server_capabilities(encoding: PositionEncoding) -> ServerCapabilities {
     // Static advertisement is what makes jabar work with every client rather
     // than only those supporting `client/registerCapability`. Each field has its
     // own `OneOf<bool, _>` type, so the repetition is unavoidable.
     ServerCapabilities {
         position_encoding: Some(encoding.to_lsp()),
-        workspace_symbol_provider: has_index.then_some(OneOf::Left(true)),
-        definition_provider: has_index.then_some(OneOf::Left(true)),
-        references_provider: has_index.then_some(OneOf::Left(true)),
-        document_symbol_provider: has_index.then_some(OneOf::Left(true)),
-        implementation_provider: has_index
-            .then_some(lsp_types::ImplementationProviderCapability::Simple(true)),
-        hover_provider: has_index.then_some(lsp_types::HoverProviderCapability::Simple(true)),
-        call_hierarchy_provider: has_index
-            .then_some(lsp_types::CallHierarchyServerCapability::Simple(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        implementation_provider: Some(lsp_types::ImplementationProviderCapability::Simple(true)),
+        hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+        call_hierarchy_provider: Some(lsp_types::CallHierarchyServerCapability::Simple(true)),
         // Incremental sync, because the alternative is resending whole files on
         // every keystroke and this server is meant for large ones.
         text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
@@ -148,28 +135,21 @@ mod tests {
     #[test]
     fn the_negotiated_encoding_is_reported_back() {
         for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16] {
-            let caps = server_capabilities(encoding, false);
+            let caps = server_capabilities(encoding);
             assert_eq!(caps.position_encoding, Some(encoding.to_lsp()));
         }
     }
 
     #[test]
-    fn queries_are_advertised_only_once_an_index_exists() {
-        // The property that keeps a client from being told "no such symbol" when
-        // the truth is "nothing is loaded".
-        let without = server_capabilities(PositionEncoding::Utf8, false);
-        assert!(without.definition_provider.is_none());
-        assert!(without.hover_provider.is_none());
-        assert!(without.workspace_symbol_provider.is_none());
-
-        let with = server_capabilities(PositionEncoding::Utf8, true);
-        assert!(with.definition_provider.is_some());
-        assert!(with.references_provider.is_some());
-        assert!(with.hover_provider.is_some());
-        assert!(with.implementation_provider.is_some());
-        assert!(with.document_symbol_provider.is_some());
-        assert!(with.workspace_symbol_provider.is_some());
-        assert!(with.call_hierarchy_provider.is_some());
+    fn implemented_queries_are_always_advertised() {
+        let caps = server_capabilities(PositionEncoding::Utf8);
+        assert!(caps.definition_provider.is_some());
+        assert!(caps.references_provider.is_some());
+        assert!(caps.hover_provider.is_some());
+        assert!(caps.implementation_provider.is_some());
+        assert!(caps.document_symbol_provider.is_some());
+        assert!(caps.workspace_symbol_provider.is_some());
+        assert!(caps.call_hierarchy_provider.is_some());
     }
 
     #[test]
@@ -178,8 +158,7 @@ mod tests {
         // on before its handler exists. An advertised capability that returns
         // nothing tells the client "there are none", which is a lie it cannot
         // detect.
-        // Nothing is advertised without an index; see the test above.
-        let caps = server_capabilities(PositionEncoding::Utf8, true);
+        let caps = server_capabilities(PositionEncoding::Utf8);
         // Everything in the client's surface is now served, so this test has
         // nothing left to guard. It stays as the place to add the next
         // unimplemented capability rather than being deleted.
@@ -192,7 +171,7 @@ mod tests {
 
     #[test]
     fn text_sync_is_incremental_and_two_way() {
-        let caps = server_capabilities(PositionEncoding::Utf8, false);
+        let caps = server_capabilities(PositionEncoding::Utf8);
         let Some(TextDocumentSyncCapability::Options(sync)) = caps.text_document_sync else {
             panic!("expected sync options");
         };

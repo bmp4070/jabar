@@ -45,8 +45,10 @@ and watching all use the pinned directory.
 
 Indexing runs a Bazel build. That can take minutes, and nobody asked for it by
 opening an editor. With `auto` off, jabar looks for an existing index and serves
-nothing if there is none — which is honest, since it advertises no capability it
-cannot serve.
+nothing if there is none. It advertises its implemented operations, but their
+queries fail with `IndexNotReady` until an index is available. Startup discovery
+and an enabled automatic build run after the `initialize` response; check
+`jabar/status` for `indexLoading`, `startupState`, and `startupError`.
 
 Turn it on when you would rather wait once than build by hand.
 
