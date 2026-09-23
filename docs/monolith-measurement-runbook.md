@@ -1,22 +1,22 @@
-# Measuring jabar against Salesforce core — runbook
+# Measuring jabar against the Monolith — runbook
 
 A concrete, repo-specific procedure for executing
 [`docs/monolith-measurements.md`](monolith-measurements.md) against the working
-copy at `/opt/workspace/core-public/core`. The protocol doc is the authority on
+copy at `/path/to/monolith`. The protocol doc is the authority on
 *what* to measure and the acceptance gates; this runbook records *how* on this
 machine, and what the harness added under `crates/jabar-server/src/bench.rs` and
 `tools/` gives you.
 
 > **Status:** harness built and validated on a synthetic fixture. No counted
-> core runs collected yet. Treat every number below the tooling section as a
+> Monolith runs collected yet. Treat every number below the tooling section as a
 > budget, not a result.
 
 ## The target, as measured on 2026-09-21
 
 | Property | Value |
 | --- | --- |
-| Workspace | `/opt/workspace/core-public/core` |
-| `bazel-bin` | → `/opt/workspace/.cache/bazel/870f52.../execroot/core/bazel-out/k8-fastbuild/bin` |
+| Workspace | `/path/to/monolith` |
+| `bazel-bin` | → `<bazel-output-base>/execroot/monolith/bazel-out/k8-fastbuild/bin` |
 | SCIP shards under `bazel-bin` | 6,876 |
 | Total SCIP bytes | ~5.4 GiB |
 | `.jabar/` | `aspects/` present; **no `index/` cache** → first run is a clean cache-miss |
@@ -141,7 +141,7 @@ catches wrong counts and corrupt caches" — the `--expect-min 999` case is the
 wrong-count proof. Add a corrupt-cache case (truncate `.jabar/index/cache/CURRENT`)
 before signing that box off.
 
-## Phase plan against core
+## Phase plan against the Monolith
 
 Run `jabar` with `index.auto=false` for cache/reload runs so a Bazel child is
 never mistaken for startup work; measure auto-indexing separately.
@@ -167,10 +167,10 @@ Example (cache hit, one sample, common sentinel):
 ```sh
 target/release/jabar-bench startup \
   --jabar target/release/jabar \
-  --root /opt/workspace/core-public/core \
+  --root /path/to/monolith \
   --init-json '{"index":{"auto":false}}' \
-  --query Account --expect-min 1 \
-  --bench-log /tmp/jabar-bench/core-hit.jsonl --run-id core-hit-001
+  --query Service --expect-min 1 \
+  --bench-log /tmp/jabar-bench/monolith-hit.jsonl --run-id monolith-hit-001
 ```
 
 Wrap in a loop for N samples; keep the process alive through reconciliation,
@@ -184,10 +184,10 @@ Drive the 12 refresh and lifecycle scenarios by mutating shards under
 
 ```sh
 target/release/jabar-bench probe \
-  --jabar target/release/jabar --root /opt/workspace/core-public/core \
+  --jabar target/release/jabar --root /path/to/monolith \
   --init-json '{"index":{"auto":false}}' \
-  --query Account --duration-secs 90 \
-  --bench-log /tmp/jabar-bench/core-scn2.jsonl --run-id core-scn2-001 &
+  --query Service --duration-secs 90 \
+  --bench-log /tmp/jabar-bench/monolith-scn2.jsonl --run-id monolith-scn2-001 &
 # ... then touch one shard / incremental aspect build / branch switch ...
 ```
 
@@ -204,14 +204,14 @@ To measure the aspect build and produce a from-scratch parity baseline:
 
 ```sh
 target/release/jabar-bench startup \
-  --jabar target/release/jabar --root /opt/workspace/core-public/core \
+  --jabar target/release/jabar --root /path/to/monolith \
   --init-json '{"index":{"auto":true,"targets":["//<scoped>/..."],
                 "scipJava":"/home/sfwork/.local/jabar-bench/bin/scip-java"}}' \
-  --query Account --expect-min 1 --bench-log /tmp/jabar-bench/core-autoindex.jsonl \
-  --run-id core-autoindex-001
+  --query Service --expect-min 1 --bench-log /tmp/jabar-bench/monolith-autoindex.jsonl \
+  --run-id monolith-autoindex-001
 ```
 
-This emits `index.build`. Scope `targets` — `//...` on core includes targets
+This emits `index.build`. Scope `targets` — `//...` on the Monolith includes targets
 broken at HEAD, credentialed, or missing toolchains. Compare counts
 (shards/definitions/references/occurrences) against a cache-hit process for the
 Phase-4 parity check using `SymbolIndex`'s count methods.
@@ -236,7 +236,7 @@ pass/fail with evidence.
 
 ### Follow-ups from the first counted run
 
-The first counted run against core ([results](monolith-measurement-results.md))
+The first counted run against the Monolith ([results](monolith-measurement-results.md))
 surfaced these, in rough priority order:
 
 - [ ] **Async index build** — the ~118 s cold decode runs synchronously in

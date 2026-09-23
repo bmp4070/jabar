@@ -1,9 +1,9 @@
-# Monolith measurement results — jabar vs. Salesforce core
+# Monolith measurement results — jabar vs. the Monolith
 
 First counted run of the harness ([bench.rs](../crates/jabar-server/src/bench.rs)
 + [tools/bench-client](../tools/bench-client), driven per
 [monolith-measurement-runbook.md](monolith-measurement-runbook.md)) against a
-live checkout of the Salesforce core monorepo.
+live checkout of the Monolith monorepo.
 
 > **Status: partial.** Startup (cache-miss + cache-hit), steady-state
 > responsiveness, memory, and cache footprint are measured. Refresh scenarios,
@@ -15,8 +15,8 @@ live checkout of the Salesforce core monorepo.
 | | |
 | --- | --- |
 | Date | 2026-09-22 |
-| Repo | `/opt/workspace/core-public/core` |
-| HEAD | `121f5979cb112` (60026185, `266/p4/266-main`, freshly pulled to latest) |
+| Repo | `/path/to/monolith` |
+| HEAD | `121f5979cb112` (freshly pulled to latest) |
 | jabar | `bench/monolith-measurement-harness`, `--release` |
 | Host | Linux, 122 GiB RAM, no cgroup memory cap; warm storage (shared host) |
 | Mode | `index.auto=false` — measured from the SCIP shards already on disk (no aspect build) |
@@ -47,7 +47,7 @@ between a freshly-decoded index and one restored from cache.
 
 ## Version 2 snapshot — counted results (2026-09-22)
 
-The version 2 format was then measured against the same core checkout on this
+The version 2 format was then measured against the same Monolith checkout on this
 host (jabar `perf/warm-start-memory` @ `8d06862`, `--release`, `index.auto=false`).
 The version 1 cache was version-rejected, so the process decoded the shards once
 and published a fresh v2 generation; a subsequent `startup` then hit it. Counts
@@ -107,7 +107,7 @@ From the `probe` workload — open-loop probes over 210 s against the static
 | Method | cadence | count | p50 | p95 | max | errors |
 | --- | --- | --- | --- | --- | --- | --- |
 | `jabar/status` | 50 ms | 4,200 | 0.20 ms | 0.26 ms | 8.35 ms | 0 |
-| `workspace/symbol` ("Account") | 1 s | 210 | **167.0 ms** | **289.9 ms** | 313.4 ms | 0 |
+| `workspace/symbol` (a common type name) | 1 s | 210 | **167.0 ms** | **289.9 ms** | 313.4 ms | 0 |
 
 `jabar/status` is effectively free. **`workspace/symbol` is the expensive
 operation at monolith scale** — p50 167 ms, p95 290 ms — which exceeds the
@@ -209,7 +209,7 @@ hit) before publishing any number as a gate result.
 - Percentiles are nearest-rank. Sample sizes are **single startup samples** and
   one 210 s probe window — below the protocol's ≥10 (miss) / ≥30 (hit) startup
   repetitions. Treat these as first-pass magnitudes, not published figures.
-- `workspace/symbol` used one query ("Account"); no fixed multi-query corpus yet.
+- `workspace/symbol` used one query (a common type name); no fixed multi-query corpus yet.
 - Storage was warm (shared host); the cold-storage startup variant is deferred.
 
 ## Not yet measured
@@ -223,4 +223,4 @@ hit) before publishing any number as a gate result.
   cache-hit correctness parity beyond raw counts.
 - Cold-storage (page-cache-dropped) startup.
 - A fixed correctness query corpus compared normalized in-private.
-- Invalid-cache and configuration-miss fallbacks against core.
+- Invalid-cache and configuration-miss fallbacks against the Monolith.

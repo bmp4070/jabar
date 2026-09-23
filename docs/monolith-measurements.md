@@ -2,7 +2,7 @@
 
 This protocol measures whether the built-index cache makes Jabar usable on a
 large Java monolith without moving the cost into memory or background reloads.
-It is designed for the reported Salesforce-core scale of 2.68M files under
+It is designed for the reported Monolith scale of a couple of million files under
 `bazel-bin`, 6,876 SCIP shards, and 3.13M definitions, but does not depend on
 publishing repository paths or symbol names.
 
@@ -43,7 +43,7 @@ record:
 The end-to-end corpus must preserve the condition this optimization addresses.
 Use a frozen real output tree, or a preserved/synthetic tree with the same
 non-SCIP entry count, directory fan-out, symlinks, and `.scip-targetroot` and
-`.semanticdb` exclusions. Copying only the 6,876 shards removes the 2.68M-entry
+`.semanticdb` exclusions. Copying only the 6,876 shards removes the couple-million-entry
 walk and is valid only for separately labelled decode/format microbenchmarks.
 Do not race an active Bazel build unless that race is the workload under test.
 
