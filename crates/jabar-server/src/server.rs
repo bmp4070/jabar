@@ -190,6 +190,12 @@ struct StartupResult {
     outcome: StartupOutcome,
 }
 
+fn startup_watch_dir(discovered: &Discovered) -> Option<&str> {
+    // Cache-managed Bazel generations use bounded periodic reconciliation.
+    // Recursively watching bazel-bin would walk millions of unrelated outputs.
+    discovered.cache.is_none().then_some(discovered.dir.as_str())
+}
+
 enum StartupOutcome {
     Loaded { discovered: Box<Discovered>, watcher: Result<FileWatcher, String> },
     NoIndex,
@@ -611,7 +617,7 @@ impl Server {
                 discovered = discover_index(&root, &config);
             }
             let Some(discovered) = discovered else { return Ok(StartupOutcome::NoIndex) };
-            let watch_dir = (!discovered.cache_hit).then_some(discovered.dir.as_str());
+            let watch_dir = startup_watch_dir(&discovered);
             let watch_path = watch_dir.map(paths::Utf8Path::new).and_then(paths::AbsPath::try_new);
             let watcher_timer = crate::bench::start();
             let watcher = FileWatcher::spawn(watch_path, Some(&root)).map_err(|e| e.to_string());
@@ -699,7 +705,13 @@ impl Server {
                     definitions = discovered.index.definition_count(),
                     "found an index at startup"
                 );
+                // The worker loaded a generation whose inputs predate any LSP
+                // edits received while it was running. Adoption normally
+                // recomputes freshness for a newly built generation, but this
+                // startup generation cannot make those concurrent edits current.
+                let stale_during_startup = self.stale_documents.clone();
                 self.adopt_discovered(*discovered, watcher);
+                self.stale_documents.extend(stale_during_startup);
                 self.startup_state = "ready";
             }
             StartupOutcome::NoIndex => {
@@ -2520,6 +2532,123 @@ mod startup_cache_tests {
     }
 
     #[test]
+    fn startup_publication_preserves_saved_edits_seen_while_loading() {
+        for close_before_publish in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("src/Foo.java");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "class Foo {}\n").unwrap();
+            let uri = lsp_types::Url::from_file_path(&source).unwrap();
+            let path = uri::vfs_path(&uri).unwrap();
+            let index_dir = paths::Utf8PathBuf::from_path_buf(temp.path().join("index")).unwrap();
+            let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+            let mut server = server_at(temp.path());
+
+            server.schedule_startup_work(move || {
+                release_rx.recv().unwrap();
+                Ok(StartupOutcome::Loaded {
+                    discovered: Box::new(Discovered {
+                        dir: index_dir,
+                        index: test_index(),
+                        shards: Vec::new(),
+                        provenance: None,
+                        cache: None,
+                        cache_hit: false,
+                        verified: true,
+                    }),
+                    watcher: Err("disabled in test".to_owned()),
+                })
+            });
+
+            server.did_open(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "java",
+                        "version": 1,
+                        "text": "class Foo {}\n"
+                    }
+                }))
+                .unwrap(),
+            );
+            server.did_change(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri, "version": 2 },
+                    "contentChanges": [{ "text": "class Foo { int added; }\n" }]
+                }))
+                .unwrap(),
+            );
+            std::fs::write(&source, "class Foo { int added; }\n").unwrap();
+            server.did_save(
+                serde_json::from_value(serde_json::json!({
+                    "textDocument": { "uri": uri }
+                }))
+                .unwrap(),
+            );
+            if close_before_publish {
+                server.did_close(
+                    serde_json::from_value(serde_json::json!({
+                        "textDocument": { "uri": uri }
+                    }))
+                    .unwrap(),
+                );
+            }
+            assert!(server.stale_documents.contains(&path));
+
+            release_tx.send(()).unwrap();
+            let result = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            server.on_startup_result(result);
+
+            assert!(
+                server.stale_documents.contains(&path),
+                "startup publication made a concurrent saved edit look indexed (closed={close_before_publish})"
+            );
+            let error = server
+                .goto_definition(serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 0, "character": 0 }
+                }))
+                .unwrap_err();
+            assert!(matches!(error.code, ErrorCode::ContentModified));
+        }
+    }
+
+    #[test]
+    fn cache_managed_startup_generations_do_not_watch_bazel_bin_recursively() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("bazel-bin");
+        std::fs::create_dir(&dir).unwrap();
+        let config = Config::default();
+        let key = CacheKey::new(temp.path(), &dir, &config).unwrap();
+        let cache = CacheState {
+            root: temp.path().to_path_buf(),
+            dir: dir.clone(),
+            key,
+            shards: Vec::new(),
+        };
+        let utf8_dir = paths::Utf8PathBuf::from_path_buf(dir).unwrap();
+        let discovered = |cache_hit, cache| Discovered {
+            dir: utf8_dir.clone(),
+            index: test_index(),
+            shards: Vec::new(),
+            provenance: None,
+            cache,
+            cache_hit,
+            verified: true,
+        };
+
+        assert!(startup_watch_dir(&discovered(true, Some(cache.clone()))).is_none());
+        assert!(
+            startup_watch_dir(&discovered(false, Some(cache))).is_none(),
+            "a cacheable miss uses periodic reconciliation too"
+        );
+        assert!(
+            startup_watch_dir(&discovered(false, None)).is_some(),
+            "the manual .jabar/index fallback still needs shard watching"
+        );
+    }
+
+    #[test]
     fn failed_and_superseded_startup_results_do_not_publish() {
         let mut server = server();
         server.schedule_startup_work(|| Err("aspect failed".to_owned()));
@@ -2528,13 +2657,40 @@ mod startup_cache_tests {
         assert_eq!(server.status().startup_state, "failed");
         assert_eq!(server.status().startup_error.as_deref(), Some("aspect failed"));
 
-        server.schedule_startup_work(|| Ok(StartupOutcome::NoIndex));
+        let temp = tempfile::tempdir().unwrap();
+        let path = paths::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        server.schedule_startup_work(move || {
+            Ok(StartupOutcome::Loaded {
+                discovered: Box::new(Discovered {
+                    dir: path,
+                    index: test_index(),
+                    shards: Vec::new(),
+                    provenance: None,
+                    cache: None,
+                    cache_hit: false,
+                    verified: true,
+                }),
+                watcher: Err("disabled in test".to_owned()),
+            })
+        });
         let stale = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         server.refresh_revision = server.refresh_revision.wrapping_add(1);
         server.on_startup_result(stale);
         assert_eq!(server.status().startup_state, "superseded");
         assert!(!server.status().index_loading);
         assert!(server.index.is_none());
+    }
+
+    #[test]
+    fn a_startup_worker_panic_becomes_a_reported_failure() {
+        let mut server = server();
+        server.schedule_startup_work(|| panic!("injected startup panic"));
+        let result = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_startup_result(result);
+
+        assert_eq!(server.status().startup_state, "failed");
+        assert_eq!(server.status().startup_error.as_deref(), Some("startup index worker panicked"));
+        assert!(!server.status().index_loading);
     }
 
     #[test]

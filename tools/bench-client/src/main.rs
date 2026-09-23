@@ -355,6 +355,15 @@ impl Server {
     }
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Every workload exit path, including readiness timeouts and malformed
+        // replies, must stop and reap the measured process. A leaked monolith
+        // server can retain tens of GiB and invalidate every following sample.
+        self.wait_briefly();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Minimal LSP JSON-RPC transport over the child's stdio
 // ---------------------------------------------------------------------------
@@ -529,4 +538,39 @@ fn now_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn server_cleanup_terminates_and_reaps_a_hung_child() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let server = Server {
+            child,
+            run_id: "cleanup-test".to_owned(),
+            bench_log: None,
+            stdin: None,
+            stdout: None,
+        };
+
+        drop(server);
+
+        let still_exists = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_exists, "benchmark child {pid} survived Server::drop");
+    }
 }
