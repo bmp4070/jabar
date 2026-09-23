@@ -107,8 +107,10 @@ as a pass. It sets `JABAR_BENCH_RUN`/`JABAR_BENCH_LOG` on the child so the
 client JSON and the server phase log share a `run_id`.
 
 Workloads:
-- `startup` — spawn→initialize→initialized→first status→first `workspace/symbol`,
-  with `index_loaded` and `returned >= --expect-min` validation. Phase-2 startup.
+- `startup` — spawn→initialize→initialized→status polling→readiness→first
+  `workspace/symbol`, with `--ready-timeout-secs` (default 180), `index_loaded`,
+  and `returned >= --expect-min` validation. Reports initialize, readiness,
+  and first correct query separately. Phase-2 startup.
 - `probe` — after startup, open-loop `jabar/status` @50ms and `workspace/symbol`
   (+ optional `textDocument/definition`) @1s for `--duration-secs`, reporting
   nearest-rank p50/p95/max per method. Phase-3 responsiveness. (Single in-flight
@@ -239,9 +241,9 @@ pass/fail with evidence.
 The first counted run against the Monolith ([results](monolith-measurement-results.md))
 surfaced these, in rough priority order:
 
-- [ ] **Async index build** — the ~118 s cold decode runs synchronously in
-      `initialize` and blocks the event loop; move it off the loop thread and
-      serve `initialize` immediately, reporting readiness via `jabar/status`.
+- [x] **Async index build** — cache reads, cold shard decode, and optional
+      automatic indexing now run after `initialize` on one startup worker;
+      `jabar/status` reports readiness and startup outcome.
 - [ ] **Faster warm start** — cache-hit is still ~57 s, deserialize-bound on the
       10 GiB snapshot; consider an mmap/zero-copy format or lazy section loading.
 - [ ] **`workspace/symbol` perf** — p95 ~290 ms over 3.1M defs, above the 250 ms

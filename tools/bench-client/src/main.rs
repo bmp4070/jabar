@@ -9,9 +9,8 @@
 //! phase events, tied together by a shared run ID.
 //!
 //! Workloads:
-//! - `startup`: spawn to `initialize`, to `initialized`, to first `jabar/status`,
-//!   to first `workspace/symbol`. Validates the index is loaded and a sentinel
-//!   query meets a minimum count. This is the Phase-2 startup measurement.
+//! - `startup`: records initialize separately, polls status to readiness with a
+//!   deadline, then measures the first correct `workspace/symbol` result.
 //! - `probe`: after startup, run open-loop probes (`jabar/status`, a fixed
 //!   definition, a fixed symbol) on independent schedules for a fixed duration,
 //!   reporting per-method latency percentiles. This is the Phase-3
@@ -20,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -99,6 +99,7 @@ impl Args {
 fn workload_startup(args: &Args) -> Result<Value> {
     let query = args.opt("query").unwrap_or("").to_owned();
     let expect_min: usize = args.parse_or("expect-min", 0)?;
+    let ready_timeout = Duration::from_secs_f64(args.parse_or("ready-timeout-secs", 180.0)?);
 
     let spawned = Instant::now();
     let mut server = Server::spawn(args)?;
@@ -111,8 +112,8 @@ fn workload_startup(args: &Args) -> Result<Value> {
     client.notify("initialized", json!({}))?;
     let t_initialized = spawned.elapsed();
 
-    let status = client.request("jabar/status", json!({}))?;
-    let t_first_status = spawned.elapsed();
+    let (status, t_first_status, status_polls) = wait_ready(&mut client, ready_timeout, spawned)?;
+    let t_ready = spawned.elapsed();
     let index_loaded = status.get("indexLoaded").and_then(Value::as_bool).unwrap_or(false);
     let indexed_definitions = status.get("indexedDefinitions").and_then(Value::as_u64).unwrap_or(0);
 
@@ -145,10 +146,13 @@ fn workload_startup(args: &Args) -> Result<Value> {
         "query": query,
         "returned": returned,
         "expect_min": expect_min,
+        "status_polls": status_polls,
+        "ready_timeout_secs": ready_timeout.as_secs_f64(),
         "client_ms": {
             "spawn_to_initialize": ms(t_initialize),
             "spawn_to_initialized": ms(t_initialized),
             "spawn_to_first_status": ms(t_first_status),
+            "spawn_to_ready": ms(t_ready),
             "spawn_to_first_symbol": ms(t_first_symbol),
         },
         "failures": failures,
@@ -169,6 +173,8 @@ fn workload_probe(args: &Args) -> Result<Value> {
     let mut client = Client::new(&mut server)?;
     client.initialize(server_root_uri(args)?, init_options(args)?)?;
     client.notify("initialized", json!({}))?;
+    let ready_timeout = Duration::from_secs_f64(args.parse_or("ready-timeout-secs", 180.0)?);
+    wait_ready(&mut client, ready_timeout, Instant::now())?;
 
     // Open-loop schedules: each probe is due on its own cadence regardless of
     // whether the previous one has answered, so a stall cannot hide requests
@@ -217,6 +223,38 @@ fn workload_probe(args: &Args) -> Result<Value> {
         "definition": definition.summary(),
     });
     Ok(report)
+}
+
+fn wait_ready(
+    client: &mut Client,
+    timeout: Duration,
+    origin: Instant,
+) -> Result<(Value, Duration, usize)> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut first_status = None;
+    let mut polls = 0;
+    loop {
+        let status = client.request_until("jabar/status", json!({}), deadline)?;
+        polls += 1;
+        first_status.get_or_insert_with(|| origin.elapsed());
+        if status.get("indexLoaded").and_then(Value::as_bool) == Some(true) {
+            return Ok((status, first_status.unwrap(), polls));
+        }
+        let state = status.get("startupState").and_then(Value::as_str).unwrap_or("unknown");
+        if matches!(state, "failed" | "no-index" | "cancelled" | "superseded" | "unavailable") {
+            bail!(
+                "index unavailable after {polls} status polls: startupState={state}, startupError={}",
+                status.get("startupError").unwrap_or(&Value::Null)
+            );
+        }
+        if started.elapsed() >= timeout {
+            bail!("index readiness deadline exceeded after {polls} status polls ({state})");
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(timeout.saturating_sub(started.elapsed())),
+        );
+    }
 }
 
 fn time_request(
@@ -317,13 +355,22 @@ impl Server {
     }
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Every workload exit path, including readiness timeouts and malformed
+        // replies, must stop and reap the measured process. A leaked monolith
+        // server can retain tens of GiB and invalidate every following sample.
+        self.wait_briefly();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Minimal LSP JSON-RPC transport over the child's stdio
 // ---------------------------------------------------------------------------
 
 struct Client {
     writer: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    incoming: Receiver<Result<Value, String>>,
     next_id: i64,
 }
 
@@ -331,7 +378,18 @@ impl Client {
     fn new(server: &mut Server) -> Result<Client> {
         let writer = server.stdin.take().context("server stdin already taken")?;
         let stdout = server.stdout.take().context("server stdout already taken")?;
-        Ok(Client { writer, reader: BufReader::new(stdout), next_id: 1 })
+        let (tx, incoming) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let message = read_message(&mut reader).map_err(|err| err.to_string());
+                let failed = message.is_err();
+                if tx.send(message).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Ok(Client { writer, incoming, next_id: 1 })
     }
 
     fn initialize(&mut self, root_uri: String, options: Value) -> Result<Value> {
@@ -360,18 +418,43 @@ impl Client {
     /// request that interleaves (jabar registers capabilities and creates
     /// progress tokens this way) so the transport does not deadlock.
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_inner(method, params, None)
+    }
+
+    fn request_until(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        self.request_inner(method, params, Some(deadline))
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Option<Instant>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
         loop {
-            let message = self.read_message()?;
-            if let Some(response_id) = message.get("id").and_then(Value::as_i64) {
+            let message = match deadline {
+                Some(deadline) => self
+                    .incoming
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|err| {
+                        anyhow!("`{method}` response deadline exceeded or transport closed: {err}")
+                    })?
+                    .map_err(|err| anyhow!(err))?,
+                None => self
+                    .incoming
+                    .recv()
+                    .context("server closed the connection")?
+                    .map_err(|err| anyhow!(err))?,
+            };
+            if let Some(response_id) = message.get("id") {
                 if message.get("method").is_some() {
-                    // A server→client request. Acknowledge and keep waiting.
                     self.send(json!({ "jsonrpc": "2.0", "id": response_id, "result": null }))?;
                     continue;
                 }
-                if response_id == id {
+                if response_id.as_i64() == Some(id) {
                     if let Some(error) = message.get("error") {
                         bail!("`{method}` failed: {error}");
                     }
@@ -393,28 +476,28 @@ impl Client {
         self.writer.flush()?;
         Ok(())
     }
+}
 
-    fn read_message(&mut self) -> Result<Value> {
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut line = String::new();
-            let read = self.reader.read_line(&mut line)?;
-            if read == 0 {
-                bail!("server closed the connection");
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(value.trim().parse().context("bad Content-Length")?);
-            }
+fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            bail!("server closed the connection");
         }
-        let len = content_length.context("header without Content-Length")?;
-        let mut body = vec![0u8; len];
-        self.reader.read_exact(&mut body)?;
-        Ok(serde_json::from_slice(&body)?)
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse().context("bad Content-Length")?);
+        }
     }
+    let len = content_length.context("header without Content-Length")?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -455,4 +538,39 @@ fn now_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn server_cleanup_terminates_and_reaps_a_hung_child() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let server = Server {
+            child,
+            run_id: "cleanup-test".to_owned(),
+            bench_log: None,
+            stdin: None,
+            stdout: None,
+        };
+
+        drop(server);
+
+        let still_exists = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_exists, "benchmark child {pid} survived Server::drop");
+    }
 }
