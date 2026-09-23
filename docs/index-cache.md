@@ -2,9 +2,9 @@
 
 ## Current path and observed cost
 
-`discover_index` calls `SymbolIndex::from_dir(bazel-bin)` before answering LSP
-`initialize`. The loader stats the tree, reads every `.scip` shard, decodes
-protobuf, and builds lookup maps. On Salesforce core, the reported input is a
+Startup discovery now runs on a worker after LSP `initialize` replies. The
+loader may stat the tree, read every `.scip` shard, decode protobuf, and build
+lookup maps before the first correct query. On Salesforce core, the reported input is a
 2.68M-file tree with 6,876 shards and 3.13M definitions. The reported walk is
 ~46s and total initialization ~5 minutes. These are observations from one
 workspace, not repeatable benchmarks yet; record the commands, hardware, cache
@@ -57,21 +57,20 @@ current.
 
 ## Load and refresh path
 
-1. On startup, resolve workspace and Bazel configuration, inspect `CURRENT`,
-   validate the generation metadata, and load `index.bin`. Measure this path
-   against a defined warm-start budget. A cache miss retains the existing shard
-   discovery path until a separate cold-start design is implemented; it may
-   still block `initialize` for minutes on a large workspace.
+1. Reply to `initialize`, then use one startup worker to resolve Bazel output,
+   inspect `CURRENT`, validate metadata, and load `index.bin`. A cache miss uses
+   shard discovery on that worker. `jabar/status` exposes `indexLoading`,
+   `startupState`, and `startupError`. Queries before readiness return
+   `RequestFailed` with `IndexNotReady`; they do not return empty results.
 2. Cached sessions now avoid the recursive `bazel-bin` watch and use bounded
    periodic reconciliation. Add a watch on a small build-published manifest or
    generation pointer, or an explicit refresh trigger, to reduce detection
    latency for external builds. A watcher overflow/error must mark the index
    unverified and schedule a scan.
-3. Shard scans, protobuf parsing during reload, and cache writes now run on
-   workers and completed results return to the server event loop. Cache decode
-   and cold shard loading still occur before `initialize`; any Bazel build is
-   also synchronous when `index.auto` is needed at startup. Continue rejecting
-   worker results whose workspace, configuration, or HEAD no longer matches.
+3. Startup cache decode, cold shard loading, optional `index.auto` build,
+   watcher setup, refresh scans, and cache writes run on workers. Completed
+   generations return to the event loop for publication. Startup cannot overlap
+   an explicit load or refresh, and stale or cancelled results are discarded.
 4. Rapid refresh changes are coalesced and progress/errors are reported. Add
    rate limiting for repeated failures and expose cache age. Keep the prior
    index while refreshing when its provenance still matches. Measure peak RSS

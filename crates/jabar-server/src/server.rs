@@ -63,8 +63,6 @@ pub const LOAD_INDEX_REQUEST: &str = "jabar/loadIndex";
 /// Performs the `initialize` handshake and runs until the client disconnects.
 pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     let (id, params) = connection.initialize_start().context("initialize handshake failed")?;
-    // `initialize.total` spans request-received to response-sent; index
-    // discovery, the expensive part, happens in between and is included.
     let init_timer = crate::bench::start();
     let params: lsp_types::InitializeParams =
         serde_json::from_value(params).context("client sent malformed InitializeParams")?;
@@ -87,38 +85,8 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     let config = Config::from_initialization_options(params.initialization_options.as_ref());
     tracing::debug!(?config, "configuration");
 
-    // Find an index before advertising, because LSP has no way to say
-    // "supported, but not yet": a provider advertised with nothing behind it
-    // means clients call it and get nothing, which reads as "no such symbol".
-    let mut discovered = root.as_deref().and_then(|root| discover_index(root, &config));
-
-    // Building takes minutes and blocks the handshake, so it happens only when
-    // the client asked for it and there is nothing to serve otherwise.
-    if discovered.is_none()
-        && config.index.auto
-        && let Some(root) = root.as_deref()
-    {
-        match build_index(root, &config) {
-            Ok(()) => discovered = discover_index(root, &config),
-            Err(err) => tracing::warn!(%err, "could not build an index"),
-        }
-    }
-    if let Some(discovered) = &discovered {
-        tracing::info!(
-            dir = %discovered.dir,
-            cached = discovered.cache_hit,
-            shards = discovered.index.shard_count(),
-            definitions = discovered.index.definition_count(),
-            "found an index at startup"
-        );
-    } else {
-        tracing::info!(
-            "no index found; run the SCIP aspect, then reopen or call `jabar/loadIndex`"
-        );
-    }
-
     let result = lsp_types::InitializeResult {
-        capabilities: server_capabilities(encoding, discovered.is_some()),
+        capabilities: server_capabilities(encoding),
         server_info: Some(lsp_types::ServerInfo {
             name: "jabar".to_owned(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
@@ -130,21 +98,13 @@ pub fn run_server(connection: Connection) -> anyhow::Result<()> {
     crate::bench::finish(
         "initialize.total",
         init_timer,
-        crate::bench::Fields {
-            cache_hit: discovered.as_ref().map(|d| d.cache_hit),
-            shards: discovered.as_ref().map(|d| d.index.shard_count()),
-            definitions: discovered.as_ref().map(|d| d.index.definition_count()),
-            outcome: Some(if discovered.is_some() { "ok" } else { "no-index" }),
-            ..Default::default()
-        },
+        crate::bench::Fields { outcome: Some("ok"), ..Default::default() },
     );
 
     let mut server = Server::new(connection.sender.clone(), encoding, root);
     server.supports_progress = supports_progress;
     server.apply_config(config);
-    if let Some(discovered) = discovered {
-        server.adopt_discovered(discovered);
-    }
+    server.schedule_startup();
     server.run(&connection)
 }
 
@@ -223,6 +183,17 @@ struct ExplicitLoadResult {
     request_id: RequestId,
     revision: u64,
     result: Result<ExplicitGeneration, RequestError>,
+}
+
+struct StartupResult {
+    revision: u64,
+    outcome: StartupOutcome,
+}
+
+enum StartupOutcome {
+    Loaded { discovered: Box<Discovered>, watcher: Result<FileWatcher, String> },
+    NoIndex,
+    Failed(String),
 }
 
 struct PendingExplicitLoad {
@@ -617,11 +588,147 @@ pub struct Server {
     explicit_load_tx: Sender<ExplicitLoadResult>,
     explicit_load_rx: Receiver<ExplicitLoadResult>,
     explicit_load_progress: Option<String>,
+    startup_tx: Sender<StartupResult>,
+    startup_rx: Receiver<StartupResult>,
+    startup_running: bool,
+    startup_state: &'static str,
+    startup_error: Option<String>,
     telemetry: Telemetry,
     shutdown_requested: bool,
 }
 
 impl Server {
+    /// Starts one background startup generation after `initialize` has replied.
+    fn schedule_startup(&mut self) {
+        let Some(root) = self.workspace_root.clone() else {
+            return;
+        };
+        let config = self.config.clone();
+        self.schedule_startup_work(move || {
+            let mut discovered = discover_index(&root, &config);
+            if discovered.is_none() && config.index.auto {
+                build_index(&root, &config)?;
+                discovered = discover_index(&root, &config);
+            }
+            let Some(discovered) = discovered else { return Ok(StartupOutcome::NoIndex) };
+            let watch_dir = (!discovered.cache_hit).then_some(discovered.dir.as_str());
+            let watch_path = watch_dir.map(paths::Utf8Path::new).and_then(paths::AbsPath::try_new);
+            let watcher_timer = crate::bench::start();
+            let watcher = FileWatcher::spawn(watch_path, Some(&root)).map_err(|e| e.to_string());
+            crate::bench::finish(
+                "watcher.start",
+                watcher_timer,
+                crate::bench::Fields {
+                    outcome: Some(if watcher.is_ok() { "ok" } else { "error" }),
+                    ..Default::default()
+                },
+            );
+            if !provenance_is_current(
+                discovered.provenance.as_ref(),
+                Some(Path::new(root.as_str())),
+                Path::new(discovered.dir.as_str()),
+            ) {
+                return Err("workspace moved during startup loading".to_owned());
+            }
+            Ok(StartupOutcome::Loaded { discovered: Box::new(discovered), watcher })
+        });
+    }
+
+    fn schedule_startup_work(
+        &mut self,
+        work: impl FnOnce() -> Result<StartupOutcome, String> + Send + 'static,
+    ) {
+        if self.startup_running || self.refresh_running || self.explicit_load_running {
+            return;
+        }
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        let revision = self.refresh_revision;
+        let tx = self.startup_tx.clone();
+        self.startup_running = true;
+        self.startup_state = "loading";
+        self.startup_error = None;
+        let timer = crate::bench::start();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(work))
+                .unwrap_or_else(|_| Err("startup index worker panicked".to_owned()))
+                .unwrap_or_else(StartupOutcome::Failed);
+            let fields = match &outcome {
+                StartupOutcome::Loaded { discovered, .. } => crate::bench::Fields {
+                    generation: Some(revision),
+                    cache_hit: Some(discovered.cache_hit),
+                    shards: Some(discovered.index.shard_count()),
+                    definitions: Some(discovered.index.definition_count()),
+                    references: Some(discovered.index.reference_count()),
+                    reference_paths: Some(discovered.index.reference_path_count()),
+                    occurrences: Some(discovered.index.occurrence_count()),
+                    outcome: Some("ok"),
+                    ..Default::default()
+                },
+                StartupOutcome::NoIndex => crate::bench::Fields {
+                    generation: Some(revision),
+                    outcome: Some("no-index"),
+                    ..Default::default()
+                },
+                StartupOutcome::Failed(_) => crate::bench::Fields {
+                    generation: Some(revision),
+                    outcome: Some("error"),
+                    ..Default::default()
+                },
+            };
+            crate::bench::finish("startup.load", timer, fields);
+            let _ = tx.send(StartupResult { revision, outcome });
+        });
+    }
+
+    fn on_startup_result(&mut self, result: StartupResult) {
+        if !self.startup_running || result.revision != self.refresh_revision {
+            if self.startup_running {
+                self.startup_running = false;
+                self.startup_state = "superseded";
+            }
+            self.retire_startup_outcome(result.outcome);
+            return;
+        }
+        self.startup_running = false;
+        match result.outcome {
+            StartupOutcome::Loaded { discovered, watcher } => {
+                tracing::info!(
+                    dir = %discovered.dir,
+                    cached = discovered.cache_hit,
+                    shards = discovered.index.shard_count(),
+                    definitions = discovered.index.definition_count(),
+                    "found an index at startup"
+                );
+                self.adopt_discovered(*discovered, watcher);
+                self.startup_state = "ready";
+            }
+            StartupOutcome::NoIndex => {
+                self.startup_state = "no-index";
+                tracing::info!("no index found; run the SCIP aspect or call `jabar/loadIndex`");
+            }
+            StartupOutcome::Failed(error) => {
+                tracing::warn!(%error, "startup index load failed");
+                self.startup_state = "failed";
+                self.startup_error = Some(error);
+            }
+        }
+        self.schedule_queued_refresh();
+    }
+
+    fn retire_startup_outcome(&self, outcome: StartupOutcome) {
+        if let StartupOutcome::Loaded { discovered, .. } = outcome {
+            self.retire_index(Arc::new(discovered.index));
+        }
+    }
+
+    fn cancel_startup(&mut self) {
+        if self.startup_running {
+            self.startup_running = false;
+            self.startup_state = "cancelled";
+            self.refresh_revision = self.refresh_revision.wrapping_add(1);
+        }
+    }
+
     pub fn new(
         sender: Sender<Message>,
         encoding: PositionEncoding,
@@ -630,6 +737,7 @@ impl Server {
         let build = workspace_root.clone().map(BazelCli::new);
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (explicit_load_tx, explicit_load_rx) = crossbeam_channel::unbounded();
+        let (startup_tx, startup_rx) = crossbeam_channel::bounded(1);
         let (retire_tx, retire_rx): (Sender<RetiredIndex>, Receiver<RetiredIndex>) =
             crossbeam_channel::unbounded();
         std::thread::spawn(move || {
@@ -687,6 +795,11 @@ impl Server {
             explicit_load_tx,
             explicit_load_rx,
             explicit_load_progress: None,
+            startup_tx,
+            startup_rx,
+            startup_running: false,
+            startup_state: "unavailable",
+            startup_error: None,
             config: Config::default(),
             overlay: Overlay::new(),
             supports_progress: false,
@@ -752,6 +865,12 @@ impl Server {
                     }
                     continue;
                 },
+                recv(self.startup_rx) -> result => {
+                    if let Ok(result) = result {
+                        self.on_startup_result(result);
+                    }
+                    continue;
+                },
                 recv(refresh_tick) -> _ => {
                     self.on_refresh_tick();
                     continue;
@@ -780,6 +899,7 @@ impl Server {
                     if request.method == lsp_types::request::Shutdown::METHOD {
                         tracing::info!("client requested shutdown");
                         self.cancel_explicit_load("server is shutting down");
+                        self.cancel_startup();
                         self.shutdown_requested = true;
                         self.send(Response::new_ok(request.id, ()).into());
                         continue;
@@ -931,7 +1051,7 @@ impl Server {
         changed: bool,
         work: impl FnOnce() -> std::io::Result<RefreshWork> + Send + 'static,
     ) {
-        if self.explicit_load_running {
+        if self.explicit_load_running || self.startup_running {
             if changed {
                 self.refresh_again = true;
             }
@@ -987,7 +1107,6 @@ impl Server {
                 }
                 Ok(RefreshWork::Loaded { index, shards, provenance }) => {
                     let swap_timer = crate::bench::start();
-                    let was_unavailable = self.index.is_none();
                     let definitions = index.definition_count();
                     let shard_count = index.shard_count();
                     tracing::info!(shards = shard_count, definitions, "index reloaded");
@@ -1001,9 +1120,6 @@ impl Server {
                         cache.shards = shards;
                         self.cache_hit = false;
                         self.write_cache_async();
-                    }
-                    if was_unavailable {
-                        self.register_workspace_symbol();
                     }
                     crate::bench::finish(
                         "reload.swap",
@@ -1248,7 +1364,7 @@ impl Server {
         self.index_dir = Some(dir);
     }
 
-    fn adopt_discovered(&mut self, discovered: Discovered) {
+    fn adopt_discovered(&mut self, discovered: Discovered, watcher: Result<FileWatcher, String>) {
         self.refresh_revision = self.refresh_revision.wrapping_add(1);
         self.cache = discovered.cache;
         self.cache_hit = discovered.cache_hit;
@@ -1260,10 +1376,10 @@ impl Server {
             if discovered.verified { RefreshIntent::Idle } else { RefreshIntent::Retry };
         self.replace_index(Arc::new(discovered.index));
         self.refresh_document_freshness();
-        // Watching millions of bazel-bin entries recursively can itself stall
-        // startup. Cached indexes reconcile in a worker instead.
-        let watch_dir = self.cache.is_none().then_some(discovered.dir.as_str());
-        self.start_watching(watch_dir);
+        match watcher {
+            Ok(watcher) => self.watcher = Some(watcher),
+            Err(err) => tracing::warn!(%err, "not watching for changes; reloads must be manual"),
+        }
         self.index_dir = Some(discovered.dir);
         if self.cache_hit {
             self.schedule_index_refresh(false, false);
@@ -1393,7 +1509,7 @@ impl Server {
         request_id: RequestId,
         work: impl FnOnce() -> Result<ExplicitGeneration, RequestError> + Send + 'static,
     ) -> Result<(), RequestError> {
-        if self.refresh_running || self.explicit_load_running {
+        if self.refresh_running || self.explicit_load_running || self.startup_running {
             return Err(RequestError::new(
                 ErrorCode::RequestFailed,
                 "another index generation is already loading; retry when it completes".to_owned(),
@@ -1476,7 +1592,6 @@ impl Server {
         match result.result {
             Ok(generation) => {
                 let ExplicitGeneration { path, index, shards, provenance, watcher } = generation;
-                let was_unavailable = self.index.is_none();
                 let shard_count = index.shard_count();
                 let definitions = index.definition_count();
                 self.replace_index(Arc::from(index));
@@ -1495,9 +1610,6 @@ impl Server {
                         self.watcher = None;
                         tracing::warn!(%err, "not watching for changes; reloads must be manual");
                     }
-                }
-                if was_unavailable {
-                    self.register_workspace_symbol();
                 }
                 tracing::info!(shards = shard_count, definitions, path = %path, "index loaded");
                 let outcome = if definitions == 0 {
@@ -1583,11 +1695,7 @@ impl Server {
         // distinguish and would act on.
         if self.index.is_none() || self.workspace_root.is_none() {
             guard.finish(handlers::index_unavailable_outcome());
-            return Err(RequestError::new(
-                ErrorCode::ServerNotInitialized,
-                "no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
-                    .to_owned(),
-            ));
+            return Err(self.index_not_ready());
         }
         let root = self.workspace_root.clone().expect("just checked");
 
@@ -2011,11 +2119,7 @@ impl Server {
     fn refuse(&self, guard: &mut telemetry::InFlight<'_>, uri: &lsp_types::Url) -> RequestError {
         if self.index.is_none() {
             guard.mark_failed(telemetry::Failure::IndexUnavailable);
-            RequestError::new(
-                ErrorCode::ServerNotInitialized,
-                "no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
-                    .to_owned(),
-            )
+            self.index_not_ready()
         } else {
             guard.mark_failed(telemetry::Failure::BadRequest);
             RequestError::new(
@@ -2023,6 +2127,16 @@ impl Server {
                 format!("`{uri}` is not a file inside the workspace"),
             )
         }
+    }
+
+    fn index_not_ready(&self) -> RequestError {
+        let message = if self.startup_running || self.refresh_running || self.explicit_load_running
+        {
+            "IndexNotReady: symbol index is loading; retry after jabar/status reports indexLoaded"
+        } else {
+            "IndexNotReady: no symbol index is loaded; run the SCIP aspect and call `jabar/loadIndex`"
+        };
+        RequestError::new(ErrorCode::RequestFailed, message.to_owned())
     }
 
     /// Begins watching the shards and the workspace's git state.
@@ -2048,38 +2162,6 @@ impl Server {
                 self.watcher = Some(watcher);
             }
             Err(err) => tracing::warn!(%err, "not watching for changes; reloads must be manual"),
-        }
-    }
-
-    /// Registers `workspace/symbol` dynamically, now that it can be served.
-    fn register_workspace_symbol(&mut self) {
-        let registrations = [
-            lsp_types::request::WorkspaceSymbolRequest::METHOD,
-            lsp_types::request::GotoDefinition::METHOD,
-            lsp_types::request::References::METHOD,
-            lsp_types::request::HoverRequest::METHOD,
-            lsp_types::request::GotoImplementation::METHOD,
-            lsp_types::request::DocumentSymbolRequest::METHOD,
-            lsp_types::request::CallHierarchyPrepare::METHOD,
-        ]
-        .into_iter()
-        .map(|method| lsp_types::Registration {
-            id: format!("jabar-{method}"),
-            method: method.to_owned(),
-            register_options: None,
-        })
-        .collect();
-        let params = lsp_types::RegistrationParams { registrations };
-        match serde_json::to_value(params) {
-            Ok(params) => self.send(
-                lsp_server::Request::new(
-                    lsp_server::RequestId::from("jabar-register-workspace-symbol".to_owned()),
-                    lsp_types::request::RegisterCapability::METHOD.to_owned(),
-                    params,
-                )
-                .into(),
-            ),
-            Err(err) => tracing::warn!(%err, "could not build the capability registration"),
         }
     }
 
@@ -2233,7 +2315,11 @@ impl Server {
                 PositionEncoding::Utf16 => "utf-16",
             },
             index_loaded: self.index.is_some(),
-            index_loading: self.refresh_running || self.explicit_load_running,
+            index_loading: self.startup_running
+                || self.refresh_running
+                || self.explicit_load_running,
+            startup_state: self.startup_state,
+            startup_error: self.startup_error.clone(),
             watching: self.watcher.is_some(),
             index_cache_loaded: self.cache_hit,
             shards_verified: self.shards_verified,
@@ -2276,6 +2362,9 @@ impl Drop for Server {
         while let Ok(result) = self.explicit_load_rx.try_recv() {
             self.retire_explicit_result(result.result);
         }
+        while let Ok(result) = self.startup_rx.try_recv() {
+            self.retire_startup_outcome(result.outcome);
+        }
         if let Some(index) = self.index.take() {
             self.retire_index(index);
         }
@@ -2291,6 +2380,8 @@ pub struct Status {
     pub position_encoding: &'static str,
     pub index_loaded: bool,
     pub index_loading: bool,
+    pub startup_state: &'static str,
+    pub startup_error: Option<String>,
     pub watching: bool,
     /// True when startup loaded the persisted built-index snapshot.
     pub index_cache_loaded: bool,
@@ -2392,6 +2483,75 @@ mod startup_cache_tests {
 
         assert!(!server.status().index_loading);
         assert_eq!(server.index.as_ref().unwrap().definition_count(), 1);
+    }
+
+    #[test]
+    fn startup_worker_keeps_status_responsive_and_adopts_one_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = paths::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+        let mut server = server();
+        server.schedule_startup_work(move || {
+            release_rx.recv().unwrap();
+            Ok(StartupOutcome::Loaded {
+                discovered: Box::new(Discovered {
+                    dir: path,
+                    index: test_index(),
+                    shards: Vec::new(),
+                    provenance: None,
+                    cache: None,
+                    cache_hit: false,
+                    verified: true,
+                }),
+                watcher: Err("disabled in test".to_owned()),
+            })
+        });
+        assert!(server.status().index_loading);
+        assert_eq!(server.status().startup_state, "loading");
+        assert_eq!(server.index_not_ready().code as i32, ErrorCode::RequestFailed as i32);
+        assert!(server.index_not_ready().message.contains("IndexNotReady"));
+        assert!(server.schedule_explicit_load(RequestId::from(7), || unreachable!()).is_err());
+        release_tx.send(()).unwrap();
+        let result = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_startup_result(result);
+        assert_eq!(server.status().startup_state, "ready");
+        assert!(!server.status().index_loading);
+        assert_eq!(server.index.as_ref().unwrap().search("Foo").len(), 1);
+    }
+
+    #[test]
+    fn failed_and_superseded_startup_results_do_not_publish() {
+        let mut server = server();
+        server.schedule_startup_work(|| Err("aspect failed".to_owned()));
+        let failed = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_startup_result(failed);
+        assert_eq!(server.status().startup_state, "failed");
+        assert_eq!(server.status().startup_error.as_deref(), Some("aspect failed"));
+
+        server.schedule_startup_work(|| Ok(StartupOutcome::NoIndex));
+        let stale = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.refresh_revision = server.refresh_revision.wrapping_add(1);
+        server.on_startup_result(stale);
+        assert_eq!(server.status().startup_state, "superseded");
+        assert!(!server.status().index_loading);
+        assert!(server.index.is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_startup_without_waiting_for_worker() {
+        let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+        let mut server = server();
+        server.schedule_startup_work(move || {
+            release_rx.recv().unwrap();
+            Ok(StartupOutcome::NoIndex)
+        });
+        server.cancel_startup();
+        assert_eq!(server.status().startup_state, "cancelled");
+        assert!(!server.status().index_loading);
+        release_tx.send(()).unwrap();
+        let stale = server.startup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.on_startup_result(stale);
+        assert_eq!(server.status().startup_state, "cancelled");
     }
 
     fn write_class_shard(dir: &Path, name: &str) {

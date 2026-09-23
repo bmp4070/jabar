@@ -61,6 +61,7 @@ monolith results:
 | --- | --- | --- |
 | `startup.total` | process entry | first correct query response |
 | `initialize.total` | initialize request received | initialize response sent |
+| `startup.load` | startup worker scheduled | cache/shard/build discovery finished |
 | `cache.key` | cache-key construction | workspace/HEAD/output-tree key ready |
 | `cache.read` | `CURRENT` open | checksum verified and `SymbolIndex` decoded |
 | `shards.scan` | recursive scan begins | sorted shard metadata ready |
@@ -78,9 +79,10 @@ monolith results:
 Each event records a run ID, monotonic duration, outcome, cache hit/miss,
 generation, shard/definition/reference/occurrence counts, and bytes where
 applicable. It must not record source paths or symbol strings. The benchmark
-client also timestamps process spawn, initialize request/response, initialized
-notification, first `jabar/status`, and the first fixed `workspace/symbol`
-response. This separates server work from client and process-launch overhead.
+client also timestamps process spawn, initialize response, initialized
+notification, first `jabar/status`, index readiness, and the first fixed
+`workspace/symbol` response. `startup` polls `jabar/status` until `indexLoaded`
+or its `--ready-timeout-secs` deadline. A failed startup state fails the run.
 
 The heartbeat runs only in benchmark instrumentation, on a monotonic 20ms
 schedule. Record the intended deadline, handling time, and scheduling lateness;
@@ -247,8 +249,9 @@ first counted run, record the host GiB caps and, for containers/cgroups, the
 effective memory limit. Later changes create a new revision of the criteria;
 they do not replace the original pass/fail result:
 
-- storage-warm cache-hit `initialize` p95 is under 10s and at least 5x faster
-  than the cache-miss median;
+- cache-hit and cache-miss `initialize` p95 are each under 1s;
+- storage-warm cache-hit time to index readiness is at least 5x faster than
+  the cache-miss median;
 - storage-warm cache-hit time from process spawn to the first correct query has
   p95 under 12s;
 - an unchanged reconciliation does not increase steady RSS by more than 5%;
