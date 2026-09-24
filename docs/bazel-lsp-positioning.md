@@ -11,6 +11,9 @@ This page describes current strengths and limits. It does not claim that Jabar
 is faster, smaller, or more accurate than another language server: no controlled
 comparative benchmark has established those conclusions.
 
+The procedure for a controlled Java/Bazel comparison with Metals v2 is in the
+[side-by-side evaluation plan](metals-v2-comparison-plan.md).
+
 ## Where Jabar is useful
 
 ### Bazel-produced Java semantics
