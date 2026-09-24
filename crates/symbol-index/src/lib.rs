@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 /// Columns are in whatever [`PositionEncoding`] the containing document used.
 /// Converting to a client's negotiated encoding is the server's job, not this
 /// crate's — it has the file text and this does not.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range {
     pub start_line: u32,
     pub start_col: u32,
@@ -74,7 +74,7 @@ impl Range {
 }
 
 /// How a document's columns are counted.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PositionEncoding {
     Utf8,
     Utf16,
@@ -174,7 +174,7 @@ pub struct Reference<'a> {
 ///
 /// The containing map supplies the symbol and `reference_paths` supplies the
 /// path. At monolith scale this avoids two owned strings per reference.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct StoredReference {
     path: u32,
     range: Range,
@@ -247,6 +247,8 @@ pub struct SymbolIndex {
     by_name: FxHashMap<String, Vec<usize>>,
     /// Symbol string to definition index.
     by_symbol: FxHashMap<String, usize>,
+    /// Additional declaration sites for symbols with more than one definition.
+    other_definition_sites: FxHashMap<String, Vec<usize>>,
     /// Symbol string to every compact reference to it.
     references: FxHashMap<String, Vec<StoredReference>>,
     /// Interned paths used by `references`.
@@ -403,7 +405,7 @@ impl SymbolIndex {
             let path = dir.join(&shard.path);
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    if !index.add_shard(&bytes, &path.display().to_string()) {
+                    if !index.add_shard_with(&bytes, &path.display().to_string(), false) {
                         failed.push(shard.path.clone());
                     }
                 }
@@ -412,6 +414,11 @@ impl SymbolIndex {
                     failed.push(shard.path.clone());
                 }
             }
+        }
+        // A cold load appends all shards first and deduplicates each symbol's
+        // rows once. Peak scratch memory is bounded by one symbol's list.
+        for references in index.references.values_mut() {
+            Self::deduplicate_references(references);
         }
         ShardLoad { index, failed }
     }
@@ -429,6 +436,10 @@ impl SymbolIndex {
 
     /// Adds one shard's contents. `origin` is used only for diagnostics.
     pub fn add_shard(&mut self, bytes: &[u8], origin: &str) -> bool {
+        self.add_shard_with(bytes, origin, true)
+    }
+
+    fn add_shard_with(&mut self, bytes: &[u8], origin: &str, deduplicate: bool) -> bool {
         let index = match Index::parse_from_bytes(bytes) {
             Ok(index) => index,
             Err(err) => {
@@ -437,6 +448,8 @@ impl SymbolIndex {
             }
         };
         self.shards += 1;
+
+        let mut touched = FxHashSet::default();
 
         for doc in &index.documents {
             let encoding = PositionEncoding::of(doc);
@@ -516,22 +529,56 @@ impl SymbolIndex {
                             path_id
                         }
                     };
-                    self.references.entry(occ.symbol.clone()).or_default().push(StoredReference {
+                    let reference = StoredReference {
                         path: path_id,
                         range,
                         encoding,
                         is_import: roles & SymbolRole::Import as i32 != 0,
-                    });
+                    };
+                    self.references.entry(occ.symbol.clone()).or_default().push(reference);
+                    if deduplicate {
+                        touched.insert(occ.symbol.as_str());
+                    }
                 }
             }
 
             // Ordered once per document so lookup can stop early. SCIP emits
             // occurrences in source order already, but nothing guarantees it.
             if let Some(occurrences) = self.occurrences.get_mut(&path) {
-                occurrences.sort_by_key(|o| (o.range.start_line, o.range.start_col));
+                occurrences.sort_by_key(|o| {
+                    (
+                        o.range.start_line,
+                        o.range.start_col,
+                        o.range.end_line,
+                        o.range.end_col,
+                        o.symbol,
+                    )
+                });
+                occurrences.dedup_by(|a, b| a.range == b.range && a.symbol == b.symbol);
+            }
+        }
+        for symbol in touched {
+            if let Some(references) = self.references.get_mut(symbol) {
+                Self::deduplicate_references(references);
             }
         }
         true
+    }
+
+    fn deduplicate_references(references: &mut Vec<StoredReference>) {
+        if references.len() < 2 {
+            return;
+        }
+        let original_len = references.len();
+        let mut seen = FxHashSet::default();
+        references.retain(|reference| seen.insert(reference.clone()));
+        // Overlapping shards can collapse a large vector to a small one. Give
+        // that backing allocation back once the excess is material instead of
+        // carrying duplicate-row capacity for the lifetime of the server.
+        if references.capacity().saturating_sub(references.len()) > references.len().max(1024) {
+            references.shrink_to_fit();
+        }
+        debug_assert!(references.len() <= original_len);
     }
 
     fn intern_symbol(&mut self, symbol: &str) -> u32 {
@@ -577,18 +624,26 @@ impl SymbolIndex {
     /// Adds a definition directly, for callers that build an index from
     /// something other than a SCIP shard — a dirty-file overlay, or a test.
     ///
-    /// A symbol already present is ignored, so re-indexing a target cannot
-    /// double its symbols.
+    /// An already indexed declaration site is ignored, so overlapping targets
+    /// cannot double it while distinct sites for one symbol remain visible.
     pub fn insert(&mut self, def: Definition) {
-        // A symbol can be defined once. Re-indexing the same target, or two
-        // shards covering one file, must not produce duplicates.
-        if self.by_symbol.contains_key(&def.symbol) {
+        // One symbol can have several real declaration sites. Only the same
+        // symbol at the same path and range is a duplicate shard row.
+        if self.by_path.get(&def.path).is_some_and(|sites| {
+            sites.iter().any(|&i| {
+                self.definitions[i].symbol == def.symbol && self.definitions[i].range == def.range
+            })
+        }) {
             return;
         }
         let idx = self.definitions.len();
         self.by_path.entry(def.path.clone()).or_default().push(idx);
         self.by_name.entry(def.name.to_lowercase()).or_default().push(idx);
-        self.by_symbol.insert(def.symbol.clone(), idx);
+        if self.by_symbol.contains_key(&def.symbol) {
+            self.other_definition_sites.entry(def.symbol.clone()).or_default().push(idx);
+        } else {
+            self.by_symbol.insert(def.symbol.clone(), idx);
+        }
         for supertype in &def.implements {
             self.implementors.entry(supertype.clone()).or_default().push(idx);
         }
@@ -766,14 +821,27 @@ impl SymbolIndex {
         span: Range,
         owner: &str,
     ) -> Vec<(&str, Range)> {
-        self.references_within_owner(path, span, Some(owner))
+        let Some(def) = self.by_path.get(path).and_then(|sites| {
+            sites
+                .iter()
+                .map(|&i| &self.definitions[i])
+                .find(|def| def.symbol == owner && def.enclosing == Some(span))
+        }) else {
+            return Vec::new();
+        };
+        self.references_within_callable_site(def)
+    }
+
+    pub fn references_within_callable_site(&self, owner: &Definition) -> Vec<(&str, Range)> {
+        let Some(span) = owner.enclosing else { return Vec::new() };
+        self.references_within_owner(&owner.path, span, Some((owner.symbol.as_str(), owner.range)))
     }
 
     fn references_within_owner(
         &self,
         path: &str,
         span: Range,
-        owner: Option<&str>,
+        owner: Option<(&str, Range)>,
     ) -> Vec<(&str, Range)> {
         let Some(occurrences) = self.occurrences.get(path) else { return Vec::new() };
         let mut seen_ids = FxHashSet::default();
@@ -785,18 +853,20 @@ impl SymbolIndex {
             if !encloses(&span, &occ.range) {
                 continue;
             }
-            if let Some(owner) = owner
-                && self
-                    .enclosing_callable(path, occ.range)
-                    .is_some_and(|callable| callable.symbol != owner)
+            if let Some((owner_symbol, owner_range)) = owner
+                && self.enclosing_callable(path, occ.range).is_some_and(|callable| {
+                    callable.symbol != owner_symbol || callable.range != owner_range
+                })
             {
                 continue;
             }
             let symbol = self.symbol_names[occ.symbol as usize].as_str();
             // A definition inside the span is the method itself, or something
             // declared in it -- neither is a call.
-            if self.by_symbol.get(symbol).is_some_and(|&i| {
-                self.definitions[i].path == path && self.definitions[i].range == occ.range
+            if self.by_path.get(path).is_some_and(|sites| {
+                sites.iter().any(|&i| {
+                    self.definitions[i].symbol == symbol && self.definitions[i].range == occ.range
+                })
             }) {
                 continue;
             }
@@ -828,6 +898,29 @@ impl SymbolIndex {
 
     pub fn definition(&self, symbol: &str) -> Option<&Definition> {
         self.by_symbol.get(symbol).map(|&i| &self.definitions[i])
+    }
+
+    /// Every distinct declaration site for a symbol, in shard order.
+    pub fn definition_sites(&self, symbol: &str) -> Vec<&Definition> {
+        let Some(&first) = self.by_symbol.get(symbol) else { return Vec::new() };
+        let mut sites = vec![&self.definitions[first]];
+        if let Some(others) = self.other_definition_sites.get(symbol) {
+            sites.extend(others.iter().map(|&i| &self.definitions[i]));
+        }
+        sites
+    }
+
+    /// Resolves an exact site carried through a call hierarchy item.
+    pub fn definition_site(&self, symbol: &str, path: &str, range: Range) -> Option<&Definition> {
+        let first = self.definition(symbol)?;
+        if first.path == path && first.range == range {
+            return Some(first);
+        }
+        self.other_definition_sites
+            .get(symbol)?
+            .iter()
+            .map(|&i| &self.definitions[i])
+            .find(|def| def.path == path && def.range == range)
     }
 
     /// Every reference to `symbol`, definitions excluded.
@@ -1061,7 +1154,62 @@ mod tests {
         // already-interned path when the skipped reverse map is rebuilt.
         assert!(restored.add_shard(&shard.write_to_bytes().unwrap(), "again.scip"));
         assert_eq!(restored.reference_path_count(), 1);
-        assert_eq!(restored.reference_count(), 4);
+        assert_eq!(restored.reference_count(), 2, "appending the same shard remains idempotent");
+    }
+
+    #[test]
+    fn overlapping_shards_deduplicate_sites_without_losing_distinct_resolutions() {
+        let symbol = "semanticdb maven example lib example/Library#call().";
+        let other = "semanticdb maven example lib example/Other#call().";
+        let mut first = Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/Caller.java".to_owned();
+        for (name, line, roles) in
+            [(symbol, 1, SymbolRole::Definition as i32), (symbol, 4, 0), (other, 4, 0)]
+        {
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = vec![line, 2, 6];
+            occurrence.symbol = name.to_owned();
+            occurrence.symbol_roles = roles;
+            doc.occurrences.push(occurrence);
+        }
+        first.documents.push(doc);
+
+        let mut second = first.clone();
+        let doc = &mut second.documents[0];
+        let mut distinct_site = doc.occurrences[0].clone();
+        distinct_site.range = vec![2, 2, 6];
+        doc.occurrences.push(distinct_site);
+        let mut distinct_reference = doc.occurrences[1].clone();
+        distinct_reference.range = vec![5, 2, 6];
+        doc.occurrences.push(distinct_reference);
+
+        let mut index = SymbolIndex::default();
+        assert!(index.add_shard(&first.write_to_bytes().unwrap(), "first.scip"));
+        assert!(index.add_shard(&second.write_to_bytes().unwrap(), "second.scip"));
+        assert_eq!(index.definition_count(), 2);
+        assert_eq!(index.definitions_in("src/Caller.java").len(), 2);
+        assert_eq!(index.search("call").len(), 2);
+        assert_eq!(index.reference_count(), 3);
+        assert_eq!(index.references(symbol).len(), 2);
+        assert_eq!(index.references(other).len(), 1);
+        assert_eq!(index.occurrence_count(), 5);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.scip"), first.write_to_bytes().unwrap()).unwrap();
+        std::fs::write(dir.path().join("second.scip"), second.write_to_bytes().unwrap()).unwrap();
+        let cold = SymbolIndex::load_validated(dir.path()).unwrap().index;
+        assert_eq!(cold.definition_count(), 2);
+        assert_eq!(cold.reference_count(), 3);
+        assert_eq!(cold.occurrence_count(), 5);
+
+        let mut snapshot = Vec::new();
+        index.write_snapshot(&mut snapshot).unwrap();
+        let mut restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
+        assert!(restored.add_shard(&second.write_to_bytes().unwrap(), "again.scip"));
+        assert_eq!(restored.definition_count(), 2);
+        assert_eq!(restored.reference_count(), 3);
+        assert_eq!(restored.occurrence_count(), 5);
     }
 
     #[test]
@@ -1274,6 +1422,30 @@ mod tests {
         index.insert(def("com/acme/A#", "A"));
         assert_eq!(index.definition_count(), 1);
         assert_eq!(index.search("A").len(), 1);
+    }
+
+    #[test]
+    fn multisite_definitions_keep_each_site_and_implementation() {
+        let mut index = SymbolIndex::default();
+        let mut first = def("com/acme/A#", "A");
+        first.implements.push("com/acme/Base#".to_owned());
+        let mut second = first.clone();
+        second.path = "java/Elsewhere.java".to_owned();
+        index.insert(first.clone());
+        index.insert(second.clone());
+        assert_eq!(index.definition_sites(&first.symbol).len(), 2);
+        assert_eq!(index.definition(&first.symbol).unwrap().path, first.path);
+        assert_eq!(
+            index.definition_site(&first.symbol, &second.path, second.range).unwrap().path,
+            second.path
+        );
+        assert_eq!(index.implementors("com/acme/Base#").len(), 2);
+
+        let mut snapshot = Vec::new();
+        index.write_snapshot(&mut snapshot).unwrap();
+        let restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
+        assert_eq!(restored.definition_sites(&first.symbol).len(), 2);
+        assert_eq!(restored.implementors("com/acme/Base#").len(), 2);
     }
 
     fn r(sl: u32, sc: u32, el: u32, ec: u32) -> Range {

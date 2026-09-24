@@ -5,11 +5,20 @@ marketplace containing one.
 
 ## Setup
 
-jabar must be findable. Either put it on PATH:
+jabar must be findable. Install a checksum-verified release from the repository
+root:
+
+```sh
+./scripts/install.sh 0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Or build it from source and put it on PATH:
 
 ```sh
 cargo build --release
-ln -sf "$PWD/target/release/jabar" /usr/local/bin/jabar   # or anywhere on PATH
+mkdir -p "$HOME/.local/bin"
+ln -sf "$PWD/target/release/jabar" "$HOME/.local/bin/jabar"
 ```
 
 …or edit `command` in `.claude-plugin/marketplace.json` to the absolute path.
@@ -29,9 +38,14 @@ claims `.java`, and two servers for one extension is not a defined situation.
 
 ## Using it
 
-Open a Bazel Java repo with a SCIP index present — jabar looks for `bazel-bin`
-and `.jabar/index`, and advertises nothing without one. Then ask Claude to use
-the LSP tool, for example:
+Open a Bazel Java repo. By default Jabar loads existing SCIP shards from the
+Bazel output tree or `.jabar/index`. Jabar can also produce shards by running
+its bundled aspect when the client enables `index.auto`; that requires a
+separately installed compatible `scip-java` binary on `PATH` or in
+`index.scipJava`, plus `JAVA_HOME` in the environment that launches Claude. The
+local Claude plugin uses Jabar's defaults, so produce the
+first index manually as described below before asking Claude to use the LSP
+tool, for example:
 
 - "find the definition of ProjectCache"
 - "who calls getAllProjects"

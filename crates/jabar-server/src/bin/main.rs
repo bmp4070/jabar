@@ -3,6 +3,11 @@
 use lsp_server::Connection;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--version" || arg == "-V") {
+        println!("jabar {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     jabar_server::init_tracing();
     // Before anything else, so `t_ns` and startup durations count from process
     // entry. A no-op unless `JABAR_BENCH_LOG` is set.

@@ -13,7 +13,21 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 
-let client: LanguageClient | undefined;
+import { ClientLifecycle } from "./clientLifecycle";
+
+let lifecycle: ClientLifecycle<LanguageClient> | undefined;
+let outputChannel: vscode.OutputChannel | undefined;
+
+const restartSettings = [
+  "jabar.server.path",
+  "jabar.server.log",
+  "jabar.bazel",
+  "jabar.outputBase",
+  "jabar.index.auto",
+  "jabar.index.targets",
+  "jabar.index.scipJava",
+  "jabar.javaHome",
+];
 
 /// Where to look for the binary, in order, before falling back to PATH.
 ///
@@ -49,6 +63,29 @@ function locateServer(context: vscode.ExtensionContext): string | undefined {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  outputChannel = vscode.window.createOutputChannel("jabar");
+  lifecycle = new ClientLifecycle(() => startClient(context));
+  context.subscriptions.push(
+    outputChannel,
+    vscode.commands.registerCommand("jabar.status", () => showStatus()),
+    vscode.commands.registerCommand("jabar.reloadIndex", () => reloadIndex()),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (restartSettings.some((setting) => event.affectsConfiguration(setting))) {
+        void lifecycle
+          ?.restart()
+          .then((restarted) => {
+            if (restarted) {
+              vscode.window.showInformationMessage("jabar restarted with the updated settings.");
+            }
+          })
+          .catch((error) => console.error("jabar failed to restart while applying settings", error));
+      }
+    }),
+  );
+  await lifecycle.start();
+}
+
+async function startClient(context: vscode.ExtensionContext): Promise<LanguageClient | undefined> {
   const config = vscode.workspace.getConfiguration("jabar");
   const located = locateServer(context);
   const command = located ?? "jabar";
@@ -61,28 +98,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...process.env,
         // The server logs to stderr; stdout carries the protocol.
         JABAR_LOG: config.get<string>("server.log") || "info",
+        JAVA_HOME: config.get<string>("javaHome") || process.env.JAVA_HOME,
       },
     },
   };
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "java" }],
+    initializationOptions: {
+      bazel: config.get<string>("bazel") || "bazel",
+      outputBase: config.get<string>("outputBase") || undefined,
+      index: {
+        auto: config.get<boolean>("index.auto") ?? false,
+        targets: config.get<string[]>("index.targets") ?? ["//..."],
+        scipJava: config.get<string>("index.scipJava") || undefined,
+      },
+    },
     // jabar reads its index from bazel-bin, so a rebuild is a server-side
     // event. It watches for that itself; this tells VS Code not to also stream
     // us file events we would only discard.
     synchronize: {},
-    outputChannel: vscode.window.createOutputChannel("jabar"),
+    outputChannel,
   };
 
-  client = new LanguageClient("jabar", "jabar", serverOptions, clientOptions);
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand("jabar.status", () => showStatus()),
-    vscode.commands.registerCommand("jabar.reloadIndex", () => reloadIndex()),
-  );
+  const client = new LanguageClient("jabar", "jabar", serverOptions, clientOptions);
 
   try {
     await client.start();
+    return client;
   } catch (error) {
     // `spawn jabar ENOENT` on its own tells a user nothing actionable, so name
     // what was tried and what would fix it.
@@ -99,17 +142,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand("workbench.action.openSettings", "jabar.server.path");
     }
     console.error("jabar failed to start", error);
+    return undefined;
   }
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return client?.stop();
+  return lifecycle?.shutdown();
 }
 
 /// `jabar/status` reports what the server currently believes about itself,
 /// including whether an index is loaded. Without it, a server that is running
 /// but has no index is indistinguishable from one that is working.
 async function showStatus(): Promise<void> {
+  const client = lifecycle?.client;
   if (!client) {
     vscode.window.showWarningMessage("jabar is not running.");
     return;
@@ -138,6 +183,7 @@ async function showStatus(): Promise<void> {
 /// The server watches `bazel-bin` and reloads on its own, so this is for when
 /// an index was produced somewhere else, or the watcher could not start.
 async function reloadIndex(): Promise<void> {
+  const client = lifecycle?.client;
   if (!client) {
     vscode.window.showWarningMessage("jabar is not running.");
     return;

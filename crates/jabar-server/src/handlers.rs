@@ -12,12 +12,36 @@
 //! returns tens of thousands of locations; a silently clipped list makes an
 //! agent believe it has seen every call site.
 
+use std::cell::RefCell;
+
 use lsp_types::{Location, Position, Range, SymbolInformation, SymbolKind as LspKind, Url};
 use rustc_hash::{FxHashMap, FxHashSet};
 use symbol_index::{Definition, PositionEncoding, SymbolIndex, SymbolKind};
 use telemetry::{EmptyReason, Failure, Outcome};
 
 use crate::line_index::{LineIndex, LinePosition, PositionEncoding as ClientEncoding};
+
+/// Source indexes shared by every conversion in one request. Missing files are
+/// cached too, so a large result set makes at most one read per path.
+struct SourceCache<'a> {
+    read_file: &'a dyn Fn(&str) -> Option<String>,
+    indexes: RefCell<FxHashMap<String, Option<LineIndex>>>,
+}
+
+impl<'a> SourceCache<'a> {
+    fn new(read_file: &'a impl Fn(&str) -> Option<String>) -> Self {
+        Self { read_file, indexes: RefCell::new(FxHashMap::default()) }
+    }
+
+    fn with_index<R>(&self, path: &str, use_index: impl FnOnce(Option<&LineIndex>) -> R) -> R {
+        let mut indexes = self.indexes.borrow_mut();
+        if !indexes.contains_key(path) {
+            let index = (self.read_file)(path).map(|text| LineIndex::new(&text));
+            indexes.insert(path.to_owned(), index);
+        }
+        use_index(indexes.get(path).and_then(Option::as_ref))
+    }
+}
 
 /// How many results a search returns before truncating.
 ///
@@ -74,6 +98,7 @@ pub fn workspace_symbol_with(
     client_encoding: ClientEncoding,
     read_file: impl Fn(&str) -> Option<String>,
 ) -> SearchResults {
+    let cache = SourceCache::new(&read_file);
     let needle = query.to_lowercase();
     let live_matches: Vec<&Definition> = live
         .iter()
@@ -95,7 +120,7 @@ pub fn workspace_symbol_with(
         .into_iter()
         .chain(indexed)
         .take(SEARCH_LIMIT)
-        .filter_map(|def| to_symbol_information(def, workspace_root, client_encoding, &read_file))
+        .filter_map(|def| to_symbol_information(def, workspace_root, client_encoding, &cache))
         .collect();
 
     SearchResults { symbols, total }
@@ -105,11 +130,11 @@ fn to_symbol_information(
     def: &Definition,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Option<SymbolInformation> {
     let abs = workspace_root.join(&def.path);
     let uri = Url::from_file_path(abs.as_str()).ok()?;
-    let range = convert_range(def, client_encoding, read_file);
+    let range = convert_range(def, client_encoding, cache);
 
     #[allow(deprecated)] // `deprecated` is a required field of the struct
     Some(SymbolInformation {
@@ -137,9 +162,9 @@ fn to_symbol_information(
 fn convert_range(
     def: &Definition,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Range {
-    convert_span(&def.path, def.range, def.encoding, client_encoding, read_file)
+    convert_span(&def.path, def.range, def.encoding, client_encoding, cache)
 }
 
 fn convert_span(
@@ -147,7 +172,7 @@ fn convert_span(
     raw: symbol_index::Range,
     index_encoding: symbol_index::PositionEncoding,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Range {
     let passthrough = Range {
         start: Position::new(raw.start_line, raw.start_col),
@@ -165,27 +190,25 @@ fn convert_span(
         return passthrough;
     }
 
-    let Some(text) = read_file(path) else {
-        tracing::debug!(path, "no text for column conversion; passing columns through");
-        return passthrough;
-    };
-    let line_index = LineIndex::new(&text);
-
-    let convert = |line: u32, col: u32| -> Position {
-        let offset = line_index.offset(LinePosition::new(line, col), index_encoding);
-        match offset {
-            Some(offset) => {
-                let converted = line_index.position(offset, client_encoding);
-                Position::new(converted.line, converted.character)
+    cache.with_index(path, |line_index| {
+        let Some(line_index) = line_index else {
+            tracing::debug!(path, "no text for column conversion; passing columns through");
+            return passthrough;
+        };
+        let convert = |line: u32, col: u32| -> Position {
+            match line_index.offset(LinePosition::new(line, col), index_encoding) {
+                Some(offset) => {
+                    let converted = line_index.position(offset, client_encoding);
+                    Position::new(converted.line, converted.character)
+                }
+                None => Position::new(line, col),
             }
-            // A position the file does not have. The index is stale relative to
-            // the text; the caller sees a slightly wrong column rather than
-            // nothing.
-            None => Position::new(line, col),
+        };
+        Range {
+            start: convert(raw.start_line, raw.start_col),
+            end: convert(raw.end_line, raw.end_col),
         }
-    };
-
-    Range { start: convert(raw.start_line, raw.start_col), end: convert(raw.end_line, raw.end_col) }
+    })
 }
 
 fn to_lsp_kind(kind: SymbolKind) -> LspKind {
@@ -219,14 +242,14 @@ fn to_lsp_kind(kind: SymbolKind) -> LspKind {
 /// `jabar/references` says so.
 pub const REFERENCE_LIMIT: usize = 5000;
 
-/// A resolved location, plus what the index knew about it.
+/// Resolved declaration locations, plus what the index knew about them.
 pub struct Located {
-    pub location: Location,
+    pub locations: Vec<Location>,
     /// The SCIP symbol, so a caller can chain another query without re-resolving.
     pub symbol: String,
 }
 
-/// Resolves the symbol under a cursor to its definition.
+/// Resolves the symbol under a cursor to every retained declaration site.
 ///
 /// `position` arrives in the client's encoding and is converted to the index's
 /// UTF-16 columns before lookup — the two disagree on any line with a non-ASCII
@@ -239,17 +262,16 @@ pub fn goto_definition(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Option<Located> {
-    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
-    let def = index.definition(&symbol)?;
-    let location = to_location(
-        def.path.as_str(),
-        def.range,
-        def.encoding,
-        workspace_root,
-        client_encoding,
-        read_file,
-    )?;
-    Some(Located { location, symbol })
+    let cache = SourceCache::new(read_file);
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
+    let locations = index
+        .definition_sites(&symbol)
+        .into_iter()
+        .filter_map(|def| {
+            to_location(&def.path, def.range, def.encoding, workspace_root, client_encoding, &cache)
+        })
+        .collect::<Vec<_>>();
+    (!locations.is_empty()).then_some(Located { locations, symbol })
 }
 
 /// References to the symbol under a cursor, ranked and capped.
@@ -265,11 +287,14 @@ pub fn find_references(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Option<ReferenceResults> {
-    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let cache = SourceCache::new(read_file);
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
 
     let mut hits: Vec<(&str, symbol_index::Range, symbol_index::PositionEncoding)> = Vec::new();
-    if include_declaration && let Some(def) = index.definition(&symbol) {
-        hits.push((def.path.as_str(), def.range, def.encoding));
+    if include_declaration {
+        for def in index.definition_sites(&symbol) {
+            hits.push((def.path.as_str(), def.range, def.encoding));
+        }
     }
     for reference in index.references(&symbol) {
         hits.push((reference.path, reference.range, reference.encoding));
@@ -295,7 +320,7 @@ pub fn find_references(
         .into_iter()
         .take(REFERENCE_LIMIT)
         .filter_map(|(path, range, encoding)| {
-            to_location(path, range, encoding, workspace_root, client_encoding, read_file)
+            to_location(path, range, encoding, workspace_root, client_encoding, &cache)
         })
         .collect();
 
@@ -325,17 +350,18 @@ fn symbol_under_cursor(
     relative_path: &str,
     position: LinePosition,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Option<String> {
     // The index stores UTF-16 columns. A UTF-8 client's column is a byte
     // offset, and converting needs the file's text.
     let col = if client_encoding == ClientEncoding::Utf16 {
         position.character
     } else {
-        let text = read_file(relative_path)?;
-        let line_index = LineIndex::new(&text);
-        let offset = line_index.offset(position, client_encoding)?;
-        line_index.position(offset, ClientEncoding::Utf16).character
+        cache.with_index(relative_path, |line_index| {
+            let line_index = line_index?;
+            let offset = line_index.offset(position, client_encoding)?;
+            Some(line_index.position(offset, ClientEncoding::Utf16).character)
+        })?
     };
     index.symbol_at(relative_path, position.line, col).map(str::to_owned)
 }
@@ -346,13 +372,13 @@ fn to_location(
     index_encoding: symbol_index::PositionEncoding,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Option<Location> {
     let abs = workspace_root.join(relative_path);
     let uri = Url::from_file_path(abs.as_str()).ok()?;
     Some(Location {
         uri,
-        range: convert_span(relative_path, range, index_encoding, client_encoding, read_file),
+        range: convert_span(relative_path, range, index_encoding, client_encoding, cache),
     })
 }
 
@@ -371,7 +397,8 @@ pub fn hover(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Option<lsp_types::Hover> {
-    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let cache = SourceCache::new(read_file);
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
     let def = index.definition(&symbol)?;
 
     let mut markdown = String::new();
@@ -424,19 +451,13 @@ pub fn goto_implementation(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<Location>> {
-    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
+    let cache = SourceCache::new(read_file);
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
     let locations = index
         .implementors(&symbol)
         .into_iter()
         .filter_map(|def| {
-            to_location(
-                &def.path,
-                def.range,
-                def.encoding,
-                workspace_root,
-                client_encoding,
-                read_file,
-            )
+            to_location(&def.path, def.range, def.encoding, workspace_root, client_encoding, &cache)
         })
         .collect();
     Some(locations)
@@ -465,10 +486,11 @@ pub fn document_symbols_from(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::DocumentSymbol> {
+    let cache = SourceCache::new(read_file);
     let converted: Vec<(usize, lsp_types::DocumentSymbol)> = defs
         .iter()
         .enumerate()
-        .map(|(i, def)| (i, to_document_symbol(def, relative_path, client_encoding, read_file)))
+        .map(|(i, def)| (i, to_document_symbol(def, relative_path, client_encoding, &cache)))
         .collect();
 
     // Nest by enclosing span: a symbol whose selection range falls inside an
@@ -521,15 +543,14 @@ fn to_document_symbol(
     def: &Definition,
     relative_path: &str,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> lsp_types::DocumentSymbol {
-    let selection =
-        convert_span(relative_path, def.range, def.encoding, client_encoding, read_file);
+    let selection = convert_span(relative_path, def.range, def.encoding, client_encoding, cache);
     // The full declaration where the indexer gave one, otherwise the name --
     // LSP requires `range` to contain `selection_range`, so it can never be
     // narrower.
     let range = match def.enclosing {
-        Some(span) => convert_span(relative_path, span, def.encoding, client_encoding, read_file),
+        Some(span) => convert_span(relative_path, span, def.encoding, client_encoding, cache),
         None => selection,
     };
     #[allow(deprecated)] // `deprecated` is a required field of the struct
@@ -558,14 +579,27 @@ pub fn prepare_call_hierarchy(
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Option<lsp_types::CallHierarchyItem> {
-    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, read_file)?;
-    let def = index.definition(&symbol)?;
+    let cache = SourceCache::new(read_file);
+    let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
+    let cursor = (position.line, position.character);
+    let def = index
+        .definition_sites(&symbol)
+        .into_iter()
+        .find(|def| {
+            if def.path != relative_path {
+                return false;
+            }
+            let range = convert_span(&def.path, def.range, def.encoding, client_encoding, &cache);
+            (range.start.line, range.start.character) <= cursor
+                && cursor < (range.end.line, range.end.character)
+        })
+        .or_else(|| index.definition(&symbol))?;
     // Only a callable can have callers. Starting a hierarchy from a class would
     // give a tree of things that are not calls.
     if !matches!(def.kind, SymbolKind::Method | SymbolKind::Constructor) {
         return None;
     }
-    to_call_item(def, workspace_root, client_encoding, read_file)
+    to_call_item(def, workspace_root, client_encoding, &cache)
 }
 
 /// Methods that call the given one.
@@ -576,44 +610,54 @@ pub fn prepare_call_hierarchy(
 /// enclosing class.
 pub fn incoming_calls(
     index: &SymbolIndex,
-    symbol: &str,
+    site: &CallItemSite,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::CallHierarchyIncomingCall> {
+    let Some(target) = index.definition_site(&site.symbol, &site.path, site.range) else {
+        return Vec::new();
+    };
+    let cache = SourceCache::new(read_file);
     // One entry per caller, carrying every site it calls from -- which is what
     // `from_ranges` is for, and why a caller appearing twice is one result.
-    let mut callers: Vec<(&Definition, Vec<Range>)> = Vec::new();
-    let mut caller_ids: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut callers: Vec<(&Definition, Vec<symbol_index::Reference<'_>>)> = Vec::new();
+    let mut caller_ids: FxHashMap<(&str, &str, symbol_index::Range), usize> = FxHashMap::default();
 
-    for reference in index.references(symbol) {
+    for reference in index.references(&target.symbol) {
         let Some(caller) = index.enclosing_callable(reference.path, reference.range) else {
             continue;
         };
-        let range = convert_span(
-            reference.path,
-            reference.range,
-            reference.encoding,
-            client_encoding,
-            read_file,
-        );
-        match caller_ids.get(caller.symbol.as_str()).copied() {
-            Some(index) => callers[index].1.push(range),
+        let key = (caller.symbol.as_str(), caller.path.as_str(), caller.range);
+        match caller_ids.get(&key).copied() {
+            Some(index) => callers[index].1.push(reference),
             None => {
-                caller_ids.insert(caller.symbol.as_str(), callers.len());
-                callers.push((caller, vec![range]));
+                if callers.len() == CALL_HIERARCHY_LIMIT {
+                    continue;
+                }
+                caller_ids.insert(key, callers.len());
+                callers.push((caller, vec![reference]));
             }
         }
     }
 
     callers
         .into_iter()
-        .take(CALL_HIERARCHY_LIMIT)
-        .filter_map(|(def, from_ranges)| {
-            Some(lsp_types::CallHierarchyIncomingCall {
-                from: to_call_item(def, workspace_root, client_encoding, read_file)?,
-                from_ranges,
-            })
+        .filter_map(|(def, references)| {
+            let from = to_call_item(def, workspace_root, client_encoding, &cache)?;
+            let from_ranges = references
+                .into_iter()
+                .map(|reference| {
+                    convert_span(
+                        reference.path,
+                        reference.range,
+                        reference.encoding,
+                        client_encoding,
+                        &cache,
+                    )
+                })
+                .collect();
+            Some(lsp_types::CallHierarchyIncomingCall { from, from_ranges })
         })
         .collect()
 }
@@ -621,17 +665,22 @@ pub fn incoming_calls(
 /// Methods the given one calls.
 pub fn outgoing_calls(
     index: &SymbolIndex,
-    symbol: &str,
+    site: &CallItemSite,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::CallHierarchyOutgoingCall> {
-    let Some(def) = index.definition(symbol) else { return Vec::new() };
+    let cache = SourceCache::new(read_file);
+    let Some(def) = index.definition_site(&site.symbol, &site.path, site.range) else {
+        return Vec::new();
+    };
     // Without a declaration span there is no body to look inside.
-    let Some(span) = def.enclosing else { return Vec::new() };
+    if def.enclosing.is_none() {
+        return Vec::new();
+    }
 
     index
-        .references_within_callable(&def.path, span, &def.symbol)
+        .references_within_callable_site(def)
         .into_iter()
         .filter_map(|(referenced, at)| {
             let callee = index.definition(referenced)?;
@@ -641,14 +690,14 @@ pub fn outgoing_calls(
                 return None;
             }
             Some(lsp_types::CallHierarchyOutgoingCall {
-                to: to_call_item(callee, workspace_root, client_encoding, read_file)?,
+                to: to_call_item(callee, workspace_root, client_encoding, &cache)?,
                 // Where in *this* method the call appears.
                 from_ranges: vec![convert_span(
                     &def.path,
                     at,
                     def.encoding,
                     client_encoding,
-                    read_file,
+                    &cache,
                 )],
             })
         })
@@ -662,25 +711,31 @@ pub fn outgoing_calls(
 /// a level at a time, so breadth past this is noise rather than context.
 pub const CALL_HIERARCHY_LIMIT: usize = 100;
 
-/// Recovers the SCIP symbol a `CallHierarchyItem` was built from.
-pub fn call_item_symbol(item: &lsp_types::CallHierarchyItem) -> Option<String> {
-    item.data.as_ref()?.get("symbol")?.as_str().map(str::to_owned)
+/// Index coordinates identifying one declaration carried across hierarchy requests.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CallItemSite {
+    pub symbol: String,
+    pub path: String,
+    pub range: symbol_index::Range,
+}
+
+pub fn call_item_site(item: &lsp_types::CallHierarchyItem) -> Option<CallItemSite> {
+    serde_json::from_value(item.data.clone()?).ok()
 }
 
 fn to_call_item(
     def: &Definition,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
-    read_file: &impl Fn(&str) -> Option<String>,
+    cache: &SourceCache<'_>,
 ) -> Option<lsp_types::CallHierarchyItem> {
     let abs = workspace_root.join(&def.path);
     let uri = lsp_types::Url::from_file_path(abs.as_str()).ok()?;
-    let selection_range =
-        convert_span(&def.path, def.range, def.encoding, client_encoding, read_file);
+    let selection_range = convert_span(&def.path, def.range, def.encoding, client_encoding, cache);
     // LSP requires `range` to contain `selection_range`, so a definition without
     // a declaration span uses its name for both.
     let range = match def.enclosing {
-        Some(span) => convert_span(&def.path, span, def.encoding, client_encoding, read_file),
+        Some(span) => convert_span(&def.path, span, def.encoding, client_encoding, cache),
         None => selection_range,
     };
     Some(lsp_types::CallHierarchyItem {
@@ -691,7 +746,14 @@ fn to_call_item(
         uri,
         range,
         selection_range,
-        data: Some(serde_json::json!({ "symbol": def.symbol })),
+        data: Some(
+            serde_json::to_value(CallItemSite {
+                symbol: def.symbol.clone(),
+                path: def.path.clone(),
+                range: def.range,
+            })
+            .expect("call item site is serializable"),
+        ),
     })
 }
 
@@ -708,6 +770,8 @@ pub fn index_unavailable_outcome() -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Message as _;
+    use std::cell::Cell;
 
     fn root() -> paths::AbsPathBuf {
         paths::AbsPathBuf::try_from("/repo").expect("absolute")
@@ -841,5 +905,172 @@ mod tests {
         );
         assert_eq!(results.total, 0);
         assert!(results.symbols.is_empty());
+    }
+
+    #[test]
+    fn same_file_results_share_one_source_index_per_request() {
+        let mut index = SymbolIndex::default();
+        index.insert(definition("Same.java", "Alpha", 0, 2, 7));
+        index.insert(definition("Same.java", "Beta", 0, 8, 12));
+        let reads = Cell::new(0);
+        let results = workspace_symbol(&index, "a", &root(), ClientEncoding::Utf8, |_| {
+            reads.set(reads.get() + 1);
+            Some("é Alpha Beta\n".to_owned())
+        });
+        assert_eq!(results.symbols.len(), 2);
+        assert_eq!(reads.get(), 1);
+        let columns: Vec<_> =
+            results.symbols.iter().map(|s| s.location.range.start.character).collect();
+        assert_eq!(columns, [3, 9]);
+
+        let results = workspace_symbol(&index, "a", &root(), ClientEncoding::Utf16, |_| {
+            panic!("matching encodings need no source read")
+        });
+        let columns: Vec<_> =
+            results.symbols.iter().map(|s| s.location.range.start.character).collect();
+        assert_eq!(columns, [2, 8]);
+    }
+
+    #[test]
+    fn incoming_calls_converts_only_the_first_hundred_caller_groups() {
+        let target = "semanticdb maven example lib example/Target#call().";
+        let mut index = SymbolIndex::default();
+        let mut target_def = definition("Target.java", "Target", 0, 2, 3);
+        target_def.symbol = target.to_owned();
+        target_def.kind = SymbolKind::Method;
+        index.insert(target_def);
+        let mut shard = scip::types::Index::new();
+        for i in 0..=CALL_HIERARCHY_LIMIT {
+            let path = format!("Caller{i}.java");
+            let mut caller = definition(&path, &format!("Caller{i}"), 0, 2, 3);
+            caller.symbol = format!("caller-{i}");
+            caller.kind = SymbolKind::Method;
+            caller.enclosing =
+                Some(symbol_index::Range { start_line: 0, start_col: 0, end_line: 0, end_col: 10 });
+            index.insert(caller);
+
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = path;
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.symbol = target.to_owned();
+            occurrence.range = vec![0, 4, 5];
+            doc.occurrences.push(occurrence);
+            shard.documents.push(doc);
+        }
+        // A site for an already included caller appears after the excluded
+        // group and must still be retained.
+        let mut extra = scip::types::Document::new();
+        extra.relative_path = "Caller0.java".to_owned();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.symbol = target.to_owned();
+        occurrence.range = vec![0, 6, 7];
+        extra.occurrences.push(occurrence);
+        shard.documents.push(extra);
+        assert!(index.add_shard(&shard.write_to_bytes().unwrap(), "fanout.scip"));
+
+        let reads = Cell::new(0);
+        let site = CallItemSite {
+            symbol: target.to_owned(),
+            path: "Target.java".to_owned(),
+            range: symbol_index::Range { start_line: 0, start_col: 2, end_line: 0, end_col: 3 },
+        };
+        let calls = incoming_calls(&index, &site, &root(), ClientEncoding::Utf8, &|path| {
+            assert_ne!(path, "Caller100.java", "excluded caller must not be converted");
+            reads.set(reads.get() + 1);
+            Some("é abcdefghij\n".to_owned())
+        });
+        assert_eq!(calls.len(), CALL_HIERARCHY_LIMIT);
+        assert_eq!(calls[0].from_ranges.len(), 2);
+        assert_eq!(calls[0].from_ranges[0].start.character, 5);
+        assert_eq!(calls[0].from_ranges[1].start.character, 7);
+        assert_eq!(reads.get(), CALL_HIERARCHY_LIMIT);
+    }
+
+    #[test]
+    fn multisite_call_items_expand_their_own_bodies_and_references_include_both_sites() {
+        let shared = "semanticdb maven example lib example/Shared#run().";
+        let mut index = SymbolIndex::default();
+        let mut shard = scip::types::Index::new();
+        for (path, callee_name) in [("A.java", "First"), ("B.java", "Second")] {
+            let mut caller = definition(path, "Shared", 0, 2, 8);
+            caller.symbol = shared.to_owned();
+            caller.kind = SymbolKind::Method;
+            caller.enclosing =
+                Some(symbol_index::Range { start_line: 0, start_col: 0, end_line: 2, end_col: 0 });
+            index.insert(caller);
+            let callee_symbol = format!("callee-{callee_name}");
+            let mut callee = definition(&format!("{callee_name}.java"), callee_name, 0, 0, 5);
+            callee.symbol = callee_symbol.clone();
+            callee.kind = SymbolKind::Method;
+            index.insert(callee);
+
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = path.to_owned();
+            let mut declared = scip::types::Occurrence::new();
+            declared.symbol = shared.to_owned();
+            declared.range = vec![0, 2, 8];
+            declared.symbol_roles = scip::types::SymbolRole::Definition as i32;
+            doc.occurrences.push(declared);
+            let mut called = scip::types::Occurrence::new();
+            called.symbol = callee_symbol;
+            called.range = vec![1, 2, 8];
+            doc.occurrences.push(called);
+            shard.documents.push(doc);
+        }
+        assert!(index.add_shard(&shard.write_to_bytes().unwrap(), "shared.scip"));
+
+        let first = prepare_call_hierarchy(
+            &index,
+            "A.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        let second = prepare_call_hierarchy(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        let first_site = call_item_site(&first).unwrap();
+        let second_site = call_item_site(&second).unwrap();
+        assert_eq!(first_site.path, "A.java");
+        assert_eq!(second_site.path, "B.java");
+        let first_calls =
+            outgoing_calls(&index, &first_site, &root(), ClientEncoding::Utf16, &|_| None);
+        let second_calls =
+            outgoing_calls(&index, &second_site, &root(), ClientEncoding::Utf16, &|_| None);
+        assert_eq!(first_calls.len(), 1);
+        assert_eq!(second_calls.len(), 1);
+        assert_eq!(first_calls[0].to.name, "First");
+        assert_eq!(second_calls[0].to.name, "Second");
+
+        let references = find_references(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            true,
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(references.total, 2);
+        assert_eq!(references.locations.len(), 2);
+        let definitions = goto_definition(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(definitions.locations.len(), 2);
     }
 }

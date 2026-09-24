@@ -17,7 +17,7 @@ use symbol_index::{ShardMetadata, SymbolIndex};
 
 use crate::config::Config;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAGIC: &[u8; 8] = b"JABARIDX";
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -339,6 +339,7 @@ fn update_checksum(checksum: &mut u64, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Message as _;
     use symbol_index::{Definition, PositionEncoding, Range, SymbolKind};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, CacheKey, SymbolIndex) {
@@ -388,11 +389,25 @@ mod tests {
         fs::write(generation.join("index.bin"), body).unwrap();
         let mut manifest: Manifest =
             serde_json::from_reader(File::open(&manifest_path).unwrap()).unwrap();
-        manifest.version = VERSION - 1;
+        manifest.version = 2;
         manifest.bytes = body.len() as u64;
         serde_json::to_writer(File::create(manifest_path).unwrap(), &manifest).unwrap();
 
         assert!(load(temp.path(), &key).unwrap().is_none());
+
+        // A miss leaves the shard path available to rebuild the index.
+        let mut shard = scip::types::Index::new();
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "src/Foo.java".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.symbol = "java Foo#".into();
+        occurrence.range = vec![0, 6, 9];
+        occurrence.symbol_roles = scip::types::SymbolRole::Definition as i32;
+        doc.occurrences.push(occurrence);
+        shard.documents.push(doc);
+        fs::write(dir.join("target.scip"), shard.write_to_bytes().unwrap()).unwrap();
+        let rebuilt = SymbolIndex::load_validated(&dir).unwrap().index;
+        assert_eq!(rebuilt.definition("java Foo#").unwrap().path, "src/Foo.java");
     }
 
     #[test]

@@ -3,6 +3,10 @@
 Everything arrives as LSP `initializationOptions`. Every setting has a default
 that works, so a client that sends nothing still gets a working server.
 
+Automatic indexing invokes scip-java, which requires `JAVA_HOME`. Set it in the
+environment that launches the LSP client. The VS Code shim can instead pass it
+through its `jabar.javaHome` setting.
+
 ```jsonc
 {
   // Where bazel keeps its state. Omit to share the workspace default.
