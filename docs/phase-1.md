@@ -9,9 +9,9 @@ surface was verified against Claude Code's LSP tool; the classpath and
 source-mapping claims were verified by attaching `jdb` to `fixtures/megarepo`.
 
 **Current SCIP status (2026-09-17):** This document preserves the historical
-v0.12.3 spike and its fork decision. Upstream `scip-code/scip-java` now includes
-the Bazel 9 and bzlmod fixes. Jabar bundles an unmodified upstream aspect
-snapshot; no separate scip-java fork is needed. See
+v0.12.3 spike. Upstream `scip-code/scip-java` now includes the Bazel 9 and
+bzlmod fixes. Jabar bundles an upstream aspect snapshot with one documented
+source-jar fix. See
 [`crates/build-model/aspects/README.md`](../crates/build-model/aspects/README.md)
 for the current integration.
 
@@ -1126,7 +1126,7 @@ Each gets baked into a type signature early. Deferring means rewriting Phase 2.
 | How does the client learn that a result was truncated? | A custom method returning an explicit total and a ranking rationale, with standard `textDocument/references` kept as a conformant fallback for Copilot. Silent truncation makes an agent confidently wrong. |
 | Own a Bazel daemon connection, or shell out per query? | Shell out to the CLI, which talks to the resident Bazel server — there is no per-query JVM warmup to avoid. The real cost is contention with the agent's own builds (F13), answered by a dedicated `--output_base` rather than by a different protocol. |
 | How does the index behave when a target's header jar is missing or stale? | Three-way source model per target: present → read it; absent → `TargetNotLoaded`, never `NoMatch`; source newer than jar → overlay from parsed source (F14). |
-| Where does call-site data for `findReferences` come from? | **Decided: build-time reference tables, SCIP format, `scip-java`'s JVM indexer, our own fork of its Bazel aspect.** The spike confirmed SCIP answers 8 of 9 operations including call hierarchy, and matched the fixture's golden answers exactly — but scip-java's aspect does not run on Bazel 9 (F15). |
+| Where does call-site data for `findReferences` come from? | **Decided: build-time reference tables, SCIP format, `scip-java`'s JVM indexer, and the bundled upstream Bazel aspect with one local source-jar fix.** The spike confirmed SCIP answers 8 of 9 operations including call hierarchy and matched the fixture's golden answers (F15). |
 | Is a first build a prerequisite? | **Yes, scoped — not `//...`.** An index is a build output, so require the build rather than engineer around its absence. Produced in CI and fetched where possible; locally as a fallback (F17). |
 | How does jabar learn a file changed outside the client? | **Undecided.** `didChangeWatchedFiles`, watchman, or an explicit `jabar/refresh` the agent calls after its own builds. The last is attractive because the client is the thing running the builds (F18). |
 | What is the unit of focus? | A set, not a target, with promote-on-write membership (F16). |

@@ -52,12 +52,12 @@ and an enabled automatic build run after the `initialize` response; check
 
 Turn it on when you would rather wait once than build by hand.
 
-## `index.targets` — not `//...`
+## `index.targets` — scope large workspaces
 
-Defaults to `//...` because that is the only sensible default for a small repo,
-and it is the wrong value for a large one. A real megarepo's `//...` includes
+The default is `//...` so a small repository works without configuration.
+Large workspaces should set an explicit scope: the full pattern can include
 targets broken at HEAD, targets needing credentials, and targets whose
-toolchains are not installed. Scope it to what you work in:
+toolchains are not installed locally. For example:
 
 ```json
 { "index": { "targets": ["//java/...", "//lib/..."] } }

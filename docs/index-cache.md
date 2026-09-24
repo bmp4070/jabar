@@ -2,13 +2,16 @@
 
 ## Current path and observed cost
 
-`discover_index` calls `SymbolIndex::from_dir(bazel-bin)` before answering LSP
-`initialize`. The loader stats the tree, reads every `.scip` shard, decodes
-protobuf, and builds lookup maps. On the Monolith, the reported input is a
-tree of a couple of million files with 6,876 shards and 3.13M definitions. The reported walk is
-~46s and total initialization ~5 minutes. These are observations from one
-workspace, not repeatable benchmarks yet; record the commands, hardware, cache
-state, shard bytes, and timing breakdown before committing to a format.
+After answering LSP `initialize`, one startup worker resolves the output tree
+and first attempts to load the keyed built-index snapshot. On a miss or rejected
+snapshot, the validated-shard fallback stats the tree, reads every `.scip`
+shard, decodes protobuf, and builds lookup maps. The first counted
+representative run used a tree of a couple million files with 6,876 shards and
+3.13M definitions. On the measured host, version 2 took about 100 seconds on the
+shard-decode path and about 22 seconds on a warm cache hit. These are limited
+samples on one workspace; see
+[`monolith-measurement-results.md`](monolith-measurement-results.md) for the
+environment and caveats.
 
 A shard-path manifest skips the walk but still decodes every shard. A
 concatenated `index.scip` also needs protobuf decoding and lookup construction.
@@ -98,10 +101,10 @@ branch switches, and a refresh finishing after a newer generation.
 Run the protocol in
 [`docs/monolith-measurements.md`](monolith-measurements.md), including its
 cache-state definitions, phase timings, peak/steady RSS collection, response
-probes during reload, correctness parity, raw artifacts, and acceptance gates.
-Accept the cache only when the warm path meets those gates and produces the same
-answers as a fresh shard load. `docs/monolith-roadmap.md` tracks the other
-requirements for large repositories.
+probes during reload, normalized response comparisons, raw artifacts, and
+acceptance gates. Accept the cache only when the warm path meets those gates and
+produces the same answers as a fresh shard load. `docs/monolith-roadmap.md`
+tracks the other requirements for large repositories.
 
 **Status:** the first implementation persists the complete built index with a
 versioned MessagePack snapshot, checksum, configuration/HEAD key, exact shard
@@ -118,6 +121,7 @@ reference/occurrence counts, and distinct reference paths on cache hits.
 
 The version 2 layout still uses streaming MessagePack. It is an incremental
 reduction in bytes, allocations, and resident state ahead of any mmap or lazy
-format decision. Cache misses still scan and decode synchronously, and the
-representative-monolith version 2 measurements, source-build freshness,
-indexing coverage, and CI distribution work remain open.
+format decision. Cache misses still scan and decode serially inside the startup
+worker. Version 2 has initial representative-monolith measurements; the required
+repetitions, refresh workloads, normalized query-response comparison,
+source-build freshness, indexing coverage, and CI distribution work remain open.

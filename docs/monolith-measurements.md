@@ -297,7 +297,7 @@ The measurement work is complete when:
 - [ ] all startup and refresh workloads have the required samples;
 - [ ] peak and steady RSS are captured with phase-correlated samples;
 - [ ] the current whole-index cache is validated against the gates;
-- [ ] correctness parity and index counts match the shard-loaded baseline;
+- [ ] normalized query responses and index counts match the shard-loaded baseline;
 - [ ] sanitized raw-run, aggregate, and environment artifacts are published;
 - [ ] each acceptance gate is marked pass/fail with evidence;
 - [ ] failures produce a follow-up issue and owner rather than being omitted.
@@ -307,5 +307,8 @@ value-snapshot prototype, then compare it with the accepted whole-index cache on
 identical shards using the decode/format subset of this protocol. That experiment
 does not block publishing measurements for the current implementation.
 
-**Status:** planned. No representative-monolith latency or peak-memory results
-have been collected for the current cache implementation.
+**Status:** partially executed. Initial v1 and v2 startup, query, cache-size,
+steady-memory, and peak-RSS samples are recorded in
+[`monolith-measurement-results.md`](monolith-measurement-results.md). Required
+repetitions, refresh and lifecycle scenarios, cold-storage and auto-index runs,
+and the normalized query-response corpus remain open.

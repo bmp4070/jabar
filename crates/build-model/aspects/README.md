@@ -1,11 +1,13 @@
 # The SCIP indexing aspect
 
-Jabar bundles an unmodified copy of the [upstream `scip-java` Bazel aspect](https://github.com/scip-code/scip-java/blob/main/scip-java/src/main/resources/scip-java/scip_java.bzl),
+Jabar bundles a snapshot of the
+[upstream `scip-java` Bazel aspect](https://github.com/scip-code/scip-java/blob/main/scip-java/src/main/resources/scip-java/scip_java.bzl)
 at commit `0e47f47c4aebf47ce7f739eb51fa50938f3356d5` (2026-09-16).
-Upstream now handles Bazel 9, bzlmod-only workspaces, and shell-quoted javac
-options. A separate `bmp4070/scip-java` fork is unnecessary. The bundled file
-exists because Bazel loads aspects by a label inside the workspace; Jabar writes
-it to `<workspace>/.jabar/aspects/` when indexing.
+It has one local change: targets whose sources are entirely `.srcjar` files are
+indexed instead of treated as empty. Upstream handles Bazel 9, bzlmod-only
+workspaces, and shell-quoted javac options. The bundled file exists because
+Bazel loads aspects by a label inside the workspace; Jabar writes it to
+`<workspace>/.jabar/aspects/` when indexing.
 
 Use a `scip-java` binary with the matching upstream CLI. The old v0.12.3
 binary and this aspect are not a tested pair.
@@ -35,5 +37,5 @@ find bazel-bin -type f -name '*.scip' -not -path '*.scip-targetroot/*' | xargs c
 ```
 
 The earlier v0.12.3 aspect was verified on Bazel 9.2.0, JDK 26, and the
-`fixtures/megarepo` workspace. The current upstream snapshot has not yet been
-run against that fixture in this repository.
+`fixtures/megarepo` workspace. The current snapshot plus the source-jar change
+has not yet been run against that fixture in this repository.

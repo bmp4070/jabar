@@ -46,9 +46,9 @@ pub struct IndexConfig {
 
     /// What to index.
     ///
-    /// Deliberately not `//...`: on a real megarepo that includes targets
-    /// broken at HEAD, targets needing credentials, and targets whose
-    /// toolchains are not installed. Scoping is the normal case.
+    /// Defaults to `//...` so a small repository works without configuration.
+    /// Large repositories should narrow this because the full pattern can
+    /// include broken, credentialed, or locally unsupported targets.
     pub targets: Vec<String>,
 
     /// Path to `scip-java`. Absent means look it up on `PATH`.

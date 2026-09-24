@@ -1,3 +1,6 @@
+# Derived from scip-code/scip-java at commit 0e47f47c4aebf47ce7f739eb51fa50938f3356d5.
+# Modified by Jabar in 2026 to index targets whose sources are entirely .srcjar files.
+
 """
 Bazel aspect to run scip-java against a Java Bazel codebase.
 

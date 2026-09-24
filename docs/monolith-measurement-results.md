@@ -42,8 +42,9 @@ symbol and path strings from each reference row. Its counted results are in
 version 1 values here are retained as the comparison baseline.
 
 Counts are identical across the cache-miss and cache-hit runs (3,130,763
-definitions both times) — a first, if narrow, **correctness-parity** signal
-between a freshly-decoded index and one restored from cache.
+definitions both times). This is a narrow structural-integrity signal between a
+freshly decoded index and one restored from cache; it does not establish answer
+equivalence for the query corpus.
 
 ## Version 2 snapshot — counted results (2026-09-22)
 
@@ -53,8 +54,9 @@ The version 1 cache was version-rejected, so the process decoded the shards once
 and published a fresh v2 generation; a subsequent `startup` then hit it. Counts
 match the v1 run exactly — 3,130,763 defs / 39,434,571 refs / 42,567,085
 occurrences, across 165,165 distinct reference paths — and the `cache.read` hit
-self-reports the snapshot byte count, so this is **correctness parity** between
-the decoded index and the v2 snapshot on both counts and bytes.
+self-reports the snapshot byte count. Counts and serialized bytes support
+snapshot completeness, while normalized responses for the fixed query corpus
+still need comparison.
 
 | Metric | v1 | v2 | Change |
 | --- | --- | --- | --- |
@@ -67,9 +69,10 @@ the decoded index and the v2 snapshot on both counts and bytes.
 | `workspace/symbol` p50 / p95 (probe) | 167 / 290 ms | 145 / 152 ms | now inside the 250 ms gate |
 
 Both warm samples agree (`cache.read` 21.73 s / 22.03 s). `shards.decode` is
-unchanged (~100 s here) — v2 touches only the persisted layout, not the
-synchronous shard decode, so cold start and its event-loop block (finding 1)
-remain open.
+unchanged (~100 s here). Version 2 changes the persisted and in-memory reference
+layout, while SCIP shard decoding remains serial inside a startup worker. The
+long time to readiness remains; the event-loop block described in the version 1
+baseline was removed after these measurements.
 
 **What moved:** removing the owned `symbol` and `path` strings from every one of
 the 39.4M reference rows — the symbol is now the map key, paths intern into a
@@ -79,7 +82,7 @@ and peak memory by ~2.3–2.5×. It is still streaming MessagePack, so the
 mmap/zero-copy and lazy-section options in recommendation 2 remain available for a
 further cut; this is the incremental step ahead of that decision.
 
-## Startup
+## Version 1 startup baseline
 
 Median of the runs below; each is a single sample (not yet the ≥10/≥30 the
 protocol asks for — see caveats).
@@ -97,9 +100,10 @@ protocol asks for — see caveats).
 The cache **halves** cold start (118 s → 57 s) but does **not** make startup
 interactive: the hit path is dominated by deserializing the 10.14 GiB MessagePack
 snapshot (~57 s ≈ 190 MB/s effective — deserialize-bound, not I/O-bound, since
-the file was warm in page cache). See [Findings](#findings).
+the file was warm in page cache). See
+[Findings from the version 1 baseline](#findings-from-the-version-1-baseline).
 
-## Steady-state responsiveness
+## Version 1 steady-state responsiveness
 
 From the `probe` workload — open-loop probes over 210 s against the static
 (unchanging) shard set, so this isolates query cost, not refresh cost.
@@ -114,7 +118,7 @@ operation at monolith scale** — p50 167 ms, p95 290 ms — which exceeds the
 protocol's 250 ms p95 responsiveness target. (Single query string; a broader
 corpus is needed before treating this as the definitive number.)
 
-## Event-loop health
+## Version 1 event-loop health
 
 `event_loop.heartbeat`, 20 ms cadence, armed only under bench:
 
@@ -129,12 +133,15 @@ gate around that window. **Note:** heartbeats are *not* recorded during the
 ~118 s decode itself — the synchronous decode blocks the event loop entirely,
 so no beats are serviced (see finding 1).
 
-## Findings
+## Findings from the version 1 baseline
 
-1. **Cold startup blocks the event loop for the full decode (~118 s).**
-   `shards.decode` runs synchronously inside `initialize`, so the server is
-   unresponsive — no heartbeats serviced, no requests answered — for ~2 minutes
-   on a cold cache. This is the dominant startup cost.
+1. **Cold startup blocked the event loop for the full decode (~118 s) at the
+   measured revision.** `shards.decode` ran synchronously inside `initialize`,
+   so the server serviced no heartbeats or requests for about two minutes. The
+   current server performs startup work on a bounded worker after the
+   `initialize` response. Navigation requests fail quickly with `IndexNotReady`
+   until the worker publishes an index; the roughly 100-second cold readiness
+   cost itself has not yet been reduced.
 
 2. **Cache-hit startup is still ~57 s and deserialize-bound.** Restoring the
    10.14 GiB snapshot only halves cold start. The cost is rmp-serde
@@ -164,35 +171,34 @@ so no beats are serviced (see finding 1).
 
 ## Recommended fixes
 
-In priority order, mapped to the findings above. Product/engineering changes
-(1–4) are proposals, not yet implemented; (5) is harness hygiene.
+The list below records the resulting work and the remaining measurement needs.
 
-1. **Make the index build asynchronous (finding 1).** Return from `initialize`
-   immediately and build the index on a background thread; report readiness via
-   `jabar/status` (`indexLoaded`) and progress notifications. Requests that
-   arrive before the index is ready get a fast "still indexing" answer instead of
-   a ~2-minute stall. This is the single biggest responsiveness win — it removes
-   the event-loop block regardless of cold/warm.
+1. **Make the index build asynchronous (finding 1): implemented.** The server
+   returns from `initialize`, builds the index on a bounded worker, reports
+   readiness through `jabar/status`, and returns `IndexNotReady` for navigation
+   requests until publication. The current implementation still needs the
+   counted monolith rerun to verify event-loop responsiveness and measure time
+   from process start to the first correct answer.
 
 2. **Cut warm-start deserialization (finding 2).** The 10.14 GiB version 1
    MessagePack snapshot takes ~57 s to deserialize. Version 2 first compacts the
    39.4M reference rows: the containing map supplies their symbol and one path
    table replaces per-row path strings. It keeps streaming deserialization and
    rejects version 1 before loading, avoiding an old-plus-new conversion peak.
-   Measure that change before choosing an mmap-friendly layout, lazy sections,
-   or a split hot index. Target: seconds, not ~1 min.
+   The measured v2 warm load is about 22 seconds. Continue with an mmap-friendly
+   layout, lazy sections, or a split hot index if the repeated measurements
+   confirm that it misses the final readiness budget.
 
-3. **Add a persisted name index for `workspace/symbol` (finding 3).** p95 ~290 ms
-   over 3.1M definitions suggests a scan. Precompute and persist a prefix/trigram
-   or FST name index in the cache so symbol search is a lookup, and cap/stream
-   results. Target: p95 < 250 ms.
+3. **Broaden the `workspace/symbol` corpus (finding 3).** The v2 probe measured
+   152 ms p95 for one query, inside the provisional 250 ms gate. Run the fixed
+   multi-query corpus before deciding whether a persisted prefix, trigram, or
+   FST name index is justified.
 
-4. **Reduce peak memory on both paths (finding 4).** Peak ~67 GiB vs ~17 GiB
-   resident. The loader already handles shards one at a time and streams cache
-   input into the final index. Version 2 reduces the final reference rows from
-   roughly 72 to 24 bytes before string payload and allocator savings. Rerun
-   cache load in a fresh process and add stage-specific memory evidence before
-   selecting the next allocation target.
+4. **Continue measuring peak memory on both paths (finding 4).** Version 2
+   reduced warm peak RSS from 62.0 to 24.6 GiB and the miss-path peak from 66.9
+   to 29.7 GiB in the initial samples. Rerun each path in fresh processes with
+   stage-correlated memory evidence, including cache publication and concurrent
+   replacement generations, before selecting the next allocation target.
 
 5. **Make `startup` wait for cache publication (finding 5).** Add a
    `--hold-secs`/quiesce step so the workload polls `jabar/status` (or waits)
@@ -220,7 +226,7 @@ hit) before publishing any number as a gate result.
   branch switch, watcher-error → unverified, explicit reload, reclamation, and
   superseded cache writes) and their reload/heartbeat behaviour.
 - Auto-indexing: the scip-java aspect build (`index.build`), and fresh-build vs
-  cache-hit correctness parity beyond raw counts.
+  cache-hit normalized response equivalence beyond raw counts.
 - Cold-storage (page-cache-dropped) startup.
-- A fixed correctness query corpus compared normalized in-private.
+- A fixed query corpus with normalized responses compared in private.
 - Invalid-cache and configuration-miss fallbacks against the Monolith.

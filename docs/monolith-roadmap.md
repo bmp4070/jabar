@@ -1,11 +1,12 @@
 # Large Java monolith readiness
 
-Jabar can answer its nine LSP operations from SCIP shards, but its current
-startup, refresh, and coverage behavior has not been validated for a workspace
-with millions of build outputs. This is an implementation plan, not a claim
-that those workloads already work. `docs/phase-1.md` records the earlier
-milestones; `docs/index-cache.md` details the cache and
-`docs/monolith-measurements.md` defines the benchmark protocol.
+Jabar can answer its nine LSP operations from SCIP shards. An initial run on a
+large workspace measured 6,876 shards and 42.6 million occurrences, establishing
+feasibility and exposing startup and memory costs. The small sample count and
+unmeasured refresh, coverage, and query-corpus scenarios do not establish
+production readiness. `docs/phase-1.md` records the earlier milestones;
+`docs/index-cache.md` details the cache and `docs/monolith-measurements.md`
+defines the remaining benchmark protocol.
 
 ## 1. Establish a repeatable baseline
 
@@ -45,8 +46,7 @@ it. Avoid a hand-patch to `.jabar/aspects/`: Jabar overwrites that copy when
 running the aspect. Test each excluded option against actual target command
 lines; keep flags required for correct symbols and diagnostics. Include ECJ
 and javac targets, mixed builds, generated sources, and targets that ECJ can
-compile but stock javac rejects. This work does not require a scip-java fork
-unless an upstream limitation is demonstrated.
+compile but stock javac rejects.
 
 `--keep_going` currently accepts Bazel exit 3 and loads the shards that exist.
 Add a build coverage report with attempted, indexed, failed, and skipped
@@ -74,12 +74,14 @@ cache matches current shards but cannot prove that the shards match current
 source files. A same-HEAD external rebuild cannot be detected from git HEAD
 alone.
 
-A cache miss still incurs today's long walk. Decide and test the cold-start
-client behavior separately: prebuild/distribute a cache in CI or a developer
-bootstrap step, or add a protocol path that loads later and makes capabilities
-available predictably. Do not block `initialize` for minutes while claiming a
-fast cold start. Gate this stage on the measured startup and reload budgets,
-correct branch/configuration invalidation, and parity with fresh shards.
+A cache miss still incurs a long walk and shard decode, but startup and reload
+work now run off the protocol event loop. The server returns its implemented
+capabilities during `initialize`; navigation requests return `IndexNotReady`
+until a worker publishes the index, and `jabar/status` reports readiness. Decide
+and test whether CI distribution or a developer bootstrap step should reduce
+the remaining cold time to readiness. Gate this stage on measured startup and
+reload budgets, correct branch/configuration invalidation, and normalized
+response equivalence with fresh shards.
 
 ## 4. Keep queries and memory usable at scale
 
