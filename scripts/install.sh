@@ -12,7 +12,7 @@ $JABAR_INSTALL_DIR or $HOME/.local/bin.
 Environment:
   JABAR_TARGET       Override the detected Rust target triple.
   JABAR_INSTALL_DIR  Default installation directory.
-  JABAR_RELEASE_URL  Override https://github.com/bmp4070/jabar/releases/download.
+  JABAR_RELEASE_URL  Override https://github.com/bmp4070/jabar-lsp/releases/download.
 EOF
 }
 
@@ -69,7 +69,7 @@ command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
 command -v install >/dev/null 2>&1 || { echo "install is required" >&2; exit 1; }
 
 artifact="jabar-${tag}-${target}.tar.gz"
-release_root=${JABAR_RELEASE_URL:-https://github.com/bmp4070/jabar/releases/download}
+release_root=${JABAR_RELEASE_URL:-https://github.com/bmp4070/jabar-lsp/releases/download}
 url="${release_root}/${tag}"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/jabar-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
