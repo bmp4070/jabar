@@ -67,6 +67,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "java" }],
+    initializationOptions: {
+      bazel: config.get<string>("bazel") || "bazel",
+      outputBase: config.get<string>("outputBase") || undefined,
+      index: {
+        auto: config.get<boolean>("index.auto") ?? false,
+        targets: config.get<string[]>("index.targets") ?? ["//..."],
+        scipJava: config.get<string>("index.scipJava") || undefined,
+      },
+    },
     // jabar reads its index from bazel-bin, so a rebuild is a server-side
     // event. It watches for that itself; this tells VS Code not to also stream
     // us file events we would only discard.

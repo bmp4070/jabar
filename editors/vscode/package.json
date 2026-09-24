@@ -2,7 +2,7 @@
   "name": "jabar",
   "displayName": "jabar",
   "description": "Java language support for Bazel megarepos, backed by SCIP indexes",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "license": "Apache-2.0",
   "private": true,
   "engines": {
@@ -38,6 +38,36 @@
           "type": "string",
           "default": "info",
           "description": "Value for JABAR_LOG in the server process, e.g. `jabar_server=debug`."
+        },
+        "jabar.bazel": {
+          "type": "string",
+          "default": "bazel",
+          "description": "Bazel executable used when Jabar builds an index."
+        },
+        "jabar.outputBase": {
+          "type": "string",
+          "default": "",
+          "description": "Optional dedicated Bazel output base for Jabar indexing."
+        },
+        "jabar.index.auto": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run Jabar's bundled scip-java aspect when no SCIP shards exist."
+        },
+        "jabar.index.targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "//..."
+          ],
+          "description": "Bazel target patterns indexed when automatic indexing is enabled."
+        },
+        "jabar.index.scipJava": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the separately installed scip-java binary. Leave empty to use PATH."
         }
       }
     },

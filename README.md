@@ -110,6 +110,46 @@ cargo fmt --all
 
 Toolchain is pinned in `rust-toolchain.toml`.
 
+## Install
+
+Release archives are published for x86-64 and ARM64 Linux (glibc) and macOS.
+Choose an explicit version so the installed bits cannot change between runs:
+
+```sh
+./scripts/install.sh 0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+jabar --version
+```
+
+The installer downloads the named archive and `SHA256SUMS` from that GitHub
+release, verifies the archive before extraction, rejects unexpected archive
+paths, and then installs only `jabar`. Set `JABAR_INSTALL_DIR` or pass a second
+argument to choose another destination. For a manual install, download the
+matching `jabar-v0.1.0-<target>.tar.gz` and `SHA256SUMS` from the same release,
+select that artifact's line, and verify it before extraction:
+
+```sh
+grep ' jabar-v0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum -c -
+# macOS: replace sha256sum with `shasum -a 256`
+```
+
+Jabar uses `scip-java` only when it needs to produce or refresh SCIP shards. It
+is a separate runtime dependency and is never downloaded or executed by the
+installer. Install it from the
+[upstream scip-java project](https://github.com/scip-code/scip-java), verify the
+artifact using the upstream release information, and either put it on `PATH` or
+set `index.scipJava` to its absolute path. The bundled aspect tracks upstream
+commit `0e47f47c4aebf47ce7f739eb51fa50938f3356d5` plus the source-jar fix described
+in [`crates/build-model/aspects/README.md`](crates/build-model/aspects/README.md);
+the older scip-java 0.12.3 executable is not a compatible tested pairing.
+
+To build from source instead:
+
+```sh
+cargo build --release --locked --package jabar-server --bin jabar
+install -m 0755 target/release/jabar "$HOME/.local/bin/jabar"
+```
+
 ## Configuration
 
 See `docs/configuration.md`. Everything is optional; the defaults work.

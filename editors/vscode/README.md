@@ -28,14 +28,18 @@ If it cannot start, the error names what it tried — `spawn jabar ENOENT` on it
 own means the search found nothing and PATH had no `jabar`, which almost always
 means the release build has not run.
 
-## The index has to exist first
+## Producing the index
 
-jabar reads SCIP shards; it does not yet produce them. On startup it looks for
-`bazel-bin` and `.jabar/index` under the workspace root, and advertises its
-query capabilities only if it finds an index — so with no shards, VS Code shows
-no jabar features rather than showing broken ones.
+Jabar can run its bundled scip-java aspect when no usable SCIP shards exist.
+Install `scip-java` separately, then enable **jabar › Index: Auto**. For a large
+workspace, also set **jabar › Index: Targets** to the package patterns you need.
+Set **jabar › Index: Scip Java** when the executable is not on `PATH`; Jabar does
+not download it. Indexing is off by default because it runs a Bazel build and
+can take minutes.
 
-Produce them with the aspect in `crates/build-model/aspects/`:
+With automatic indexing disabled, Jabar loads existing shards from the Bazel
+output tree or `.jabar/index`. You can produce them manually with the aspect in
+`crates/build-model/aspects/`:
 
 ```sh
 export JAVA_HOME=$(/usr/libexec/java_home)
@@ -47,8 +51,9 @@ bazel build //java/... \
   "--define=scip_java_binary=$(which scip-java)"
 ```
 
-The server watches for shards changing and reloads on its own. Reopen the
-window after the first build, since capabilities are decided at `initialize`.
+The server watches for shard changes and reloads on its own. Startup indexing
+runs in the background; `jabar: Show server status` reports its progress and
+navigation requests return `IndexNotReady` until the index is published.
 
 ## Commands
 
