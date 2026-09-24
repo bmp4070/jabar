@@ -223,6 +223,9 @@ work and acceptance criteria are in [`docs/monolith-roadmap.md`](docs/monolith-r
 
 Apache-2.0. See `LICENSE` and `NOTICE`.
 
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
+development checks and the contributor license agreement process.
+
 `crates/build-model/aspects/scip_java.bzl` is derived from the
 [upstream scip-java aspect](https://github.com/scip-code/scip-java) (Apache-2.0,
 © 2022 Sourcegraph, Inc.) and carries one documented source-jar fix. Upstream
