@@ -20,6 +20,9 @@ watch` recompiles on save and avoids the whole problem.
 
 Then open a Bazel Java workspace.
 
+The 0.1.0 GitHub release publishes the `jabar` server, not a VSIX. Run this shim
+from the source checkout with `--extensionDevelopmentPath` as shown above.
+
 The binary is found automatically: `target/release/jabar`, then `target/debug`,
 looked for beside the extension and under the open workspace, falling back to
 `jabar` on PATH. Set `jabar.server.path` only to override that.
@@ -34,8 +37,13 @@ Jabar can run its bundled scip-java aspect when no usable SCIP shards exist.
 Install `scip-java` separately, then enable **jabar › Index: Auto**. For a large
 workspace, also set **jabar › Index: Targets** to the package patterns you need.
 Set **jabar › Index: Scip Java** when the executable is not on `PATH`; Jabar does
-not download it. Indexing is off by default because it runs a Bazel build and
-can take minutes.
+not download it. scip-java also requires `JAVA_HOME`; launch VS Code from an
+environment that defines it or set **jabar › Java Home**. Indexing is off by
+default because it runs a Bazel build and can take minutes.
+
+Changing the binary, logging, Bazel, output-base, Java-home, or index settings
+automatically restarts the language client so the new initialization options
+take effect.
 
 With automatic indexing disabled, Jabar loads existing shards from the Bazel
 output tree or `.jabar/index`. You can produce them manually with the aspect in

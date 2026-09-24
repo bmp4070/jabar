@@ -68,6 +68,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the separately installed scip-java binary. Leave empty to use PATH."
+        },
+        "jabar.javaHome": {
+          "type": "string",
+          "default": "",
+          "description": "JAVA_HOME passed to Jabar for automatic scip-java indexing. Leave empty to inherit the environment."
         }
       }
     },

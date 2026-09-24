@@ -56,6 +56,14 @@ else
   esac
 fi
 
+case "$target" in
+  x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-apple-darwin | aarch64-apple-darwin) ;;
+  *)
+    echo "unsupported release target: $target" >&2
+    exit 1
+    ;;
+esac
+
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
 command -v install >/dev/null 2>&1 || { echo "install is required" >&2; exit 1; }
@@ -71,6 +79,11 @@ curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
 curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
   --output "${tmp}/SHA256SUMS" "${url}/SHA256SUMS"
 
+matches=$(awk -v file="$artifact" '$2 == file { count++ } END { print count + 0 }' "${tmp}/SHA256SUMS")
+if [ "$matches" -ne 1 ]; then
+  echo "expected exactly one checksum for ${artifact}, found ${matches}" >&2
+  exit 1
+fi
 expected=$(awk -v file="$artifact" '$2 == file { print $1 }' "${tmp}/SHA256SUMS")
 case "$expected" in
   '' | *[!0-9a-fA-F]*)
@@ -101,6 +114,13 @@ contents=$(tar -tzf "${tmp}/${artifact}" | LC_ALL=C sort)
 expected_contents=$(printf '%s\n' LICENSE NOTICE jabar | LC_ALL=C sort)
 if [ "$contents" != "$expected_contents" ]; then
   echo "archive contains unexpected paths; refusing to extract" >&2
+  exit 1
+fi
+if ! tar -tvzf "${tmp}/${artifact}" | awk '
+  NF == 0 || substr($1, 1, 1) != "-" { bad = 1 }
+  END { exit bad }
+'; then
+  echo "archive contains a link or non-regular member; refusing to extract" >&2
   exit 1
 fi
 

@@ -9,21 +9,51 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate tag
+  quality:
+    name: Validate release
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: bazelbuild/setup-bazelisk@b39c379c82683a5f25d34f0d062761f62693e0b2 # v3
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-23
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
       - name: Match tag to Cargo version
         shell: bash
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          extension_version=$(node -p 'require("./editors/vscode/package.json").version')
           test "${GITHUB_REF_NAME}" = "v${version}"
+          test "$extension_version" = "$version"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Prepare Bazel fixture
+        working-directory: fixtures/megarepo
+        run: bazel build //... --noshow_progress
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Test installer
+        run: scripts/test-install.sh
+      - name: Install VS Code dependencies
+        working-directory: editors/vscode
+        run: npm ci
+      - name: Compile VS Code extension
+        working-directory: editors/vscode
+        run: npm run compile
 
   build:
     name: Build ${{ matrix.target }}
-    needs: validate
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -33,17 +63,17 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-23
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
       - name: Build locked release binary
@@ -58,7 +88,11 @@ jobs:
           install -m 0644 LICENSE NOTICE "${stage}/"
           tar -czf "${artifact}" -C "${stage}" jabar LICENSE NOTICE
           shasum -a 256 "${artifact}" > "${artifact}.sha256"
-      - uses: actions/upload-artifact@v4
+          shasum -a 256 -c "${artifact}.sha256"
+          mkdir verify
+          tar -xzf "${artifact}" -C verify
+          test "$(verify/jabar --version)" = "jabar ${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jabar-${{ matrix.target }}
           path: |
@@ -73,13 +107,35 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: jabar-*
           merge-multiple: true
-      - name: Assemble checksums
+      - name: Verify release assets
         shell: bash
-        run: cat ./*.sha256 | sort -k 2 > SHA256SUMS
+        run: |
+          set -euo pipefail
+          targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+          test "$(find . -maxdepth 1 -type f -name 'jabar-*.tar.gz' | wc -l | tr -d ' ')" = 4
+          test "$(find . -maxdepth 1 -type f -name 'jabar-*.tar.gz.sha256' | wc -l | tr -d ' ')" = 4
+          : > SHA256SUMS
+          for target in "${targets[@]}"; do
+            archive="jabar-${GITHUB_REF_NAME}-${target}.tar.gz"
+            checksum="${archive}.sha256"
+            test -f "$archive"
+            test -f "$checksum"
+            test "$(wc -l < "$checksum" | tr -d ' ')" = 1
+            shasum -a 256 -c "$checksum"
+            cat "$checksum" >> SHA256SUMS
+          done
+          sort -k 2 -o SHA256SUMS SHA256SUMS
+          test "$(wc -l < SHA256SUMS | tr -d ' ')" = 4
+          shasum -a 256 -c SHA256SUMS
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

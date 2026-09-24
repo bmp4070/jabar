@@ -110,10 +110,17 @@ cargo fmt --all
 
 Toolchain is pinned in `rust-toolchain.toml`.
 
+The SCIP golden tests in `crates/symbol-index/tests/fixture.rs` run only when
+`JABAR_SCIP_DIR` points to shards generated from the fixture. Ordinary CI builds
+the Bazel fixture and tests the workspace model, but does not install
+scip-java, regenerate those shards, or exercise the golden SCIP assertions.
+
 ## Install
 
-Release archives are published for x86-64 and ARM64 Linux (glibc) and macOS.
-Choose an explicit version so the installed bits cannot change between runs:
+Server archives are published for x86-64 and ARM64 Linux and macOS. They are
+built on Ubuntu 24.04 and macOS 15; compatibility with older glibc or macOS
+versions has not been established. Choose an explicit version so installation
+does not silently select a newer release:
 
 ```sh
 ./scripts/install.sh 0.1.0
@@ -122,9 +129,12 @@ jabar --version
 ```
 
 The installer downloads the named archive and `SHA256SUMS` from that GitHub
-release, verifies the archive before extraction, rejects unexpected archive
-paths, and then installs only `jabar`. Set `JABAR_INSTALL_DIR` or pass a second
-argument to choose another destination. For a manual install, download the
+release, verifies the archive before extraction, requires exactly three regular
+files, and then installs only `jabar`. Release assets can be replaced by a
+repository administrator, so an explicit version and a checksum downloaded from
+the same release do not make those assets immutable or independently
+authenticated. Set `JABAR_INSTALL_DIR` or pass a second argument to choose
+another destination. For a manual install, download the
 matching `jabar-v0.1.0-<target>.tar.gz` and `SHA256SUMS` from the same release,
 select that artifact's line, and verify it before extraction:
 
@@ -147,8 +157,13 @@ To build from source instead:
 
 ```sh
 cargo build --release --locked --package jabar-server --bin jabar
+mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/jabar "$HOME/.local/bin/jabar"
 ```
+
+The 0.1.0 GitHub release contains the server binary only. The VS Code shim is
+compiled in CI but is not published as a VSIX or to the Marketplace; use it
+from `editors/vscode/` as a development extension.
 
 ## Configuration
 

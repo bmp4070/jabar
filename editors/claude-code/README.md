@@ -17,7 +17,8 @@ Or build it from source and put it on PATH:
 
 ```sh
 cargo build --release
-ln -sf "$PWD/target/release/jabar" /usr/local/bin/jabar   # or anywhere on PATH
+mkdir -p "$HOME/.local/bin"
+ln -sf "$PWD/target/release/jabar" "$HOME/.local/bin/jabar"
 ```
 
 …or edit `command` in `.claude-plugin/marketplace.json` to the absolute path.
@@ -41,7 +42,8 @@ Open a Bazel Java repo. By default Jabar loads existing SCIP shards from the
 Bazel output tree or `.jabar/index`. Jabar can also produce shards by running
 its bundled aspect when the client enables `index.auto`; that requires a
 separately installed compatible `scip-java` binary on `PATH` or in
-`index.scipJava`. The local Claude plugin uses Jabar's defaults, so produce the
+`index.scipJava`, plus `JAVA_HOME` in the environment that launches Claude. The
+local Claude plugin uses Jabar's defaults, so produce the
 first index manually as described below before asking Claude to use the LSP
 tool, for example:
 

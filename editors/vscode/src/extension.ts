@@ -14,6 +14,19 @@ import {
 } from "vscode-languageclient/node";
 
 let client: LanguageClient | undefined;
+let outputChannel: vscode.OutputChannel | undefined;
+let restartQueue: Promise<void> = Promise.resolve();
+
+const restartSettings = [
+  "jabar.server.path",
+  "jabar.server.log",
+  "jabar.bazel",
+  "jabar.outputBase",
+  "jabar.index.auto",
+  "jabar.index.targets",
+  "jabar.index.scipJava",
+  "jabar.javaHome",
+];
 
 /// Where to look for the binary, in order, before falling back to PATH.
 ///
@@ -49,6 +62,21 @@ function locateServer(context: vscode.ExtensionContext): string | undefined {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  outputChannel = vscode.window.createOutputChannel("jabar");
+  context.subscriptions.push(
+    outputChannel,
+    vscode.commands.registerCommand("jabar.status", () => showStatus()),
+    vscode.commands.registerCommand("jabar.reloadIndex", () => reloadIndex()),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (restartSettings.some((setting) => event.affectsConfiguration(setting))) {
+        restartQueue = restartQueue.then(() => restartClient(context));
+      }
+    }),
+  );
+  await startClient(context);
+}
+
+async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const config = vscode.workspace.getConfiguration("jabar");
   const located = locateServer(context);
   const command = located ?? "jabar";
@@ -61,6 +89,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ...process.env,
         // The server logs to stderr; stdout carries the protocol.
         JABAR_LOG: config.get<string>("server.log") || "info",
+        JAVA_HOME: config.get<string>("javaHome") || process.env.JAVA_HOME,
       },
     },
   };
@@ -80,15 +109,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // event. It watches for that itself; this tells VS Code not to also stream
     // us file events we would only discard.
     synchronize: {},
-    outputChannel: vscode.window.createOutputChannel("jabar"),
+    outputChannel,
   };
 
   client = new LanguageClient("jabar", "jabar", serverOptions, clientOptions);
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand("jabar.status", () => showStatus()),
-    vscode.commands.registerCommand("jabar.reloadIndex", () => reloadIndex()),
-  );
 
   try {
     await client.start();
@@ -109,6 +133,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     console.error("jabar failed to start", error);
   }
+}
+
+async function restartClient(context: vscode.ExtensionContext): Promise<void> {
+  const previous = client;
+  client = undefined;
+  if (previous) {
+    try {
+      await previous.stop();
+    } catch (error) {
+      console.error("jabar failed to stop while applying settings", error);
+    }
+  }
+  await startClient(context);
+  vscode.window.showInformationMessage("jabar restarted with the updated settings.");
 }
 
 export function deactivate(): Thenable<void> | undefined {
