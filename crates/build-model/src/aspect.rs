@@ -26,10 +26,9 @@ const ASPECT_LABEL: &str = "//.jabar/aspects:scip_java.bzl%scip_java_aspect";
 pub struct AspectConfig {
     /// Target pattern to index.
     ///
-    /// Not `//...` by default, and deliberately so: on a real megarepo that
-    /// pattern includes targets broken at HEAD, targets needing credentials,
-    /// and targets whose toolchains are not installed. Scoping is the normal
-    /// case, not the exception.
+    /// The server configuration defaults to `//...` so a small repository works
+    /// without configuration. Large repositories should narrow the pattern to
+    /// avoid broken, credentialed, or locally unsupported targets.
     pub targets: Vec<String>,
     /// Absolute path to the `scip-java` binary.
     pub scip_java: Utf8PathBuf,

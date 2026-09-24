@@ -1,65 +1,84 @@
 # jabar
 
-A salsa-backed Java language server for Bazel megarepos, built for AI coding
-agents first and editors second.
+A focused Java navigation language server for Bazel monorepos, built for AI
+coding agents first and editors second. Jabar serves compiler-produced SCIP
+indexes locally, reports index readiness and reference truncation through custom
+methods, and handles edited files conservatively.
 
 ## Status
 
 **All nine client operations work end to end** — `workspace/symbol`,
 `textDocument/definition`, `textDocument/references`, `textDocument/hover`,
 `textDocument/implementation`, `textDocument/documentSymbol`, and the call
-hierarchy trio. Given SCIP shards produced by the
-aspect in `crates/build-model/aspects/`, `jabar` answers symbol searches across
-a whole Bazel repo with real ranges, converted into the client's negotiated
-position encoding. Before an index is loaded it returns an LSP *error* rather
-than an empty list, because a client cannot tell those apart.
+hierarchy trio. Given SCIP shards produced by the aspect in
+`crates/build-model/aspects/`, `jabar` answers symbol searches across all loaded
+shards with real ranges, converted into the client's negotiated position
+encoding. Before an index is loaded it returns an LSP *error* rather than an
+empty list, because a client cannot tell those apart.
 
 No capability is advertised that cannot be served.
 
 | Crate | State |
 | --- | --- |
-| `paths` | Absolute UTF-8 paths. Done, 7 tests. |
-| `vfs` | File ids, path interning, change batching, revisions. Done, 27 tests. No loader yet. |
-| `telemetry` | Misbehaviour detection. Done, 21 tests. |
-| `watcher` | Reloads the index when shards or git state change. Done, 10 tests. |
-| `overlay` | tree-sitter declarations for files the index cannot see yet. Done, 11 tests. |
-| `base-db` | Salsa inputs, three durability tiers, VFS bridge. Done, 14 tests. |
-| `symbol-index` | Reads SCIP shards: search, cursor resolution, definitions, references, implementors, per-file listing. Done, 27 tests. |
-| `build-model` | Bazel labels, aquery parsing, CLI queries. Done, 34 tests (8 hit real bazel). |
-| `jabar-server` | LSP shell plus the three query handlers. Done, 61 tests. |
+| `paths` | Absolute UTF-8 paths with explicit real and virtual forms. |
+| `vfs` | File ids, path interning, change batching, and revisions. |
+| `telemetry` | Misbehaviour and lifecycle telemetry. |
+| `watcher` | Refresh scheduling when shards or git state change. |
+| `overlay` | Tree-sitter declarations for open files newer than the index. |
+| `base-db` | Salsa inputs, durability tiers, and the VFS bridge. |
+| `symbol-index` | SCIP ingestion, search, cursor resolution, definitions, references, implementors, and per-file symbols. |
+| `build-model` | Bazel labels, aquery parsing, aspect execution, and CLI queries. |
+| `jabar-server` | LSP transport, the nine operations, index lifecycle, cache, and status extensions. |
 
-## Why this exists rather than using an existing Java LSP
+## Why this exists
 
-The usual Java language servers walk the filesystem to discover sources and
-index the whole workspace eagerly. Neither survives a repo with millions of
-files. jabar takes its file list from Bazel via BSP, and computes only what a
-query actually demands.
+Jabar turns Java SCIP shards produced through Bazel's action graph into a local,
+editor-neutral LSP service. The bundled scip-java aspect performs compiler-based
+symbol resolution and captures generated sources in the configured build. With
+the default output base, Jabar canonicalizes the workspace `bazel-bin` path.
+With an explicit output base, it asks that configured Bazel invocation for its
+output path. It then loads the discovered shards into one navigation index. It
+does not currently use BSP.
 
-The second departure is the consumer. The primary clients are Claude Code and
-Copilot, which issue nine operations — `workspaceSymbol`, `goToDefinition`,
-`findReferences`, `hover`, `documentSymbol`, `goToImplementation`, and the call
-hierarchy trio. Six of those are repo-global. Completion, signature help, inlay
-hints, semantic tokens and formatting are never requested, and are out of scope.
-That deletes the hardest latency constraint a language server normally carries,
-and moves the pressure onto cross-target queries instead.
+The primary clients are coding agents that use nine navigation operations:
+`workspaceSymbol`, `goToDefinition`, `findReferences`, `hover`,
+`documentSymbol`, `goToImplementation`, and the call hierarchy trio. Completion,
+diagnostics, rename, signature help, inlay hints, semantic tokens, code actions,
+and formatting are outside the current scope. Mature Java IDE servers provide
+those editing features; Jabar concentrates on cross-target repository
+investigation and local deployment. `jabar/status` makes readiness and
+verification visible, while `jabar/references` reports the loaded-index total
+when its 5,000-result response is truncated. Workspace-symbol and call-hierarchy
+responses have smaller caps and do not currently report totals to clients.
+
+The global index covers the SCIP shards that are present and successfully
+loaded. Jabar does not yet prove that every requested Bazel target produced a
+shard, so an empty result is not a guarantee that no unindexed target contains a
+match. See [Bazel ecosystem positioning](docs/bazel-lsp-positioning.md) for a
+comparison with JDT LS, IntelliJ/BSP, Sourcegraph, Kythe, rust-analyzer, clangd,
+and Starlark language servers.
 
 ## Design notes
 
-`docs/phase-1.md` is the working plan: scope, milestones, exit gate, and the
-findings behind each decision.
+`docs/phase-1.md` records the original design investigation and milestone plan.
+The current large-workspace work is tracked in `docs/monolith-roadmap.md`.
 
-Structure follows rust-analyzer: a synchronous event loop with one writer and
-many snapshot readers, not an async runtime. Salsa cancellation works by taking
-`&mut db`, which unwinds in-flight readers; that model wants a single writer.
+The server uses a synchronous protocol event loop. Startup discovery, cache or
+shard loading, optional automatic indexing, watcher setup, refresh scans,
+replacement index construction, cache writes, and retired-index destruction run
+on bounded workers. Completed generations return to the event loop for
+publication. Query handlers run synchronously against the published index. The
+`base-db` crate contains Salsa infrastructure, but the running server does not
+currently depend on it. Its query path uses the VFS, overlay, and eagerly loaded
+global SCIP index directly.
 
-Two departures from rust-analyzer, both forced by Java:
+Two Java-specific design constraints shape the index:
 
-- **Dependencies arrive as binaries.** Most of a target's classpath is jars, and
-  the JDK's own types live in `lib/modules`, a jimage archive. rust-analyzer has
-  no analogue — every dependency it sees is source.
-- **A shallow global index sits alongside the deep per-target slice.** Six of the
-  nine client operations are repo-wide, so a purely lazy slice has nothing to
-  answer them with.
+- **Dependencies often arrive as binaries.** Most of a target's classpath is
+  jars, and the JDK's own types live in `lib/modules`, a jimage archive.
+- **A shallow global index serves repository-wide operations.** Six of the nine
+  client operations are repo-wide. A deeper per-target semantic slice remains
+  planned rather than part of the running server.
 
 Debugging is DAP, a separate protocol the agent clients do not speak. Breakpoint
 and frame mapping lands in Phase 2 off the item tree; expression evaluation waits
@@ -99,27 +118,32 @@ See `docs/configuration.md`. Everything is optional; the defaults work.
 
 `editors/claude-code/` registers jabar as Claude Code's Java language server —
 a local plugin marketplace, since that is how Claude Code discovers servers.
-`editors/vscode/` holds a VS Code extension. Any LSP client works — the server
-advertises its capabilities statically once it finds an index, so nothing is
-client-specific — but VS Code needs an extension to spawn a custom binary at all.
+`editors/vscode/` holds a VS Code extension. The server advertises its
+implemented navigation capabilities during initialization. Until the background
+startup worker publishes an index, navigation requests return an explicit
+`IndexNotReady` error and `jabar/status` reports loading progress. VS Code needs
+an extension to spawn a custom binary.
 
 ## Next steps
 
 ### Large repository startup and indexing
 
-On the Monolith, a reported `bazel-bin` walk over a couple of million files takes ~46s, and
-loading 6,876 SCIP shards takes several more minutes before `initialize`
-returns. These measurements need a repeatable baseline. The proposed fast path
-persists a built symbol index and a build-produced shard manifest, then checks
-their provenance before loading. A concatenated SCIP file or a shard-path list
-alone avoids the walk but still decodes the shards and rebuilds lookup maps.
+The first counted large-workspace run loaded 6,876 SCIP shards containing 42.6
+million occurrences. Cache format v2 reduced the snapshot to 3.74 GiB, warm
+load to about 22 seconds, warm peak RSS to 24.6 GiB, and steady RSS to about 7.3
+GiB. These are a small number of samples on one host and do not establish a
+production SLO or superiority over another language server. See
+[`docs/monolith-measurement-results.md`](docs/monolith-measurement-results.md)
+for the environment, limitations, and unmeasured workloads.
 
 The cache is a performance aid, not proof that an index matches current sources.
-Jabar now persists the built index after loading shards from `bazel-bin` and
-checks that cache before walking the output tree. It reconciles shard metadata and performs reloads
-off the LSP loop, and cached sessions avoid a recursive `bazel-bin` watcher.
-The cache reports whether its shards have been verified; that does not prove
-the sources have been rebuilt. Indexing coverage remains to be implemented. See
+Jabar persists the built index after loading shards from `bazel-bin`, validates
+cache provenance, reconciles shard metadata, and performs refresh work off the
+LSP loop. Cached sessions avoid a recursive `bazel-bin` watcher. Verification
+that the cache matches current shards does not prove that those shards match
+current sources. Complete target coverage remains to be implemented. Startup
+loading now runs on a bounded worker after `initialize`; the remaining latency
+is time to index readiness and the first correct query. See
 [`docs/index-cache.md`](docs/index-cache.md) for the cache design and
 [`docs/monolith-roadmap.md`](docs/monolith-roadmap.md) for implementation stages,
 measurements, ECJ coverage, and query-scale work.
@@ -142,10 +166,10 @@ work and acceptance criteria are in [`docs/monolith-roadmap.md`](docs/monolith-r
 
 ## License
 
-MIT or Apache-2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.
+Apache-2.0. See `LICENSE` and `NOTICE`.
 
-`crates/build-model/aspects/scip_java.bzl` is an unmodified snapshot of the
+`crates/build-model/aspects/scip_java.bzl` is derived from the
 [upstream scip-java aspect](https://github.com/scip-code/scip-java) (Apache-2.0,
-© 2022 Sourcegraph, Inc.). Upstream now supports Bazel 9 and bzlmod, so Jabar
-does not need a separate scip-java fork. See `NOTICE` and the
+© 2022 Sourcegraph, Inc.) and carries one documented source-jar fix. Upstream
+supports Bazel 9 and bzlmod. See `NOTICE` and the
 [aspect instructions](crates/build-model/aspects/README.md).

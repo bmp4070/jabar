@@ -1,10 +1,14 @@
-jabar bundles third-party code. Attribution follows.
+Jabar
+Copyright 2026 Medha Bhargav
+
+This product includes third-party code. Attribution follows.
 
 --------------------------------------------------------------------------
 crates/build-model/aspects/scip_java.bzl
 
-Unmodified copy from scip-code/scip-java, Copyright (c) 2022 Sourcegraph, Inc.
-Licensed under the Apache License, Version 2.0. See LICENSE-APACHE.
+Derived from scip-code/scip-java, Copyright (c) 2022 Sourcegraph, Inc.
+Licensed under the Apache License, Version 2.0. See LICENSE. Jabar changes the
+empty-source check so targets containing only source jars are indexed.
 
 Source: https://github.com/scip-code/scip-java/blob/0e47f47c4aebf47ce7f739eb51fa50938f3356d5/scip-java/src/main/resources/scip-java/scip_java.bzl
 --------------------------------------------------------------------------

@@ -3,7 +3,7 @@
   "displayName": "jabar",
   "description": "Java language support for Bazel megarepos, backed by SCIP indexes",
   "version": "0.0.0",
-  "license": "MIT OR Apache-2.0",
+  "license": "Apache-2.0",
   "private": true,
   "engines": {
     "vscode": "^1.85.0"

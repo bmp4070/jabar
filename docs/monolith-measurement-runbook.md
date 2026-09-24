@@ -218,7 +218,7 @@ broken at HEAD, credentialed, or missing toolchains. Compare counts
 (shards/definitions/references/occurrences) against a cache-hit process for the
 Phase-4 parity check using `SymbolIndex`'s count methods.
 
-### Phase 4 — correctness parity, Phase 5 — publish
+### Phase 4 — normalized response equivalence, Phase 5 — publish
 
 Per the protocol: equal shard/definition/reference/occurrence counts between a
 cache-hit and a fresh shard-loaded process; a fixed query corpus compared
