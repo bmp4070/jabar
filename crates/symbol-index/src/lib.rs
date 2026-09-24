@@ -247,6 +247,8 @@ pub struct SymbolIndex {
     by_name: FxHashMap<String, Vec<usize>>,
     /// Symbol string to definition index.
     by_symbol: FxHashMap<String, usize>,
+    /// Additional declaration sites for symbols with more than one definition.
+    other_definition_sites: FxHashMap<String, Vec<usize>>,
     /// Symbol string to every compact reference to it.
     references: FxHashMap<String, Vec<StoredReference>>,
     /// Interned paths used by `references`.
@@ -255,9 +257,6 @@ pub struct SymbolIndex {
     /// not rebuild it because loaded indexes are immutable query snapshots.
     #[serde(skip)]
     reference_path_ids: FxHashMap<String, u32>,
-    /// Construction-only identity set. Rebuilt if shards are appended to a snapshot.
-    #[serde(skip)]
-    reference_sites: FxHashSet<(u32, StoredReference)>,
     /// Supertype symbol to the symbols implementing it.
     implementors: FxHashMap<String, Vec<usize>>,
     /// File path to the definitions it contains.
@@ -406,7 +405,7 @@ impl SymbolIndex {
             let path = dir.join(&shard.path);
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    if !index.add_shard(&bytes, &path.display().to_string()) {
+                    if !index.add_shard_with(&bytes, &path.display().to_string(), false) {
                         failed.push(shard.path.clone());
                     }
                 }
@@ -416,9 +415,11 @@ impl SymbolIndex {
                 }
             }
         }
-        // Query snapshots do not need the construction set. Keep the compact
-        // reference rows and release the temporary deduplication table.
-        index.reference_sites = FxHashSet::default();
+        // A cold load appends all shards first and deduplicates each symbol's
+        // rows once. Peak scratch memory is bounded by one symbol's list.
+        for references in index.references.values_mut() {
+            Self::deduplicate_references(references);
+        }
         ShardLoad { index, failed }
     }
 
@@ -428,25 +429,17 @@ impl SymbolIndex {
     }
 
     pub fn read_snapshot(reader: impl Read) -> std::io::Result<SymbolIndex> {
-        let mut index: SymbolIndex = rmp_serde::from_read(reader).map_err(std::io::Error::other)?;
+        let index: SymbolIndex = rmp_serde::from_read(reader).map_err(std::io::Error::other)?;
         index.validate_snapshot()?;
-        // Older snapshots can contain duplicate rows from overlapping shards.
-        // Normalize them on read while keeping the serialized shape unchanged.
-        for references in index.references.values_mut() {
-            let mut seen = FxHashSet::default();
-            references.retain(|reference| seen.insert(reference.clone()));
-        }
-        for occurrences in index.occurrences.values_mut() {
-            occurrences.sort_by_key(|o| {
-                (o.range.start_line, o.range.start_col, o.range.end_line, o.range.end_col, o.symbol)
-            });
-            occurrences.dedup_by(|a, b| a.range == b.range && a.symbol == b.symbol);
-        }
         Ok(index)
     }
 
     /// Adds one shard's contents. `origin` is used only for diagnostics.
     pub fn add_shard(&mut self, bytes: &[u8], origin: &str) -> bool {
+        self.add_shard_with(bytes, origin, true)
+    }
+
+    fn add_shard_with(&mut self, bytes: &[u8], origin: &str, deduplicate: bool) -> bool {
         let index = match Index::parse_from_bytes(bytes) {
             Ok(index) => index,
             Err(err) => {
@@ -456,16 +449,7 @@ impl SymbolIndex {
         };
         self.shards += 1;
 
-        // Snapshot serialization omits the construction set. Restore it only
-        // when a caller appends another shard to a loaded snapshot.
-        if self.reference_sites.is_empty() && !self.references.is_empty() {
-            for (symbol, references) in &self.references {
-                if let Some(&symbol_id) = self.symbol_ids.get(symbol) {
-                    self.reference_sites
-                        .extend(references.iter().cloned().map(|reference| (symbol_id, reference)));
-                }
-            }
-        }
+        let mut touched = FxHashSet::default();
 
         for doc in &index.documents {
             let encoding = PositionEncoding::of(doc);
@@ -551,8 +535,9 @@ impl SymbolIndex {
                         encoding,
                         is_import: roles & SymbolRole::Import as i32 != 0,
                     };
-                    if self.reference_sites.insert((symbol_id, reference.clone())) {
-                        self.references.entry(occ.symbol.clone()).or_default().push(reference);
+                    self.references.entry(occ.symbol.clone()).or_default().push(reference);
+                    if deduplicate {
+                        touched.insert(occ.symbol.as_str());
                     }
                 }
             }
@@ -572,7 +557,20 @@ impl SymbolIndex {
                 occurrences.dedup_by(|a, b| a.range == b.range && a.symbol == b.symbol);
             }
         }
+        for symbol in touched {
+            if let Some(references) = self.references.get_mut(symbol) {
+                Self::deduplicate_references(references);
+            }
+        }
         true
+    }
+
+    fn deduplicate_references(references: &mut Vec<StoredReference>) {
+        if references.len() < 2 {
+            return;
+        }
+        let mut seen = FxHashSet::default();
+        references.retain(|reference| seen.insert(reference.clone()));
     }
 
     fn intern_symbol(&mut self, symbol: &str) -> u32 {
@@ -633,7 +631,11 @@ impl SymbolIndex {
         let idx = self.definitions.len();
         self.by_path.entry(def.path.clone()).or_default().push(idx);
         self.by_name.entry(def.name.to_lowercase()).or_default().push(idx);
-        self.by_symbol.entry(def.symbol.clone()).or_insert(idx);
+        if self.by_symbol.contains_key(&def.symbol) {
+            self.other_definition_sites.entry(def.symbol.clone()).or_default().push(idx);
+        } else {
+            self.by_symbol.insert(def.symbol.clone(), idx);
+        }
         for supertype in &def.implements {
             self.implementors.entry(supertype.clone()).or_default().push(idx);
         }
@@ -811,14 +813,27 @@ impl SymbolIndex {
         span: Range,
         owner: &str,
     ) -> Vec<(&str, Range)> {
-        self.references_within_owner(path, span, Some(owner))
+        let Some(def) = self.by_path.get(path).and_then(|sites| {
+            sites
+                .iter()
+                .map(|&i| &self.definitions[i])
+                .find(|def| def.symbol == owner && def.enclosing == Some(span))
+        }) else {
+            return Vec::new();
+        };
+        self.references_within_callable_site(def)
+    }
+
+    pub fn references_within_callable_site(&self, owner: &Definition) -> Vec<(&str, Range)> {
+        let Some(span) = owner.enclosing else { return Vec::new() };
+        self.references_within_owner(&owner.path, span, Some((owner.symbol.as_str(), owner.range)))
     }
 
     fn references_within_owner(
         &self,
         path: &str,
         span: Range,
-        owner: Option<&str>,
+        owner: Option<(&str, Range)>,
     ) -> Vec<(&str, Range)> {
         let Some(occurrences) = self.occurrences.get(path) else { return Vec::new() };
         let mut seen_ids = FxHashSet::default();
@@ -830,10 +845,10 @@ impl SymbolIndex {
             if !encloses(&span, &occ.range) {
                 continue;
             }
-            if let Some(owner) = owner
-                && self
-                    .enclosing_callable(path, occ.range)
-                    .is_some_and(|callable| callable.symbol != owner)
+            if let Some((owner_symbol, owner_range)) = owner
+                && self.enclosing_callable(path, occ.range).is_some_and(|callable| {
+                    callable.symbol != owner_symbol || callable.range != owner_range
+                })
             {
                 continue;
             }
@@ -875,6 +890,29 @@ impl SymbolIndex {
 
     pub fn definition(&self, symbol: &str) -> Option<&Definition> {
         self.by_symbol.get(symbol).map(|&i| &self.definitions[i])
+    }
+
+    /// Every distinct declaration site for a symbol, in shard order.
+    pub fn definition_sites(&self, symbol: &str) -> Vec<&Definition> {
+        let Some(&first) = self.by_symbol.get(symbol) else { return Vec::new() };
+        let mut sites = vec![&self.definitions[first]];
+        if let Some(others) = self.other_definition_sites.get(symbol) {
+            sites.extend(others.iter().map(|&i| &self.definitions[i]));
+        }
+        sites
+    }
+
+    /// Resolves an exact site carried through a call hierarchy item.
+    pub fn definition_site(&self, symbol: &str, path: &str, range: Range) -> Option<&Definition> {
+        let first = self.definition(symbol)?;
+        if first.path == path && first.range == range {
+            return Some(first);
+        }
+        self.other_definition_sites
+            .get(symbol)?
+            .iter()
+            .map(|&i| &self.definitions[i])
+            .find(|def| def.path == path && def.range == range)
     }
 
     /// Every reference to `symbol`, definitions excluded.
@@ -1149,6 +1187,14 @@ mod tests {
         assert_eq!(index.references(other).len(), 1);
         assert_eq!(index.occurrence_count(), 5);
 
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.scip"), first.write_to_bytes().unwrap()).unwrap();
+        std::fs::write(dir.path().join("second.scip"), second.write_to_bytes().unwrap()).unwrap();
+        let cold = SymbolIndex::load_validated(dir.path()).unwrap().index;
+        assert_eq!(cold.definition_count(), 2);
+        assert_eq!(cold.reference_count(), 3);
+        assert_eq!(cold.occurrence_count(), 5);
+
         let mut snapshot = Vec::new();
         index.write_snapshot(&mut snapshot).unwrap();
         let mut restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
@@ -1156,32 +1202,6 @@ mod tests {
         assert_eq!(restored.definition_count(), 2);
         assert_eq!(restored.reference_count(), 3);
         assert_eq!(restored.occurrence_count(), 5);
-    }
-
-    #[test]
-    fn older_snapshot_duplicate_rows_are_normalized_on_read() {
-        let mut index = SymbolIndex::default();
-        let symbol = "external symbol";
-        let symbol_id = index.intern_symbol(symbol);
-        let path_id = index.intern_reference_path("A.java").unwrap();
-        let site = StoredReference {
-            path: path_id,
-            range: Range { start_line: 1, start_col: 2, end_line: 1, end_col: 3 },
-            encoding: PositionEncoding::Utf16,
-            is_import: false,
-        };
-        index.references.insert(symbol.to_owned(), vec![site.clone(), site]);
-        let occurrence = Occurrence {
-            range: Range { start_line: 1, start_col: 2, end_line: 1, end_col: 3 },
-            symbol: symbol_id,
-        };
-        index.occurrences.insert("A.java".to_owned(), vec![occurrence, occurrence]);
-
-        let mut snapshot = Vec::new();
-        index.write_snapshot(&mut snapshot).unwrap();
-        let restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
-        assert_eq!(restored.reference_count(), 1);
-        assert_eq!(restored.occurrence_count(), 1);
     }
 
     #[test]
@@ -1394,6 +1414,30 @@ mod tests {
         index.insert(def("com/acme/A#", "A"));
         assert_eq!(index.definition_count(), 1);
         assert_eq!(index.search("A").len(), 1);
+    }
+
+    #[test]
+    fn multisite_definitions_keep_each_site_and_implementation() {
+        let mut index = SymbolIndex::default();
+        let mut first = def("com/acme/A#", "A");
+        first.implements.push("com/acme/Base#".to_owned());
+        let mut second = first.clone();
+        second.path = "java/Elsewhere.java".to_owned();
+        index.insert(first.clone());
+        index.insert(second.clone());
+        assert_eq!(index.definition_sites(&first.symbol).len(), 2);
+        assert_eq!(index.definition(&first.symbol).unwrap().path, first.path);
+        assert_eq!(
+            index.definition_site(&first.symbol, &second.path, second.range).unwrap().path,
+            second.path
+        );
+        assert_eq!(index.implementors("com/acme/Base#").len(), 2);
+
+        let mut snapshot = Vec::new();
+        index.write_snapshot(&mut snapshot).unwrap();
+        let restored = SymbolIndex::read_snapshot(snapshot.as_slice()).unwrap();
+        assert_eq!(restored.definition_sites(&first.symbol).len(), 2);
+        assert_eq!(restored.implementors("com/acme/Base#").len(), 2);
     }
 
     fn r(sl: u32, sc: u32, el: u32, ec: u32) -> Range {

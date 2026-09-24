@@ -242,14 +242,14 @@ fn to_lsp_kind(kind: SymbolKind) -> LspKind {
 /// `jabar/references` says so.
 pub const REFERENCE_LIMIT: usize = 5000;
 
-/// A resolved location, plus what the index knew about it.
+/// Resolved declaration locations, plus what the index knew about them.
 pub struct Located {
-    pub location: Location,
+    pub locations: Vec<Location>,
     /// The SCIP symbol, so a caller can chain another query without re-resolving.
     pub symbol: String,
 }
 
-/// Resolves the symbol under a cursor to its definition.
+/// Resolves the symbol under a cursor to every retained declaration site.
 ///
 /// `position` arrives in the client's encoding and is converted to the index's
 /// UTF-16 columns before lookup — the two disagree on any line with a non-ASCII
@@ -264,16 +264,14 @@ pub fn goto_definition(
 ) -> Option<Located> {
     let cache = SourceCache::new(read_file);
     let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
-    let def = index.definition(&symbol)?;
-    let location = to_location(
-        def.path.as_str(),
-        def.range,
-        def.encoding,
-        workspace_root,
-        client_encoding,
-        &cache,
-    )?;
-    Some(Located { location, symbol })
+    let locations = index
+        .definition_sites(&symbol)
+        .into_iter()
+        .filter_map(|def| {
+            to_location(&def.path, def.range, def.encoding, workspace_root, client_encoding, &cache)
+        })
+        .collect::<Vec<_>>();
+    (!locations.is_empty()).then_some(Located { locations, symbol })
 }
 
 /// References to the symbol under a cursor, ranked and capped.
@@ -293,8 +291,10 @@ pub fn find_references(
     let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
 
     let mut hits: Vec<(&str, symbol_index::Range, symbol_index::PositionEncoding)> = Vec::new();
-    if include_declaration && let Some(def) = index.definition(&symbol) {
-        hits.push((def.path.as_str(), def.range, def.encoding));
+    if include_declaration {
+        for def in index.definition_sites(&symbol) {
+            hits.push((def.path.as_str(), def.range, def.encoding));
+        }
     }
     for reference in index.references(&symbol) {
         hits.push((reference.path, reference.range, reference.encoding));
@@ -581,7 +581,19 @@ pub fn prepare_call_hierarchy(
 ) -> Option<lsp_types::CallHierarchyItem> {
     let cache = SourceCache::new(read_file);
     let symbol = symbol_under_cursor(index, relative_path, position, client_encoding, &cache)?;
-    let def = index.definition(&symbol)?;
+    let cursor = (position.line, position.character);
+    let def = index
+        .definition_sites(&symbol)
+        .into_iter()
+        .find(|def| {
+            if def.path != relative_path {
+                return false;
+            }
+            let range = convert_span(&def.path, def.range, def.encoding, client_encoding, &cache);
+            (range.start.line, range.start.character) <= cursor
+                && cursor < (range.end.line, range.end.character)
+        })
+        .or_else(|| index.definition(&symbol))?;
     // Only a callable can have callers. Starting a hierarchy from a class would
     // give a tree of things that are not calls.
     if !matches!(def.kind, SymbolKind::Method | SymbolKind::Constructor) {
@@ -598,18 +610,21 @@ pub fn prepare_call_hierarchy(
 /// enclosing class.
 pub fn incoming_calls(
     index: &SymbolIndex,
-    symbol: &str,
+    site: &CallItemSite,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::CallHierarchyIncomingCall> {
+    let Some(target) = index.definition_site(&site.symbol, &site.path, site.range) else {
+        return Vec::new();
+    };
     let cache = SourceCache::new(read_file);
     // One entry per caller, carrying every site it calls from -- which is what
     // `from_ranges` is for, and why a caller appearing twice is one result.
     let mut callers: Vec<(&Definition, Vec<symbol_index::Reference<'_>>)> = Vec::new();
     let mut caller_ids: FxHashMap<(&str, &str, symbol_index::Range), usize> = FxHashMap::default();
 
-    for reference in index.references(symbol) {
+    for reference in index.references(&target.symbol) {
         let Some(caller) = index.enclosing_callable(reference.path, reference.range) else {
             continue;
         };
@@ -650,18 +665,22 @@ pub fn incoming_calls(
 /// Methods the given one calls.
 pub fn outgoing_calls(
     index: &SymbolIndex,
-    symbol: &str,
+    site: &CallItemSite,
     workspace_root: &paths::AbsPath,
     client_encoding: ClientEncoding,
     read_file: &impl Fn(&str) -> Option<String>,
 ) -> Vec<lsp_types::CallHierarchyOutgoingCall> {
     let cache = SourceCache::new(read_file);
-    let Some(def) = index.definition(symbol) else { return Vec::new() };
+    let Some(def) = index.definition_site(&site.symbol, &site.path, site.range) else {
+        return Vec::new();
+    };
     // Without a declaration span there is no body to look inside.
-    let Some(span) = def.enclosing else { return Vec::new() };
+    if def.enclosing.is_none() {
+        return Vec::new();
+    }
 
     index
-        .references_within_callable(&def.path, span, &def.symbol)
+        .references_within_callable_site(def)
         .into_iter()
         .filter_map(|(referenced, at)| {
             let callee = index.definition(referenced)?;
@@ -692,9 +711,16 @@ pub fn outgoing_calls(
 /// a level at a time, so breadth past this is noise rather than context.
 pub const CALL_HIERARCHY_LIMIT: usize = 100;
 
-/// Recovers the SCIP symbol a `CallHierarchyItem` was built from.
-pub fn call_item_symbol(item: &lsp_types::CallHierarchyItem) -> Option<String> {
-    item.data.as_ref()?.get("symbol")?.as_str().map(str::to_owned)
+/// Index coordinates identifying one declaration carried across hierarchy requests.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CallItemSite {
+    pub symbol: String,
+    pub path: String,
+    pub range: symbol_index::Range,
+}
+
+pub fn call_item_site(item: &lsp_types::CallHierarchyItem) -> Option<CallItemSite> {
+    serde_json::from_value(item.data.clone()?).ok()
 }
 
 fn to_call_item(
@@ -720,7 +746,14 @@ fn to_call_item(
         uri,
         range,
         selection_range,
-        data: Some(serde_json::json!({ "symbol": def.symbol })),
+        data: Some(
+            serde_json::to_value(CallItemSite {
+                symbol: def.symbol.clone(),
+                path: def.path.clone(),
+                range: def.range,
+            })
+            .expect("call item site is serializable"),
+        ),
     })
 }
 
@@ -902,6 +935,10 @@ mod tests {
     fn incoming_calls_converts_only_the_first_hundred_caller_groups() {
         let target = "semanticdb maven example lib example/Target#call().";
         let mut index = SymbolIndex::default();
+        let mut target_def = definition("Target.java", "Target", 0, 2, 3);
+        target_def.symbol = target.to_owned();
+        target_def.kind = SymbolKind::Method;
+        index.insert(target_def);
         let mut shard = scip::types::Index::new();
         for i in 0..=CALL_HIERARCHY_LIMIT {
             let path = format!("Caller{i}.java");
@@ -932,7 +969,12 @@ mod tests {
         assert!(index.add_shard(&shard.write_to_bytes().unwrap(), "fanout.scip"));
 
         let reads = Cell::new(0);
-        let calls = incoming_calls(&index, target, &root(), ClientEncoding::Utf8, &|path| {
+        let site = CallItemSite {
+            symbol: target.to_owned(),
+            path: "Target.java".to_owned(),
+            range: symbol_index::Range { start_line: 0, start_col: 2, end_line: 0, end_col: 3 },
+        };
+        let calls = incoming_calls(&index, &site, &root(), ClientEncoding::Utf8, &|path| {
             assert_ne!(path, "Caller100.java", "excluded caller must not be converted");
             reads.set(reads.get() + 1);
             Some("é abcdefghij\n".to_owned())
@@ -942,5 +984,93 @@ mod tests {
         assert_eq!(calls[0].from_ranges[0].start.character, 5);
         assert_eq!(calls[0].from_ranges[1].start.character, 7);
         assert_eq!(reads.get(), CALL_HIERARCHY_LIMIT);
+    }
+
+    #[test]
+    fn multisite_call_items_expand_their_own_bodies_and_references_include_both_sites() {
+        let shared = "semanticdb maven example lib example/Shared#run().";
+        let mut index = SymbolIndex::default();
+        let mut shard = scip::types::Index::new();
+        for (path, callee_name) in [("A.java", "First"), ("B.java", "Second")] {
+            let mut caller = definition(path, "Shared", 0, 2, 8);
+            caller.symbol = shared.to_owned();
+            caller.kind = SymbolKind::Method;
+            caller.enclosing =
+                Some(symbol_index::Range { start_line: 0, start_col: 0, end_line: 2, end_col: 0 });
+            index.insert(caller);
+            let callee_symbol = format!("callee-{callee_name}");
+            let mut callee = definition(&format!("{callee_name}.java"), callee_name, 0, 0, 5);
+            callee.symbol = callee_symbol.clone();
+            callee.kind = SymbolKind::Method;
+            index.insert(callee);
+
+            let mut doc = scip::types::Document::new();
+            doc.relative_path = path.to_owned();
+            let mut declared = scip::types::Occurrence::new();
+            declared.symbol = shared.to_owned();
+            declared.range = vec![0, 2, 8];
+            declared.symbol_roles = scip::types::SymbolRole::Definition as i32;
+            doc.occurrences.push(declared);
+            let mut called = scip::types::Occurrence::new();
+            called.symbol = callee_symbol;
+            called.range = vec![1, 2, 8];
+            doc.occurrences.push(called);
+            shard.documents.push(doc);
+        }
+        assert!(index.add_shard(&shard.write_to_bytes().unwrap(), "shared.scip"));
+
+        let first = prepare_call_hierarchy(
+            &index,
+            "A.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        let second = prepare_call_hierarchy(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        let first_site = call_item_site(&first).unwrap();
+        let second_site = call_item_site(&second).unwrap();
+        assert_eq!(first_site.path, "A.java");
+        assert_eq!(second_site.path, "B.java");
+        let first_calls =
+            outgoing_calls(&index, &first_site, &root(), ClientEncoding::Utf16, &|_| None);
+        let second_calls =
+            outgoing_calls(&index, &second_site, &root(), ClientEncoding::Utf16, &|_| None);
+        assert_eq!(first_calls.len(), 1);
+        assert_eq!(second_calls.len(), 1);
+        assert_eq!(first_calls[0].to.name, "First");
+        assert_eq!(second_calls[0].to.name, "Second");
+
+        let references = find_references(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            true,
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(references.total, 2);
+        assert_eq!(references.locations.len(), 2);
+        let definitions = goto_definition(
+            &index,
+            "B.java",
+            LinePosition::new(0, 3),
+            &root(),
+            ClientEncoding::Utf16,
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(definitions.locations.len(), 2);
     }
 }

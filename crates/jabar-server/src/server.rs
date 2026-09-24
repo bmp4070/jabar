@@ -1787,8 +1787,15 @@ impl Server {
         match handlers::goto_definition(index, &relative, position, root, self.encoding, &read) {
             Some(found) => {
                 tracing::debug!(symbol = %found.symbol, "resolved definition");
-                guard.finish(telemetry::Outcome::answered(1));
-                Ok(serde_json::to_value(lsp_types::GotoDefinitionResponse::Scalar(found.location))?)
+                guard.finish(telemetry::Outcome::answered(found.locations.len()));
+                let response = if found.locations.len() == 1 {
+                    lsp_types::GotoDefinitionResponse::Scalar(
+                        found.locations.into_iter().next().unwrap(),
+                    )
+                } else {
+                    lsp_types::GotoDefinitionResponse::Array(found.locations)
+                };
+                Ok(serde_json::to_value(response)?)
             }
             None => {
                 // Nothing at that position, or a symbol this index does not
@@ -2089,23 +2096,32 @@ impl Server {
         self.require_current_document(&mut guard, &relative, root)?;
         // The symbol was stashed at prepare time. A client that fabricates an
         // item, or replays one from a previous session, will not have it.
-        let Some(symbol) = handlers::call_item_symbol(&params.item) else {
+        let Some(site) = handlers::call_item_site(&params.item) else {
             guard.mark_failed(telemetry::Failure::BadRequest);
             return Err(RequestError::new(
                 ErrorCode::InvalidParams,
                 "the call hierarchy item did not come from `prepareCallHierarchy`".to_owned(),
             ));
         };
+        if site.path != relative
+            || index.definition_site(&site.symbol, &site.path, site.range).is_none()
+        {
+            guard.mark_failed(telemetry::Failure::BadRequest);
+            return Err(RequestError::new(
+                ErrorCode::InvalidParams,
+                "the call hierarchy declaration is not in the current index".to_owned(),
+            ));
+        }
 
         let read = file_reader(&self.documents, root);
         let value = match direction {
             CallDirection::Incoming => {
-                let calls = handlers::incoming_calls(index, &symbol, root, self.encoding, &read);
+                let calls = handlers::incoming_calls(index, &site, root, self.encoding, &read);
                 guard.finish(count_outcome(calls.len()));
                 serde_json::to_value(calls)?
             }
             CallDirection::Outgoing => {
-                let calls = handlers::outgoing_calls(index, &symbol, root, self.encoding, &read);
+                let calls = handlers::outgoing_calls(index, &site, root, self.encoding, &read);
                 guard.finish(count_outcome(calls.len()));
                 serde_json::to_value(calls)?
             }
