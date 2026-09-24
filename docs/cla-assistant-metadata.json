@@ -1,0 +1,36 @@
+{
+  "fullName": {
+    "title": "Full legal name",
+    "type": "string",
+    "githubKey": "name",
+    "required": true
+  },
+  "email": {
+    "title": "Email address",
+    "type": "string",
+    "githubKey": "email",
+    "required": true
+  },
+  "capacity": {
+    "title": "Signing capacity",
+    "type": {
+      "enum": [
+        "Individual",
+        "Authorized entity representative",
+        "Individual and authorized entity representative"
+      ]
+    },
+    "required": true
+  },
+  "entityName": {
+    "title": "Entity legal name, if applicable",
+    "type": "string",
+    "required": false
+  },
+  "coveredContributors": {
+    "title": "Covered GitHub usernames, if applicable",
+    "description": "Enter one username per line.",
+    "type": "textarea",
+    "required": false
+  }
+}
