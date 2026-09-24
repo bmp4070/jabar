@@ -13,9 +13,10 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 
-let client: LanguageClient | undefined;
+import { ClientLifecycle } from "./clientLifecycle";
+
+let lifecycle: ClientLifecycle<LanguageClient> | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
-let restartQueue: Promise<void> = Promise.resolve();
 
 const restartSettings = [
   "jabar.server.path",
@@ -63,20 +64,28 @@ function locateServer(context: vscode.ExtensionContext): string | undefined {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   outputChannel = vscode.window.createOutputChannel("jabar");
+  lifecycle = new ClientLifecycle(() => startClient(context));
   context.subscriptions.push(
     outputChannel,
     vscode.commands.registerCommand("jabar.status", () => showStatus()),
     vscode.commands.registerCommand("jabar.reloadIndex", () => reloadIndex()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (restartSettings.some((setting) => event.affectsConfiguration(setting))) {
-        restartQueue = restartQueue.then(() => restartClient(context));
+        void lifecycle
+          ?.restart()
+          .then((restarted) => {
+            if (restarted) {
+              vscode.window.showInformationMessage("jabar restarted with the updated settings.");
+            }
+          })
+          .catch((error) => console.error("jabar failed to restart while applying settings", error));
       }
     }),
   );
-  await startClient(context);
+  await lifecycle.start();
 }
 
-async function startClient(context: vscode.ExtensionContext): Promise<void> {
+async function startClient(context: vscode.ExtensionContext): Promise<LanguageClient | undefined> {
   const config = vscode.workspace.getConfiguration("jabar");
   const located = locateServer(context);
   const command = located ?? "jabar";
@@ -112,10 +121,11 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     outputChannel,
   };
 
-  client = new LanguageClient("jabar", "jabar", serverOptions, clientOptions);
+  const client = new LanguageClient("jabar", "jabar", serverOptions, clientOptions);
 
   try {
     await client.start();
+    return client;
   } catch (error) {
     // `spawn jabar ENOENT` on its own tells a user nothing actionable, so name
     // what was tried and what would fix it.
@@ -132,31 +142,19 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
       await vscode.commands.executeCommand("workbench.action.openSettings", "jabar.server.path");
     }
     console.error("jabar failed to start", error);
+    return undefined;
   }
-}
-
-async function restartClient(context: vscode.ExtensionContext): Promise<void> {
-  const previous = client;
-  client = undefined;
-  if (previous) {
-    try {
-      await previous.stop();
-    } catch (error) {
-      console.error("jabar failed to stop while applying settings", error);
-    }
-  }
-  await startClient(context);
-  vscode.window.showInformationMessage("jabar restarted with the updated settings.");
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return client?.stop();
+  return lifecycle?.shutdown();
 }
 
 /// `jabar/status` reports what the server currently believes about itself,
 /// including whether an index is loaded. Without it, a server that is running
 /// but has no index is indistinguishable from one that is working.
 async function showStatus(): Promise<void> {
+  const client = lifecycle?.client;
   if (!client) {
     vscode.window.showWarningMessage("jabar is not running.");
     return;
@@ -185,6 +183,7 @@ async function showStatus(): Promise<void> {
 /// The server watches `bazel-bin` and reloads on its own, so this is for when
 /// an index was produced somewhere else, or the watcher could not start.
 async function reloadIndex(): Promise<void> {
+  const client = lifecycle?.client;
   if (!client) {
     vscode.window.showWarningMessage("jabar is not running.");
     return;

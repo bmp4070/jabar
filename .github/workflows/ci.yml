@@ -46,4 +46,4 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
       - run: npm ci
-      - run: npm run compile
+      - run: npm test

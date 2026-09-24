@@ -47,9 +47,9 @@ jobs:
       - name: Install VS Code dependencies
         working-directory: editors/vscode
         run: npm ci
-      - name: Compile VS Code extension
+      - name: Test VS Code extension
         working-directory: editors/vscode
-        run: npm run compile
+        run: npm test
 
   build:
     name: Build ${{ matrix.target }}

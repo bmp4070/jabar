@@ -569,8 +569,16 @@ impl SymbolIndex {
         if references.len() < 2 {
             return;
         }
+        let original_len = references.len();
         let mut seen = FxHashSet::default();
         references.retain(|reference| seen.insert(reference.clone()));
+        // Overlapping shards can collapse a large vector to a small one. Give
+        // that backing allocation back once the excess is material instead of
+        // carrying duplicate-row capacity for the lifetime of the server.
+        if references.capacity().saturating_sub(references.len()) > references.len().max(1024) {
+            references.shrink_to_fit();
+        }
+        debug_assert!(references.len() <= original_len);
     }
 
     fn intern_symbol(&mut self, symbol: &str) -> u32 {
